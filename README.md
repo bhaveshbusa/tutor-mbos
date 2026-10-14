@@ -2,7 +2,7 @@
 
 A configurable multi-tenant tutoring system for students, batches, fees, assessments and reporting, available through an admin UI, API and MCP.
 
-**Status: planning; implementation awaits user approval.**
+**Status: plan approved on 14 October 2026; cloud foundation setup is next.**
 
 - [Proposed initial-release plan](docs/initial-release-plan.md)
 - [Linear project](https://linear.app/lets-play-match/project/tutor-mbos-initial-release-9973c3f2fd65)
