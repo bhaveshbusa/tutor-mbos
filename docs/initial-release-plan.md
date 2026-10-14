@@ -1,6 +1,6 @@
 # Tutor MBOS: proposed initial-release plan
 
-Status: awaiting user approval. Prepared 14 October 2026.
+Status: approved by the user on 14 October 2026. Supabase projects tutor-mbos and tutor-mbos-dev created by user report; configuration verification pending.
 Repository: https://github.com/bhaveshbusa/tutor-mbos
 Delivery: https://linear.app/lets-play-match/project/tutor-mbos-initial-release-9973c3f2fd65
 
@@ -113,7 +113,7 @@ Every PR includes automated tests relevant to its behavior. Agent review and req
 5. Query/discovery completeness: report builder, saved queries/exports, MCP onboarding/help and cross-client parity.
 6. Release qualification: cloud security/regression/performance/restore checks, usable demo account, automatic evidence pack and optional user-chosen sign-off scenarios.
 
-Reporting is part of each increment's definition of done, not a post-launch phase. No implementation starts before plan approval. No dates or estimates are promised until agents assess the approved contracts.
+Reporting is part of each increment's definition of done, not a post-launch phase. The user has approved the plan; implementation can proceed through the cloud-only workflow. No dates or estimates are promised until agents assess the approved contracts.
 
 ## Documentation verification
 
