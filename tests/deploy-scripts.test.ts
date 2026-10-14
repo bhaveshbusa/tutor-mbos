@@ -3,7 +3,12 @@ import {
   checkDeployTarget,
   parseDotenv,
 } from "../scripts/assert-deploy-target.ts";
-import { checkHealthPayload } from "../scripts/smoke-health.ts";
+import {
+  checkHealthPayload,
+  fetchProjectAutomationBypass,
+  resolveProtectionBypass,
+  selectAutomationBypass,
+} from "../scripts/smoke-health.ts";
 import {
   ENVIRONMENT_BINDINGS,
   supabaseUrlFor,
@@ -116,5 +121,89 @@ describe("checkHealthPayload", () => {
       checkHealthPayload(401, undefined, { environment: "development", commit })
         .length,
     ).toBeGreaterThan(1);
+  });
+});
+
+describe("deployment protection bypass", () => {
+  const SYNTHETIC_BYPASS = "synthetic-bypass-value";
+  const project = {
+    protectionBypass: {
+      "synthetic-share-link": { scope: "shareable-link" },
+      [SYNTHETIC_BYPASS]: { scope: "automation-bypass" },
+    },
+  };
+  const fakeFetch = (ok: boolean, body: unknown) => {
+    const calls: {
+      url: URL;
+      method: string;
+      headers: Record<string, string>;
+    }[] = [];
+    const impl = async (
+      url: URL,
+      init: { method: string; headers: Record<string, string> },
+    ) => {
+      calls.push({ url, ...init });
+      return { ok, json: async () => body };
+    };
+    return { impl, calls };
+  };
+  const env = {
+    VERCEL_TOKEN: "synthetic-token",
+    VERCEL_PROJECT_ID: "prj_synthetic",
+    VERCEL_ORG_ID: "team_synthetic",
+  };
+
+  it("selects only the automation bypass", () => {
+    expect(selectAutomationBypass(project)).toBe(SYNTHETIC_BYPASS);
+    expect(
+      selectAutomationBypass({
+        protectionBypass: { other: { scope: "shareable-link" } },
+      }),
+    ).toBeUndefined();
+    expect(selectAutomationBypass(undefined)).toBeUndefined();
+  });
+
+  it("reads the project's existing bypass with a GET, never creating one", async () => {
+    const { impl, calls } = fakeFetch(true, project);
+    const value = await fetchProjectAutomationBypass({
+      token: env.VERCEL_TOKEN,
+      projectId: env.VERCEL_PROJECT_ID,
+      teamId: env.VERCEL_ORG_ID,
+      fetchImpl: impl,
+    });
+    expect(value).toBe(SYNTHETIC_BYPASS);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.method).toBe("GET");
+    expect(calls[0]!.url.pathname).toBe("/v9/projects/prj_synthetic");
+    expect(calls[0]!.url.searchParams.get("teamId")).toBe("team_synthetic");
+    expect(calls[0]!.headers.authorization).toBe("Bearer synthetic-token");
+  });
+
+  it("prefers the token-authenticated project bypass over the fallback secret", async () => {
+    const { impl } = fakeFetch(true, project);
+    await expect(
+      resolveProtectionBypass(
+        { ...env, VERCEL_AUTOMATION_BYPASS_SECRET: "synthetic-fallback" },
+        impl,
+      ),
+    ).resolves.toEqual({ source: "project", value: SYNTHETIC_BYPASS });
+  });
+
+  it("falls back to the bypass secret, then to no bypass", async () => {
+    const failing = fakeFetch(false, {});
+    await expect(
+      resolveProtectionBypass(
+        { ...env, VERCEL_AUTOMATION_BYPASS_SECRET: "synthetic-fallback" },
+        failing.impl,
+      ),
+    ).resolves.toEqual({
+      source: "fallback-secret",
+      value: "synthetic-fallback",
+    });
+    const unused = fakeFetch(true, project);
+    await expect(resolveProtectionBypass({}, unused.impl)).resolves.toEqual({
+      source: "none",
+    });
+    expect(unused.calls).toHaveLength(0);
   });
 });

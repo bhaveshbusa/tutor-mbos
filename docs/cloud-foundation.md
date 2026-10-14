@@ -65,13 +65,15 @@ Rules enforced by `src/server/config/environments.ts` and the deployment workflo
 | Vercel project `tutor-mbos` → Environment Variables (Production) | Runtime variables above, production values | Owner or Codex, at release time |
 | GitHub → Settings → Environments → `development` → Secrets | `VERCEL_TOKEN` | Owner or Codex |
 | GitHub → Settings → Environments → `production` → Secrets | `VERCEL_TOKEN` | Owner or Codex, at release time |
-| GitHub environment secrets (optional) | `VERCEL_AUTOMATION_BYPASS_SECRET` | Only if Vercel Deployment Protection blocks the smoke test |
-| GitHub environment variables (optional) | `SMOKE_BASE_URL` | Only to smoke test a stable alias instead of the deployment URL |
+| GitHub environment secrets (optional fallback) | `VERCEL_AUTOMATION_BYPASS_SECRET` | Only if the smoke test cannot read the project's automation bypass with `VERCEL_TOKEN` |
+| GitHub environment variables (optional) | `SMOKE_ALIAS_URL` | Stable alias (e.g. `https://<project>.vercel.app`) re-checked after promotion |
 | GitHub → Settings → Environments → `production` → Variables | `PRODUCTION_RELEASES_ENABLED=true` | Owner, only after final sign-off |
 
 Agent workspaces, pull request workflows and the repository never hold these values.
 
-`VERCEL_AUTOMATION_BYPASS_SECRET` is Vercel's *Protection Bypass for Automation* value (Vercel project → Settings → Deployment Protection). It only lets the smoke test reach a protected deployment. It is not an application token and grants no API or MCP access.
+`VERCEL_TOKEN` is never passed on a command line; the Vercel CLI reads it from the step environment. Only the pull, deploy, smoke and promote steps receive it. The build step does not.
+
+**Smoke tests and Deployment Protection.** Keep Deployment Protection enabled. `scripts/smoke-health.ts` reads the project's existing *Protection Bypass for Automation* through the Vercel API with `VERCEL_TOKEN`, in-process, and sends it only as a request header (masked in logs). It never creates or changes a bypass. `VERCEL_AUTOMATION_BYPASS_SECRET` is a fallback only. Neither value is an application token; they grant no API or MCP access. Unprotected aliases are not used for smoke tests.
 
 ## One-time platform setup
 
@@ -82,7 +84,8 @@ The Vercel projects and Supabase projects already exist. Do not recreate them.
 3. **GitHub environment `production`.** Create it. Restrict deployment branches to `main`. Add required reviewers (the owner) and enable *Prevent self-review*. Add secret `VERCEL_TOKEN`. Do not add `PRODUCTION_RELEASES_ENABLED` until final sign-off.
 4. **Vercel runtime variables.** Add the variables in the table above to each project's Production environment.
 5. **Vercel project settings.** For both projects: Framework Preset *Next.js*, Node.js version *24.x*. A Git connection is optional; `vercel.json` disables Git-triggered deployments so only the workflows deploy.
-6. **Deployment Protection (development).** If enabled, either generate a *Protection Bypass for Automation* secret and store it as `VERCEL_AUTOMATION_BYPASS_SECRET` in the `development` GitHub environment, or set `SMOKE_BASE_URL` to an unprotected alias.
+6. **Deployment Protection.** Keep it enabled on both projects. If it is enabled, enable *Protection Bypass for Automation* once in Vercel → project → Settings → Deployment Protection; the smoke test reads it with `VERCEL_TOKEN`, so no GitHub copy is needed. Store it as `VERCEL_AUTOMATION_BYPASS_SECRET` in the GitHub environment only if that lookup is not possible. Do not disable protection or smoke test through an unprotected alias.
+7. **Stable alias (optional).** Set `SMOKE_ALIAS_URL` on a GitHub environment to re-check the promoted alias after each promotion.
 
 ## Development deployment
 
@@ -91,9 +94,11 @@ The Vercel projects and Supabase projects already exist. Do not recreate them.
 1. Reusable CI (all checks above).
 2. `vercel pull` for project `prj_ysIJHdIKYk2MQwvOKermUvIMuGVa`.
 3. `scripts/assert-deploy-target.ts development`: linked team/project and pulled runtime variables must match the development binding.
-4. `vercel build --prod` in CI, then a secret scan of `.vercel/output`.
-5. `vercel deploy --prebuilt --prod` to `tutor-mbos-dev`. Development uses that project's main target because the project only ever holds synthetic data.
-6. `scripts/smoke-health.ts`: `/api/v1/health` must return `200`, `environment: development`, the development Supabase project ref and the deployed commit.
+4. `vercel build --prod` in CI (no `VERCEL_TOKEN`), then a secret scan of `.vercel/output`.
+5. `vercel deploy --prebuilt --prod --skip-domain` to `tutor-mbos-dev`. This creates the deployment without moving traffic. Development uses that project's main target because the project only ever holds synthetic data.
+6. `scripts/smoke-health.ts` against that deployment URL: `/api/v1/health` must return `200`, `environment: development`, the development Supabase project ref and the deployed commit.
+7. `vercel promote` only after the smoke test passes.
+8. If `SMOKE_ALIAS_URL` is set, the promoted alias is smoke tested again.
 
 To trigger manually: GitHub → Actions → *Deploy development* → *Run workflow* on `main`.
 
@@ -107,7 +112,8 @@ To trigger manually: GitHub → Actions → *Deploy development* → *Run workfl
 4. Approval on the protected `production` GitHub environment.
 5. `PRODUCTION_RELEASES_ENABLED=true` on that environment.
 6. Linked project is `tutor-mbos` (`prj_Ibov9zZm4KOvga3pWUQ83pInPJfQ`) and runtime variables match the production binding.
-7. Artifact secret scan, prebuilt deploy, then smoke test expecting `environment: production`.
+7. Artifact secret scan, then `vercel deploy --prebuilt --prod --skip-domain` (no traffic moved).
+8. Smoke test of that deployment expecting `environment: production`, then `vercel promote`, then an optional re-check of `SMOKE_ALIAS_URL`. A failed smoke test leaves the current production deployment serving traffic.
 
 The initial production release waits for final sign-off (see `AGENTS.md`).
 

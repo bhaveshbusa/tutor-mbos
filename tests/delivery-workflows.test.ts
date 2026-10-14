@@ -183,6 +183,73 @@ describe("all workflows", () => {
   });
 });
 
+describe("deployment credentials and promotion", () => {
+  const deployJobs = {
+    "deploy-development.yml": load("deploy-development.yml").jobs.deploy!,
+    "release-production.yml": load("release-production.yml").jobs.release!,
+  };
+  const runOf = (step: Step) => step.run ?? "";
+
+  it("never pass tokens or bypass secrets on a command line", () => {
+    for (const file of [...workflowFiles, ...actionFiles]) {
+      const doc = parse(raw(file)) as {
+        jobs?: Record<string, Job>;
+        runs?: { steps: Step[] };
+      };
+      const steps = [
+        ...Object.values(doc.jobs ?? {}).flatMap((job) => job.steps ?? []),
+        ...(doc.runs?.steps ?? []),
+      ];
+      for (const step of steps) {
+        expect(runOf(step), file).not.toMatch(/--token\b|-t\s+\$/);
+        expect(runOf(step), file).not.toMatch(/--protection-bypass\b/);
+      }
+    }
+  });
+
+  for (const [file, job] of Object.entries(deployJobs)) {
+    describe(file, () => {
+      const steps = job.steps ?? [];
+      const indexOf = (predicate: (step: Step) => boolean) =>
+        steps.findIndex(predicate);
+
+      it("keeps VERCEL_TOKEN out of the job environment and the build step", () => {
+        expect(job.env ?? {}).not.toHaveProperty("VERCEL_TOKEN");
+        const builds = steps.filter((step) =>
+          /vercel@\S*\s+build\b/.test(runOf(step)),
+        );
+        expect(builds).toHaveLength(1);
+        for (const build of builds) {
+          expect(JSON.stringify(build)).not.toContain("VERCEL_TOKEN");
+        }
+      });
+
+      it("deploys without promoting, smoke tests, then promotes", () => {
+        const deploys = steps.filter((step) =>
+          /\bdeploy\s+--prebuilt/.test(runOf(step)),
+        );
+        expect(deploys).toHaveLength(1);
+        expect(runOf(deploys[0]!)).toContain("--skip-domain");
+        const deploy = indexOf((step) => step === deploys[0]);
+        const smoke = indexOf(
+          (step) =>
+            runOf(step).includes("scripts/smoke-health.ts") &&
+            runOf(step).includes('"$DEPLOYMENT_URL"'),
+        );
+        const promote = indexOf((step) =>
+          /\bpromote\s+"\$DEPLOYMENT_URL"/.test(runOf(step)),
+        );
+        expect(deploy).toBeGreaterThanOrEqual(0);
+        expect(smoke).toBeGreaterThan(deploy);
+        expect(promote).toBeGreaterThan(smoke);
+        expect(steps[smoke]!.env?.DEPLOYMENT_URL).toBe(
+          "${{ steps.deploy.outputs.url }}",
+        );
+      });
+    });
+  }
+});
+
 describe("Vercel project configuration", () => {
   it("disables Git-triggered deployments so only gated workflows deploy", () => {
     const config = JSON.parse(raw("vercel.json")) as {

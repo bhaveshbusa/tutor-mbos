@@ -1,6 +1,10 @@
 /**
  * Post-deploy smoke test: GET /api/v1/health on the deployed URL and confirm
  * it reports the expected environment, Supabase binding and source commit.
+ *
+ * Protected deployments are reached with the project's existing automation
+ * bypass, read in-process with VERCEL_TOKEN (never passed on a command line,
+ * never created here). VERCEL_AUTOMATION_BYPASS_SECRET is a fallback only.
  */
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
@@ -38,6 +42,59 @@ export function checkHealthPayload(
   return errors;
 }
 
+type FetchLike = (
+  input: URL,
+  init: { method: string; headers: Record<string, string> },
+) => Promise<{ ok: boolean; json(): Promise<unknown> }>;
+
+export function selectAutomationBypass(project: unknown): string | undefined {
+  const bypasses =
+    (project as { protectionBypass?: Record<string, { scope?: unknown }> })
+      ?.protectionBypass ?? {};
+  return Object.entries(bypasses).find(
+    ([, entry]) => entry?.scope === "automation-bypass",
+  )?.[0];
+}
+
+export async function fetchProjectAutomationBypass(options: {
+  token: string;
+  projectId: string;
+  teamId: string;
+  fetchImpl?: FetchLike;
+}): Promise<string | undefined> {
+  const url = new URL(
+    `https://api.vercel.com/v9/projects/${encodeURIComponent(options.projectId)}`,
+  );
+  url.searchParams.set("teamId", options.teamId);
+  const response = await (options.fetchImpl ?? fetch)(url, {
+    method: "GET",
+    headers: { authorization: `Bearer ${options.token}` },
+  });
+  if (!response.ok) return undefined;
+  return selectAutomationBypass(await response.json().catch(() => undefined));
+}
+
+export type BypassSource = "project" | "fallback-secret" | "none";
+
+export async function resolveProtectionBypass(
+  env: Record<string, string | undefined>,
+  fetchImpl?: FetchLike,
+): Promise<{ source: BypassSource; value?: string }> {
+  const { VERCEL_TOKEN, VERCEL_PROJECT_ID, VERCEL_ORG_ID } = env;
+  if (VERCEL_TOKEN && VERCEL_PROJECT_ID && VERCEL_ORG_ID) {
+    const value = await fetchProjectAutomationBypass({
+      token: VERCEL_TOKEN,
+      projectId: VERCEL_PROJECT_ID,
+      teamId: VERCEL_ORG_ID,
+      fetchImpl,
+    }).catch(() => undefined);
+    if (value) return { source: "project", value };
+  }
+  const fallback = env.VERCEL_AUTOMATION_BYPASS_SECRET;
+  if (fallback) return { source: "fallback-secret", value: fallback };
+  return { source: "none" };
+}
+
 async function main(): Promise<number> {
   const { values } = parseArgs({
     options: {
@@ -61,8 +118,14 @@ async function main(): Promise<number> {
     baseUrl.startsWith("http") ? baseUrl : `https://${baseUrl}`,
   );
   const headers: Record<string, string> = { accept: "application/json" };
-  const bypass = process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
-  if (bypass) headers["x-vercel-protection-bypass"] = bypass;
+  const bypass = await resolveProtectionBypass(process.env);
+  if (bypass.value) {
+    if (process.env.GITHUB_ACTIONS === "true") {
+      console.log(`::add-mask::${bypass.value}`);
+    }
+    headers["x-vercel-protection-bypass"] = bypass.value;
+  }
+  console.log(`Deployment protection bypass: ${bypass.source}.`);
 
   let errors: string[] = ["No attempt made."];
   const attempts = Number(values.attempts);
