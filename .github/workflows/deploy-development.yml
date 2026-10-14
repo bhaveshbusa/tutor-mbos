@@ -1,0 +1,87 @@
+name: Deploy development
+
+# Every push to main is checked, built in CI and deployed as prebuilt output to
+# the tutor-mbos-dev Vercel project (synthetic data only), then smoke tested.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-development
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ github.sha }}
+
+  deploy:
+    name: Deploy to tutor-mbos-dev
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: development
+      url: ${{ steps.deploy.outputs.url }}
+    env:
+      DEPLOY_ENVIRONMENT: development
+      VERCEL_ORG_ID: team_2QehRm248FPmHJTzKS0rvS6b
+      VERCEL_PROJECT_ID: prj_ysIJHdIKYk2MQwvOKermUvIMuGVa
+      VERCEL_CLI_VERSION: 63.1.2
+      VERCEL_TELEMETRY_DISABLED: "1"
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - name: Require main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Development deployments run from main only."
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Require deployment credentials
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          if [ -z "$VERCEL_TOKEN" ]; then
+            echo "::error::Secret VERCEL_TOKEN is not set on the GitHub 'development' environment. See docs/cloud-foundation.md."
+            exit 1
+          fi
+      - name: Pull Vercel project settings and environment
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: pnpm dlx "vercel@${VERCEL_CLI_VERSION}" pull --yes --environment=production --token="$VERCEL_TOKEN"
+      - name: Verify deployment target binding
+        run: node scripts/assert-deploy-target.ts "$DEPLOY_ENVIRONMENT"
+      - name: Build
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          export TUTOR_MBOS_BUILD_COMMIT="$(git rev-parse HEAD)"
+          pnpm dlx "vercel@${VERCEL_CLI_VERSION}" build --prod --token="$VERCEL_TOKEN"
+      - name: Scan deployment artifact for secrets
+        run: pnpm hygiene --artifact .vercel/output
+      - name: Deploy prebuilt output
+        id: deploy
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          url="$(pnpm dlx "vercel@${VERCEL_CLI_VERSION}" deploy --prebuilt --prod --token="$VERCEL_TOKEN")"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+      - name: Smoke test
+        env:
+          DEPLOYMENT_URL: ${{ steps.deploy.outputs.url }}
+          SMOKE_BASE_URL: ${{ vars.SMOKE_BASE_URL }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+        run: |
+          node scripts/smoke-health.ts \
+            --base-url "${SMOKE_BASE_URL:-$DEPLOYMENT_URL}" \
+            --environment "$DEPLOY_ENVIRONMENT" \
+            --commit "$(git rev-parse HEAD)"

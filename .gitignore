@@ -1,0 +1,42 @@
+# Dependencies and build output
+node_modules/
+.next/
+out/
+build/
+coverage/
+*.tsbuildinfo
+next-env.d.ts
+
+# Vercel CLI state (project link and pulled environment values)
+.vercel/
+
+# Environment files: only the placeholder example is tracked
+.env
+.env.*
+!.env.example
+
+# Credentials and keys
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# Private inputs, real data and sensitive outputs never belong in this public repository
+private/
+data/
+exports/
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.backup
+*.xlsx
+*.xls
+*.csv
+!tests/fixtures/synthetic/**/*.csv
+
+# Logs and OS files
+*.log
+.DS_Store

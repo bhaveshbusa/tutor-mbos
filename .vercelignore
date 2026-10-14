@@ -1,0 +1,23 @@
+# Deployments are uploaded as prebuilt output from CI. This file is a second guard
+# for any source upload: never send private files, credentials or local state.
+.env
+.env.*
+.vercel/
+private/
+data/
+exports/
+coverage/
+tests/
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.backup
+*.xlsx
+*.xls
+*.csv
+*.log
