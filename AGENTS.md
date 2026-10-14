@@ -1,6 +1,6 @@
 # Tutor MBOS
 
-Implementation is blocked until the user approves the initial-release plan in Linear (TOS-1).
+The user approved the initial-release plan on 14 October 2026 (TOS-1 complete). Proceed through the approved cloud-only workflow. Initial production release still requires final sign-off.
 Read docs/initial-release-plan.md before working. Linear owns scope, delivery state, dependencies and acceptance evidence; GitHub owns code and versioned contracts.
 
 This is a new configurable multi-tenant system with one owner/user per business, no business roles, and admin UI, API and MCP clients. Reporting is a launch requirement across those clients. The predecessor's workbook and single-tutor identity are not this project's authority. Never copy its private data, exports, secrets or history.
