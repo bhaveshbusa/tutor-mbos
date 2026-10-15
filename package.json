@@ -21,6 +21,7 @@
     "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm hygiene && pnpm build"
   },
   "dependencies": {
+    "@mongodb-js/saslprep": "1.6.0",
     "@supabase/ssr": "0.12.7",
     "@supabase/supabase-js": "2.117.3",
     "next": "16.3.8",

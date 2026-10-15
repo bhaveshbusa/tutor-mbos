@@ -1,24 +1,30 @@
-import { createHash, createHmac, pbkdf2Sync, randomBytes } from "node:crypto";
 import { hashSql } from "./migration-runner";
+import { scramSha256Verifier } from "./scram-password";
 import type { Sql } from "./sql";
 
 /**
  * Provisions the request login used by the running app.
  *
- * Postgres 16 and later reject a non-superuser changing the SUPERUSER
- * attribute. The detail says only a superuser may change that attribute.
- * The detail that only a superuser may alter roles with the SUPERUSER
- * attribute is separate: core Postgres uses it when the target role has
- * rolsuper, including for a statement that only sets LOGIN. Setting the
- * BYPASSRLS attribute has the matching detail. This module reads pg_roles
- * and memberships, creates a missing role with LOGIN NOINHERIT only, and
- * may set LOGIN and NOINHERIT on an existing safe role. It grants
- * app_request with INHERIT FALSE and SET TRUE, then revokes only the ADMIN
- * option. The password is a SCRAM-SHA-256 verifier. SUPERUSER, BYPASSRLS,
- * CREATEROLE, CREATEDB, REPLICATION, any direct membership other than one
- * non-admin app_request grant, any other effective membership, a privileged
- * or login-capable app_request, or an ownership or ACL dependency fails
- * closed before the password and before the ready log.
+ * Postgres 16 and later reject a non-superuser statement that edits the
+ * SUPERUSER attribute. The detail says only a superuser may change that
+ * attribute. The detail that only a superuser may alter roles with the
+ * SUPERUSER attribute can mean the target role has rolsuper, including when
+ * the statement only sets LOGIN. The BYPASSRLS attribute has the matching
+ * detail. This module reports the flags it read from pg_roles and does not
+ * treat either sentence as proof by itself. It creates a missing role with
+ * LOGIN NOINHERIT only, and may set LOGIN and NOINHERIT on an existing safe
+ * role. It grants app_request with INHERIT FALSE and SET TRUE, then revokes
+ * only that membership's ADMIN option. A second grantor row fails closed
+ * with every row's options and grantor still visible. The password is a
+ * SCRAM-SHA-256 verifier. SUPERUSER, BYPASSRLS, CREATEROLE, CREATEDB,
+ * REPLICATION, any direct membership other than one non-admin app_request
+ * grant, any other effective membership, a privileged or login-capable
+ * app_request, another role reachable through app_request, or an
+ * app_runtime ownership or direct ACL dependency fails closed before the
+ * password and before the ready log. app_request's reviewed grants on
+ * schema app, its tables, and its functions stay in place, including
+ * execute on the migration-owned auth wrappers. Those grants are not
+ * app_runtime dependencies. Refusal still prints the role flags.
  */
 
 export const CREATE_APP_RUNTIME_SQL = "create role app_runtime login noinherit";
@@ -32,7 +38,6 @@ const ALLOWED_MEMBERSHIP = "app_request";
 const PRINTABLE = /^[A-Za-z0-9_]+$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const SQLSTATE = /^[0-9A-Z]{5}$/;
-const SCRAM_ITERATIONS = 4096;
 const NOT_READY_SUFFIX = "Restricted attributes were not changed.";
 
 export interface RoleMembership {
@@ -40,6 +45,7 @@ export interface RoleMembership {
   admin: boolean;
   inherit: boolean;
   set: boolean;
+  grantor: string;
 }
 
 export interface RuntimeRoleState {
@@ -66,6 +72,7 @@ export interface RuntimePrivilegeEvidence {
   role: RuntimeRoleState;
   effectiveMembers: readonly string[];
   requestRole: RequestRoleFlags;
+  requestMembers: readonly string[];
   ownedOrAcl: number;
 }
 
@@ -90,6 +97,7 @@ interface MembershipRow {
   admin_option: unknown;
   inherit_option: unknown;
   set_option: unknown;
+  grantor_name: unknown;
 }
 
 export function restrictedRuntimeAttributes(role: RuntimeRoleState): string[] {
@@ -115,7 +123,7 @@ export function unexpectedRuntimeMemberships(
 }
 
 function formatMembership(member: RoleMembership): string {
-  return `${member.role}(admin=${member.admin},inherit=${member.inherit},set=${member.set})`;
+  return `${member.role}(admin=${member.admin},inherit=${member.inherit},set=${member.set},grantor=${member.grantor})`;
 }
 
 function orderedMemberships(
@@ -126,7 +134,8 @@ function orderedMemberships(
       left.role.localeCompare(right.role) ||
       Number(left.admin) - Number(right.admin) ||
       Number(left.inherit) - Number(right.inherit) ||
-      Number(left.set) - Number(right.set),
+      Number(left.set) - Number(right.set) ||
+      left.grantor.localeCompare(right.grantor),
   );
 }
 
@@ -170,6 +179,7 @@ export function formatRuntimePrivilegeEvidence(
     formatRuntimeRoleEvidence(evidence.role),
     `effective_member_of=${members}`,
     formatRequestRole(evidence.requestRole),
+    `app_request_member_of=${evidence.requestMembers.join(",") || "none"}`,
     `owned_or_acl=${evidence.ownedOrAcl}`,
   ].join(" ");
 }
@@ -215,19 +225,6 @@ export function safeRuntimeFailure(error: unknown, password: string): string {
   return message;
 }
 
-/**
- * PostgreSQL stores a SCRAM-SHA-256 verifier and accepts that string as a
- * password specification. The plaintext stays in this process.
- */
-export function scramSha256Verifier(password: string): string {
-  const salt = randomBytes(16);
-  const salted = pbkdf2Sync(password, salt, SCRAM_ITERATIONS, 32, "sha256");
-  const clientKey = createHmac("sha256", salted).update("Client Key").digest();
-  const storedKey = createHash("sha256").update(clientKey).digest();
-  const serverKey = createHmac("sha256", salted).update("Server Key").digest();
-  return `SCRAM-SHA-256$${SCRAM_ITERATIONS}:${salt.toString("base64")}$${storedKey.toString("base64")}:${serverKey.toString("base64")}`;
-}
-
 function flag(value: unknown, name: string): boolean {
   if (typeof value !== "boolean") {
     throw new Error(notReady(`${name} was not readable`));
@@ -248,16 +245,31 @@ function sqlStateSuffix(error: unknown): string {
   return ` sqlstate=${error.code}`;
 }
 
-function refused(message: string, error: unknown): Error {
-  return new Error(`${message}${sqlStateSuffix(error)}`);
+function roleEvidence(role: RuntimeRoleState | null): string {
+  return role ? formatRuntimeRoleEvidence(role) : "role app_runtime absent";
+}
+
+function refuse(
+  phase: string,
+  role: RuntimeRoleState | null,
+  detail?: string,
+  error?: unknown,
+): Error {
+  const extra = detail ? ` ${detail}` : "";
+  const message = `${roleEvidence(role)} phase=${phase}${extra}. ${NOT_READY_SUFFIX}`;
+  const suffix = error === undefined ? "" : sqlStateSuffix(error);
+  return new Error(`${message}${suffix}`);
 }
 
 function assertSafe(role: RuntimeRoleState): void {
+  if (restrictedRuntimeAttributes(role).length > 0) {
+    throw refuse("flags", role);
+  }
   if (
-    restrictedRuntimeAttributes(role).length > 0 ||
-    unexpectedRuntimeMemberships(role.memberOf).length > 0
+    unexpectedRuntimeMemberships(role.memberOf).length > 0 ||
+    role.memberOf.length > 1
   ) {
-    throw new Error(runtimeRoleNotReady(role));
+    throw refuse("membership", role);
   }
 }
 
@@ -323,15 +335,18 @@ export async function readRuntimeRole(
     `select granted.rolname as role_name,
             membership.admin_option,
             membership.inherit_option,
-            membership.set_option
+            membership.set_option,
+            grantor.rolname as grantor_name
      from pg_auth_members membership
      join pg_roles member on member.oid = membership.member
      join pg_roles granted on granted.oid = membership.roleid
+     join pg_roles grantor on grantor.oid = membership.grantor
      where member.rolname = 'app_runtime'
      order by granted.rolname,
               membership.admin_option,
               membership.inherit_option,
-              membership.set_option`,
+              membership.set_option,
+              grantor.rolname`,
   );
   const memberOf: RoleMembership[] = [];
   for (const member of members.rows) {
@@ -341,11 +356,18 @@ export async function readRuntimeRole(
     ) {
       throw new Error(notReady("a role membership was not printable"));
     }
+    if (
+      typeof member.grantor_name !== "string" ||
+      !PRINTABLE.test(member.grantor_name)
+    ) {
+      throw new Error(notReady("a membership grantor was not printable"));
+    }
     memberOf.push({
       role: member.role_name,
       admin: flag(member.admin_option, "membership admin"),
       inherit: flag(member.inherit_option, "membership inherit"),
       set: flag(member.set_option, "membership set"),
+      grantor: member.grantor_name,
     });
   }
   return {
@@ -383,12 +405,20 @@ async function readRequestRole(db: Sql): Promise<RequestRoleFlags | null> {
   return requestRoleFlags(row);
 }
 
-async function readEffectiveMembers(db: Sql): Promise<string[]> {
+async function readEffectiveMembers(
+  db: Sql,
+  roleName: "app_request" | "app_runtime",
+): Promise<string[]> {
   const result = await db.query<{ rolname: unknown }>(
-    `select rolname
-     from pg_roles
-     where pg_has_role('app_runtime', oid, 'MEMBER')
-     order by rolname`,
+    roleName === "app_request"
+      ? `select rolname
+         from pg_roles
+         where pg_has_role('app_request', oid, 'MEMBER')
+         order by rolname`
+      : `select rolname
+         from pg_roles
+         where pg_has_role('app_runtime', oid, 'MEMBER')
+         order by rolname`,
   );
   const names: string[] = [];
   for (const row of result.rows) {
@@ -398,6 +428,20 @@ async function readEffectiveMembers(db: Sql): Promise<string[]> {
     names.push(row.rolname);
   }
   return names;
+}
+
+function requestRefusal(
+  role: RuntimeRoleState | null,
+  request: RequestRoleFlags | null,
+  members: readonly string[],
+): Error {
+  const flags = request ? formatRequestRole(request) : "app_request=missing";
+  const listed = members.length > 0 ? members.join(",") : "none";
+  return refuse(
+    "request_role",
+    role,
+    `${flags} app_request_member_of=${listed}`,
+  );
 }
 
 async function readOwnedOrAcl(db: Sql): Promise<number> {
@@ -420,12 +464,22 @@ export async function provisionAppRuntime(
   db: Sql,
   password: string,
 ): Promise<RuntimePrivilegeEvidence> {
+  const requestRole = await readRequestRole(db);
+  const requestMembers = await readEffectiveMembers(db, "app_request");
   let role = await readRuntimeRole(db);
+  if (
+    !requestRole ||
+    !isSafeRequestRole(requestRole) ||
+    requestMembers.length !== 1 ||
+    requestMembers[0] !== ALLOWED_MEMBERSHIP
+  ) {
+    throw requestRefusal(role, requestRole, requestMembers);
+  }
   if (!role) {
     try {
       await db.exec(CREATE_APP_RUNTIME_SQL);
     } catch (error) {
-      throw refused(notReady("the role could not be created"), error);
+      throw refuse("create", role, undefined, error);
     }
     role = await requireRole(db);
   }
@@ -434,57 +488,41 @@ export async function provisionAppRuntime(
     try {
       await db.exec(ALIGN_APP_RUNTIME_SQL);
     } catch (error) {
-      throw refused(notReady("login and noinherit could not be set"), error);
+      throw refuse("align", role, undefined, error);
     }
     role = await requireRole(db);
     assertSafe(role);
   }
-  if (!role.login || role.inherit || role.memberOf.length > 1) {
-    throw new Error(runtimeRoleNotReady(role));
+  if (!role.login || role.inherit) {
+    throw refuse("align", role);
   }
 
-  const requestRole = await readRequestRole(db);
-  if (!requestRole || !isSafeRequestRole(requestRole)) {
-    const flags = requestRole
-      ? formatRequestRole(requestRole)
-      : "app_request=missing";
-    throw new Error(
-      `${formatRuntimeRoleEvidence(role)} ${flags}. ${NOT_READY_SUFFIX}`,
-    );
-  }
   const ownedOrAcl = await readOwnedOrAcl(db);
   if (ownedOrAcl !== 0) {
-    throw new Error(
-      `${formatRuntimeRoleEvidence(role)} owned_or_acl=${ownedOrAcl}. ${NOT_READY_SUFFIX}`,
-    );
+    throw refuse("dependency", role, `owned_or_acl=${ownedOrAcl}`);
   }
 
   try {
     await db.exec(GRANT_APP_REQUEST_SQL);
   } catch (error) {
-    throw refused(notReady("app_request could not be granted"), error);
+    throw refuse("grant", role, undefined, error);
   }
   try {
     await db.exec(REVOKE_APP_REQUEST_ADMIN_SQL);
   } catch (error) {
-    throw refused(
-      notReady("the app_request admin option could not be revoked"),
-      error,
-    );
+    throw refuse("revoke_admin", role, undefined, error);
   }
   role = await requireRole(db);
   assertSafe(role);
   if (!isExactMembership(role)) {
-    throw new Error(runtimeRoleNotReady(role));
+    throw refuse("membership", role);
   }
 
-  const effectiveMembers = await readEffectiveMembers(db);
+  const effectiveMembers = await readEffectiveMembers(db, "app_runtime");
   if (!isExactEffective(effectiveMembers)) {
     const listed =
       effectiveMembers.length > 0 ? effectiveMembers.join(",") : "none";
-    throw new Error(
-      `${formatRuntimeRoleEvidence(role)} effective_member_of=${listed}. ${NOT_READY_SUFFIX}`,
-    );
+    throw refuse("effective", role, `effective_member_of=${listed}`);
   }
 
   const verifier = scramSha256Verifier(password);
@@ -497,14 +535,20 @@ export async function provisionAppRuntime(
     typeof statement !== "string" ||
     !statement.startsWith("alter role app_runtime password 'SCRAM-SHA-256$")
   ) {
-    throw new Error("Could not set the app runtime password.");
+    throw refuse("password", role);
   }
   try {
     await db.exec(statement);
   } catch (error) {
-    throw refused("Could not set the app runtime password.", error);
+    throw refuse("password", role, undefined, error);
   }
-  return { role, effectiveMembers, requestRole, ownedOrAcl };
+  return {
+    role,
+    effectiveMembers,
+    requestRole,
+    requestMembers,
+    ownedOrAcl,
+  };
 }
 
 export async function readSchemaLedger(db: Sql): Promise<SchemaLedgerEntry[]> {

@@ -1,5 +1,12 @@
+import { pbkdf2Sync } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import {
+  SCRAM_SHA256_ITERATIONS,
+  scramSha256Accepts,
+  scramSha256ReproducesStoredSecret,
+  scramSha256Verifier,
+} from "@/server/application/scram-password";
 import {
   ALIGN_APP_RUNTIME_SQL,
   CREATE_APP_RUNTIME_SQL,
@@ -15,7 +22,6 @@ import {
   restrictedRuntimeAttributes,
   runtimeRoleNotReady,
   safeRuntimeFailure,
-  scramSha256Verifier,
   unexpectedRuntimeMemberships,
   type RequestRoleFlags,
   type RoleMembership,
@@ -37,6 +43,7 @@ const requestGrant: RoleMembership = {
   admin: false,
   inherit: false,
   set: true,
+  grantor: "migration_login",
 };
 
 const safeRequest: RequestRoleFlags = {
@@ -63,6 +70,7 @@ const ready: RuntimePrivilegeEvidence = {
   role: safeRole,
   effectiveMembers: ["app_request", "app_runtime"],
   requestRole: safeRequest,
+  requestMembers: ["app_request"],
   ownedOrAcl: 0,
 };
 
@@ -101,6 +109,14 @@ async function useMigrationLogin(connection: SqlConnection): Promise<void> {
     "grant app_request to migration_login with admin true, inherit false, set false",
   );
   await connection.exec("set session authorization migration_login");
+}
+
+function statementVerifier(statements: readonly string[]): string {
+  const statement = statements.find((entry) =>
+    entry.startsWith("alter role app_runtime password '"),
+  );
+  if (!statement?.endsWith("'")) return "";
+  return statement.slice("alter role app_runtime password '".length, -1);
 }
 
 function expectOrdinarySql(statements: readonly string[]): void {
@@ -145,6 +161,7 @@ describe("app runtime role provisioning", () => {
           admin: true,
           inherit: true,
           set: true,
+          grantor: "postgres",
         },
       ]),
     ).toEqual(["platform_admin"]);
@@ -158,6 +175,7 @@ describe("app runtime role provisioning", () => {
           admin: false,
           inherit: true,
           set: true,
+          grantor: "postgres",
         },
       ],
     };
@@ -166,7 +184,7 @@ describe("app runtime role provisioning", () => {
     expect(message).toContain("bypassrls=true");
     expect(message).toContain("superuser=false");
     expect(message).toContain(
-      "member_of=platform_admin(admin=false,inherit=true,set=true)",
+      "member_of=platform_admin(admin=false,inherit=true,set=true,grantor=postgres)",
     );
     expect(message).not.toContain("member_of=platform_admin,");
     expect(message).toContain("Restricted attributes were not changed.");
@@ -174,13 +192,19 @@ describe("app runtime role provisioning", () => {
     const duplicated: RuntimeRoleState = {
       ...safeRole,
       memberOf: [
-        { role: "app_request", admin: true, inherit: true, set: true },
+        {
+          role: "app_request",
+          admin: true,
+          inherit: true,
+          set: true,
+          grantor: "other_grantor",
+        },
         requestGrant,
       ],
     };
     const duplicateLine = formatRuntimeRoleEvidence(duplicated);
     expect(duplicateLine).toContain(
-      "member_of=app_request(admin=false,inherit=false,set=true),app_request(admin=true,inherit=true,set=true)",
+      "member_of=app_request(admin=false,inherit=false,set=true,grantor=migration_login),app_request(admin=true,inherit=true,set=true,grantor=other_grantor)",
     );
     expect(duplicateLine).not.toContain("member_of=app_request,app_request");
     expect(formatRuntimeRoleEvidence(unsafe)).not.toContain(password);
@@ -268,10 +292,20 @@ describe("app runtime role provisioning", () => {
     expect(recorded.statements).toContain(CREATE_APP_RUNTIME_SQL);
     expect(recorded.statements).toContain(REVOKE_APP_REQUEST_ADMIN_SQL);
     expectVerifierOnly(recorded.statements);
+    expect(
+      scramSha256Accepts(statementVerifier(recorded.statements), password),
+    ).toBe(true);
+    expect(
+      scramSha256Accepts(
+        statementVerifier(recorded.statements),
+        "other-secret",
+      ),
+    ).toBe(false);
     const line = formatRuntimePrivilegeEvidence(evidence);
     expect(line).toContain(
-      "member_of=app_request(admin=false,inherit=false,set=true)",
+      "member_of=app_request(admin=false,inherit=false,set=true,grantor=migration_login)",
     );
+    expect(line).toContain("app_request_member_of=app_request");
     expect(line).toContain("effective_member_of=app_request,app_runtime");
     expect(line).toContain("owned_or_acl=0");
     expect(line).not.toContain(password);
@@ -374,6 +408,7 @@ describe("app runtime role provisioning", () => {
       message = error instanceof Error ? error.message : "";
     }
     expect(message).toContain("superuser=false");
+    expect(message).toContain("phase=flags");
     expect(message).toContain("Restricted attributes were not changed.");
     expect(message).not.toContain("is ready");
     expect(message).not.toContain(password);
@@ -411,13 +446,20 @@ describe("app runtime role provisioning", () => {
     await expect(
       provisionAppRuntime(memberCalls.sql, password),
     ).rejects.toThrow(
-      /member_of=platform_admin\(admin=false,inherit=false,set=true\)/,
+      /member_of=platform_admin\(admin=false,inherit=false,set=true,grantor=postgres\)/,
     );
     expect(memberCalls.statements.join("\n")).not.toContain("password");
     expect(memberCalls.statements.join("\n")).not.toContain("is ready");
+    expect(memberCalls.statements.join("\n")).not.toContain("alter role");
     expect(await readRuntimeRole(memberDb)).toMatchObject({
       memberOf: [
-        { role: "platform_admin", admin: false, inherit: false, set: true },
+        {
+          role: "platform_admin",
+          admin: false,
+          inherit: false,
+          set: true,
+          grantor: "postgres",
+        },
       ],
     });
   });
@@ -442,10 +484,13 @@ describe("app runtime role provisioning", () => {
     await connection.exec("reset session authorization");
     await useMigrationLogin(connection);
     const { message, statements } = await rejection(connection, password);
-    expect(message).toContain("app_request(admin=false,inherit=true,set=true)");
     expect(message).toContain(
-      "app_request(admin=true,inherit=false,set=false)",
+      "app_request(admin=false,inherit=true,set=true,grantor=postgres)",
     );
+    expect(message).toContain(
+      "app_request(admin=true,inherit=false,set=false,grantor=other_grantor)",
+    );
+    expect(message).toContain("phase=membership");
     expect(message).not.toContain("member_of=app_request,app_request");
     expect(message).toContain("Restricted attributes were not changed.");
     expect(message).not.toContain("is ready");
@@ -466,14 +511,16 @@ describe("app runtime role provisioning", () => {
     `);
     await useMigrationLogin(connection);
     const { message, statements } = await rejection(connection, password);
-    expect(message).toContain(
-      "effective_member_of=app_request,app_runtime,transit_role",
-    );
+    expect(message).toContain("app_request_member_of=app_request,transit_role");
+    expect(message).toContain("phase=request_role");
+    expect(message).toContain("login=");
     expect(message).toContain("Restricted attributes were not changed.");
     expect(message).not.toContain("is ready");
     expect(message).not.toContain(password);
     expect(statements.join("\n")).not.toContain(password);
     expect(statements.join("\n")).not.toContain("SCRAM-SHA-256$");
+    expect(statements.join("\n")).not.toContain(GRANT_APP_REQUEST_SQL);
+    expect(statements.join("\n")).not.toContain("alter role app_request");
   });
 
   it("rejects a request role that can bypass row level security", async () => {
@@ -484,8 +531,10 @@ describe("app runtime role provisioning", () => {
     );
     await useMigrationLogin(connection);
     const { message, statements } = await rejection(connection, password);
+    expect(message).toContain("phase=request_role");
     expect(message).toContain("app_request_bypassrls=true");
     expect(message).toContain("app_request_login=false");
+    expect(message).toContain("login=true");
     expect(message).toContain("Restricted attributes were not changed.");
     expect(message).not.toContain("is ready");
     expect(message).not.toContain(password);
@@ -504,6 +553,8 @@ describe("app runtime role provisioning", () => {
     `);
     await useMigrationLogin(owned);
     const ownedFailure = await rejection(owned, password);
+    expect(ownedFailure.message).toContain("phase=dependency");
+    expect(ownedFailure.message).toContain("login=true");
     expect(ownedFailure.message).toMatch(/owned_or_acl=[1-9]/);
     expect(ownedFailure.message).not.toContain("is ready");
     expect(ownedFailure.message).not.toContain(password);
@@ -532,13 +583,124 @@ describe("app runtime role provisioning", () => {
     );
     await useMigrationLogin(connection);
     const { message, statements } = await rejection(connection, password);
-    expect(message).toBe(
-      "Could not set the app runtime password. sqlstate=42501",
-    );
+    expect(message).toContain("phase=password");
+    expect(message).toContain("sqlstate=42501");
+    expect(message).toContain("login=true");
+    expect(message).toContain("superuser=false");
+    expect(message).toMatch(/sqlstate=42501$/);
     expect(message).not.toContain("permission denied");
+    expect(message).not.toContain("alter role app_runtime password");
     expect(message).not.toContain(password);
     expect(message).not.toContain("SCRAM-SHA-256");
     expectVerifierOnly(statements);
+  });
+
+  it("keeps reviewed app_request grants and migration-owned auth wrappers", async () => {
+    const connection = await migrated();
+    const privileges = await connection.query<{
+      schema_usage: boolean;
+      auth_uid: boolean;
+      businesses: boolean;
+      request_dependencies: number | string;
+      owner_name: string;
+    }>(`
+      select
+        has_schema_privilege('app_request', 'app', 'USAGE') as schema_usage,
+        has_function_privilege('app_request', 'app.auth_uid()', 'EXECUTE') as auth_uid,
+        has_table_privilege('app_request', 'app.businesses', 'SELECT') as businesses,
+        (
+          select count(*)::int
+          from pg_shdepend
+          where refclassid = 'pg_authid'::regclass
+            and refobjid = (select oid from pg_roles where rolname = 'app_request')
+            and deptype in ('a', 'o')
+        ) as request_dependencies,
+        (
+          select owner.rolname
+          from pg_proc function
+          join pg_namespace namespace on namespace.oid = function.pronamespace
+          join pg_roles owner on owner.oid = function.proowner
+          where namespace.nspname = 'app' and function.proname = 'auth_uid'
+        ) as owner_name
+    `);
+    const row = privileges.rows[0];
+    expect(row?.schema_usage).toBe(true);
+    expect(row?.auth_uid).toBe(true);
+    expect(row?.businesses).toBe(true);
+    expect(Number(row?.request_dependencies)).toBeGreaterThan(0);
+    expect(row?.owner_name).toBe("postgres");
+    await useMigrationLogin(connection);
+    const first = recording(connection);
+    expect(await provisionAppRuntime(first.sql, password)).toEqual(ready);
+    const second = recording(connection);
+    expect(await provisionAppRuntime(second.sql, password)).toEqual(ready);
+    expect(first.statements.join("\n")).not.toContain("alter role app_request");
+    expect(second.statements.join("\n")).not.toContain("drop role");
+  });
+
+  it("does not create app_runtime when the request role is unsafe", async () => {
+    const connection = await migrated();
+    await connection.exec("alter role app_request bypassrls");
+    await useMigrationLogin(connection);
+    const { message, statements } = await rejection(connection, password);
+    expect(message).toContain("role app_runtime absent");
+    expect(message).toContain("phase=request_role");
+    expect(message).toContain("app_request_bypassrls=true");
+    expect(message).not.toContain(password);
+    const issued = statements.join("\n");
+    expect(issued).not.toContain("create role");
+    expect(issued).not.toContain("alter role app_request");
+    expect(issued).not.toContain("password");
+    const still = await connection.query<{ present: boolean }>(
+      "select exists(select 1 from pg_roles where rolname = 'app_runtime') as present",
+    );
+    expect(still.rows[0]?.present).toBe(false);
+  });
+
+  it("reproduces PostgreSQL SCRAM secrets and checks the password exchange", async () => {
+    expect(
+      pbkdf2Sync("password", "salt", 4096, 32, "sha256").toString("hex"),
+    ).toBe("c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a");
+    const { connection } = await emptyDatabase();
+    const setting = await connection.query<{ scram_iterations: string }>(
+      "show scram_iterations",
+    );
+    expect(setting.rows[0]?.scram_iterations).toBe(
+      String(SCRAM_SHA256_ITERATIONS),
+    );
+    const encryption = await connection.query<{ password_encryption: string }>(
+      "show password_encryption",
+    );
+    expect(encryption.rows[0]?.password_encryption).toBe("scram-sha-256");
+    const cases = [
+      { password: "\u2168", same: "IX" },
+      { password: "pen\u00adcils", same: "pencils" },
+      { password: "pen\u00a0cil", same: "pen cil" },
+      { password: "a\u0001b", same: "a\u0001b" },
+    ];
+    for (const entry of cases) {
+      await connection.exec("drop role if exists scram_probe");
+      await connection.exec("create role scram_probe login");
+      const quoted = await connection.query<{ statement: unknown }>(
+        "select format('alter role scram_probe password %L', $1::text) as statement",
+        [entry.password],
+      );
+      const statement = quoted.rows[0]?.statement;
+      if (typeof statement !== "string") throw new Error("password statement");
+      await connection.exec(statement);
+      const stored = await connection.query<{ rolpassword: unknown }>(
+        "select rolpassword from pg_authid where rolname = 'scram_probe'",
+      );
+      const secret = stored.rows[0]?.rolpassword;
+      if (typeof secret !== "string") throw new Error("stored secret");
+      expect(secret.includes(entry.password)).toBe(false);
+      expect(scramSha256ReproducesStoredSecret(entry.password, secret)).toBe(
+        true,
+      );
+      expect(scramSha256Accepts(secret, entry.password)).toBe(true);
+      expect(scramSha256Accepts(secret, entry.same)).toBe(true);
+      expect(scramSha256Accepts(secret, "other-secret")).toBe(false);
+    }
   });
 
   it("keeps the ready log after provisioning and out of the role statements", () => {
@@ -561,6 +723,13 @@ describe("app runtime role provisioning", () => {
     expect(source).not.toContain("nobypassrls");
     expect(source).not.toContain("drop role");
     expect(source).toContain("Postgres 16 and later");
+    const scram = readFileSync(
+      "src/server/application/scram-password.ts",
+      "utf8",
+    );
+    expect(scram).toContain("saslprep");
+    expect(scram).not.toContain("console.log");
+    expect(scram).not.toContain(password);
     const release = readFileSync("docs/release.md", "utf8");
     expect(release).toContain("Postgres 16 and later");
     expect(release).toContain("rolsuper");
