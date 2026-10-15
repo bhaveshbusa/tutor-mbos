@@ -1,0 +1,73 @@
+name: Accept development
+
+# Manual hosted acceptance for tutor-mbos-dev. It does not deploy, migrate,
+# change Auth settings, or run on pull requests. Dispatch it from main after
+# the development promotion for that commit. Coding CI stays secretless.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: development-acceptance
+  cancel-in-progress: false
+
+jobs:
+  accept:
+    name: Accept tutor-mbos-dev
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: development
+    env:
+      DEPLOY_ENVIRONMENT: development
+      TUTOR_MBOS_ACCEPTANCE: development
+      VERCEL_ORG_ID: team_2QehRm248FPmHJTzKS0rvS6b
+      VERCEL_PROJECT_ID: prj_ysIJHdIKYk2MQwvOKermUvIMuGVa
+      VERCEL_CLI_VERSION: 63.1.2
+      VERCEL_TELEMETRY_DISABLED: "1"
+    steps:
+      - name: Require main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Development acceptance runs from main only."
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Report acceptance credentials
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          SUPABASE_DEVELOPMENT_ACCESS_TOKEN: ${{ secrets.SUPABASE_DEVELOPMENT_ACCESS_TOKEN }}
+          TUTOR_MBOS_APP_DATABASE_URL: ${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}
+        run: |
+          if [ -z "$VERCEL_TOKEN" ]; then
+            echo "::error::VERCEL_TOKEN is absent. Expected secret scope: GitHub environment development (Settings → Environments → development → Secrets)."
+            exit 1
+          fi
+          echo "VERCEL_TOKEN is present. Expected secret scope: GitHub environment development."
+          if [ -z "$SUPABASE_DEVELOPMENT_ACCESS_TOKEN" ]; then
+            echo "::error::SUPABASE_DEVELOPMENT_ACCESS_TOKEN is absent. Expected secret scope: GitHub environment development (Settings → Environments → development → Secrets). Purpose: read-only GET of development Auth config and PostgREST exposed schemas. Permissions: auth_config_read and data_api_config_read. Not a service-role key and not auth_config_write."
+          else
+            echo "SUPABASE_DEVELOPMENT_ACCESS_TOKEN is present. Expected secret scope: GitHub environment development."
+          fi
+          if [ -z "$TUTOR_MBOS_APP_DATABASE_URL" ]; then
+            echo "::error::TUTOR_MBOS_APP_DATABASE_URL is absent. Expected secret scope: GitHub environment development (Settings → Environments → development → Secrets). Purpose: development app_runtime connection for direct tenant reads and cleanup. Not the migration URL."
+          else
+            echo "TUTOR_MBOS_APP_DATABASE_URL is present. Expected secret scope: GitHub environment development."
+          fi
+      - name: Pull Vercel project settings and environment
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: pnpm dlx "vercel@${VERCEL_CLI_VERSION}" pull --yes --environment=production
+      - name: Verify deployment target binding
+        run: node scripts/assert-deploy-target.ts "$DEPLOY_ENVIRONMENT"
+      - name: Run hosted acceptance
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+          SUPABASE_DEVELOPMENT_ACCESS_TOKEN: ${{ secrets.SUPABASE_DEVELOPMENT_ACCESS_TOKEN }}
+          TUTOR_MBOS_APP_DATABASE_URL: ${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
+        run: pnpm accept:development

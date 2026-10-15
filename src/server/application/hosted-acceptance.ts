@@ -1,0 +1,411 @@
+/**
+ * Classifiers for the development hosted-acceptance harness.
+ * This module does not open connections or read credentials.
+ */
+import type { Sql, SqlConnection } from "./sql";
+
+export type AcceptanceStatus = "pass" | "fail" | "gap";
+
+export interface AcceptanceCase {
+  id: string;
+  status: AcceptanceStatus;
+  detail: string;
+}
+
+export interface AcceptanceReport {
+  environment: "development";
+  source: string;
+  deployedCommit: string;
+  schema: string;
+  results: AcceptanceCase[];
+}
+
+export const MANAGEMENT_TOKEN_SECRET = "SUPABASE_DEVELOPMENT_ACCESS_TOKEN";
+export const APP_DATABASE_URL_SECRET = "TUTOR_MBOS_APP_DATABASE_URL";
+export const PUBLISHABLE_KEY_NAME = "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY";
+
+/** GitHub environment secret location. Values are never read by this module. */
+export const DEVELOPMENT_SECRET_LOCATION =
+  "GitHub → Settings → Environments → development → Secrets";
+
+/**
+ * Read-only Management API token for development project
+ * idvzjqrkgnihvxoswuxu. Required permissions: auth_config_read and
+ * data_api_config_read. The harness calls GET only. It must not be a
+ * service-role key and it must not include auth_config_write.
+ */
+export const MANAGEMENT_TOKEN_PURPOSE =
+  "Read development Auth settings and PostgREST exposed schemas. GET only.";
+
+/**
+ * The development app_runtime connection already used by the deployed app.
+ * The harness sets the synthetic user's JWT claims and SET LOCAL ROLE
+ * app_request. It is not the migration URL and it is not a privileged login.
+ */
+export const APP_DATABASE_URL_PURPOSE =
+  "Development app_runtime connection for direct tenant reads and cleanup.";
+
+export const EXPECTED_AUTHORIZATION_PATH = "/oauth/consent";
+
+export const REAL_CLIENT_GAPS: readonly AcceptanceCase[] = [
+  {
+    id: "client.chatgpt",
+    status: "gap",
+    detail:
+      "Supabase MCP authentication requires the ChatGPT product to discover the protected resource, dynamically register, and complete consent in a ChatGPT account (https://supabase.com/docs/guides/auth/oauth-server/mcp-authentication). GitHub Actions and the Management API have no method that authorizes that product. generic_client evidence is not ChatGPT.",
+  },
+  {
+    id: "client.second_mcp",
+    status: "gap",
+    detail:
+      "A second real MCP product has the same account-consent limitation. No supported cloud API completes that product's authorization. Another generic registration would still be generic_client.",
+  },
+];
+
+const APP_PATH_MARKERS = [
+  "businesses",
+  "client_grants",
+  "oauth_consents",
+  "access_audit",
+  "business_creation_keys",
+  "setup_report",
+];
+
+export function secretAbsent(name: string): string {
+  return `secret_absent:${name} location=GitHub environment development`;
+}
+
+export function acceptanceCase(
+  id: string,
+  status: AcceptanceStatus,
+  detail: string,
+): AcceptanceCase {
+  return { id, status, detail: sanitizeDetail(detail) };
+}
+
+export function sanitizeDetail(value: string): string {
+  return value
+    .replace(/[\r\n]+/g, " ")
+    .replace(/sb_secret_[A-Za-z0-9_-]+/g, "[redacted]")
+    .replace(/sb_publishable_[A-Za-z0-9_-]+/g, "[redacted]")
+    .replace(/sbp_[A-Za-z0-9_-]+/g, "[redacted]")
+    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]")
+    .replace(/postgres(?:ql)?:\/\/\S+/gi, "[redacted]")
+    .replace(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g, "[redacted]")
+    .replace(/SCRAM-SHA-256\$\S+/g, "[redacted]")
+    .trim();
+}
+
+export function schemaIdentity(
+  migrations: readonly { version: string; sha256: string }[],
+): string {
+  return migrations.map((row) => `${row.version}:${row.sha256}`).join(" ");
+}
+
+export function acceptanceTally(results: readonly AcceptanceCase[]): {
+  result: "pass" | "incomplete" | "fail";
+  passed: number;
+  failed: number;
+  gaps: number;
+  exitCode: number;
+} {
+  const passed = results.filter((row) => row.status === "pass").length;
+  const failed = results.filter((row) => row.status === "fail").length;
+  const gaps = results.filter((row) => row.status === "gap").length;
+  const result = failed > 0 ? "fail" : gaps > 0 ? "incomplete" : "pass";
+  return { result, passed, failed, gaps, exitCode: failed > 0 ? 1 : 0 };
+}
+
+export function formatAcceptanceReport(report: AcceptanceReport): string {
+  const tally = acceptanceTally(report.results);
+  const lines = [
+    "environment=development",
+    `source=${sanitizeDetail(report.source) || "absent"}`,
+    `deployed_commit=${sanitizeDetail(report.deployedCommit) || "absent"}`,
+    "schema_source=reviewed_manifest",
+    `schema=${sanitizeDetail(report.schema)}`,
+    ...report.results.map(
+      (row) => `case ${row.id} ${row.status} ${sanitizeDetail(row.detail)}`,
+    ),
+    `acceptance_result=${tally.result}`,
+    `passed=${tally.passed} failed=${tally.failed} gaps=${tally.gaps}`,
+    "generic_client_is_not_chatgpt=true",
+    "generic_client_is_not_second_mcp_client=true",
+  ];
+  return lines.join("\n");
+}
+
+export interface AuthConfigSnapshot {
+  oauth_server_enabled?: unknown;
+  oauth_server_allow_dynamic_registration?: unknown;
+  oauth_server_authorization_path?: unknown;
+  site_url?: unknown;
+  uri_allow_list?: unknown;
+  security_update_password_require_reauthentication?: unknown;
+}
+
+function sameUrl(left: string, right: string): boolean {
+  return left.replace(/\/+$/, "") === right.replace(/\/+$/, "");
+}
+
+function allowList(value: string): string[] {
+  return value
+    .split(/[\s,]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+export function classifyAuthSettings(
+  config: AuthConfigSnapshot,
+  siteOrigin: string,
+): AcceptanceCase[] {
+  const callback = `${siteOrigin}/auth/callback`;
+  const recovery = `${siteOrigin}/auth/recovery`;
+  const listed =
+    typeof config.uri_allow_list === "string"
+      ? allowList(config.uri_allow_list)
+      : [];
+  const missing = [
+    listed.some((entry) => sameUrl(entry, callback)) ? "" : "auth_callback",
+    listed.some((entry) => sameUrl(entry, recovery)) ? "" : "auth_recovery",
+  ].filter(Boolean);
+  const secure = config.security_update_password_require_reauthentication;
+  return [
+    acceptanceCase(
+      "auth.oauth_server_enabled",
+      config.oauth_server_enabled === true ? "pass" : "fail",
+      config.oauth_server_enabled === true ? "enabled" : "disabled",
+    ),
+    acceptanceCase(
+      "auth.dynamic_registration",
+      config.oauth_server_allow_dynamic_registration === true ? "pass" : "fail",
+      config.oauth_server_allow_dynamic_registration === true
+        ? "enabled"
+        : "disabled",
+    ),
+    acceptanceCase(
+      "auth.authorization_path",
+      config.oauth_server_authorization_path === EXPECTED_AUTHORIZATION_PATH
+        ? "pass"
+        : "fail",
+      config.oauth_server_authorization_path === EXPECTED_AUTHORIZATION_PATH
+        ? "path=/oauth/consent"
+        : "path=mismatch",
+    ),
+    acceptanceCase(
+      "auth.site_url",
+      typeof config.site_url === "string" &&
+        sameUrl(config.site_url, siteOrigin)
+        ? "pass"
+        : "fail",
+      typeof config.site_url === "string" &&
+        sameUrl(config.site_url, siteOrigin)
+        ? "match"
+        : "mismatch",
+    ),
+    acceptanceCase(
+      "auth.redirect_allow_list",
+      missing.length === 0 ? "pass" : "fail",
+      missing.length === 0 ? "match" : `missing=${missing.join(",")}`,
+    ),
+    acceptanceCase(
+      "auth.secure_password_change",
+      typeof secure === "boolean" ? "pass" : "fail",
+      typeof secure === "boolean"
+        ? `security_update_password_require_reauthentication=${secure}`
+        : "security_update_password_require_reauthentication=absent",
+    ),
+  ];
+}
+
+export function classifyExposedSchemas(dbSchema: string): AcceptanceCase {
+  const names = dbSchema
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
+  const exposed = names.join(",") || "absent";
+  const pass = names.length === 1 && names[0] === "public";
+  return acceptanceCase(
+    "auth.exposed_schemas",
+    pass ? "pass" : "fail",
+    `db_schema=${exposed}`,
+  );
+}
+
+export function jwtAudience(token: string): unknown {
+  const payload = token.split(".")[1];
+  if (!payload) return undefined;
+  try {
+    const parsed = JSON.parse(
+      Buffer.from(payload, "base64url").toString("utf8"),
+    ) as { aud?: unknown };
+    return parsed.aud;
+  } catch {
+    return undefined;
+  }
+}
+
+function audienceLabel(value: string, resource: string): string {
+  if (value === "authenticated") return "authenticated";
+  if (value === resource) return "resource";
+  return "other";
+}
+
+export function classifyIssuedAudience(
+  aud: unknown,
+  resource: string,
+): AcceptanceCase {
+  const values = Array.isArray(aud) ? aud : [aud];
+  if (
+    values.length === 0 ||
+    values.some((value) => typeof value !== "string" || value.length === 0)
+  ) {
+    return acceptanceCase(
+      "generic_client.audience",
+      "fail",
+      "issued_audience=unreadable",
+    );
+  }
+  const labels = values.map((value) =>
+    audienceLabel(value as string, resource),
+  );
+  const accepted = labels.every(
+    (label) => label === "authenticated" || label === "resource",
+  );
+  const resourceAudience = labels.includes("resource") ? "present" : "absent";
+  return acceptanceCase(
+    "generic_client.audience",
+    accepted ? "pass" : "fail",
+    `issued_audience=${labels.join(",")} resource_audience=${resourceAudience}`,
+  );
+}
+
+export function openApiExposesApp(document: unknown): boolean {
+  const text = JSON.stringify(document ?? {});
+  if (text.includes("app.businesses") || text.includes('"schema":"app"')) {
+    return true;
+  }
+  const paths = (document as { paths?: Record<string, unknown> } | null)?.paths;
+  if (!paths || typeof paths !== "object") return false;
+  return Object.keys(paths).some((path) =>
+    APP_PATH_MARKERS.some((marker) => path.includes(marker)),
+  );
+}
+
+export function dataApiDenied(status: number, body: unknown): boolean {
+  if (status === 200) return false;
+  const code = (body as { code?: unknown } | null)?.code;
+  if (typeof code === "string" && /^PGRST\d+$/.test(code)) return true;
+  return status === 401 || status === 403 || status === 404 || status === 406;
+}
+
+export interface DirectProbe {
+  runtimeReadDenied: boolean;
+  ownVisible: boolean;
+  otherVisible: boolean;
+  deleted: boolean;
+}
+
+function permissionDenied(error: unknown): boolean {
+  const code =
+    typeof error === "object" && error !== null && "code" in error
+      ? String(error.code)
+      : "";
+  if (code === "42501") return true;
+  const message = error instanceof Error ? error.message : "";
+  return /permission denied/i.test(message);
+}
+
+async function asRequest<T>(
+  db: SqlConnection,
+  userId: string,
+  fn: (tx: Sql) => Promise<T>,
+): Promise<T> {
+  const claims = JSON.stringify({
+    sub: userId,
+    role: "authenticated",
+    aud: "authenticated",
+  });
+  return db.transaction(async (tx) => {
+    await tx.query("select set_config('request.jwt.claims', $1, true)", [
+      claims,
+    ]);
+    await tx.query("select set_config('request.jwt.claim.sub', $1, true)", [
+      userId,
+    ]);
+    await tx.exec("set local role app_request");
+    return fn(tx);
+  });
+}
+
+async function visibleIds(tx: Sql): Promise<string[]> {
+  const result = await tx.query<{ id: string }>(
+    "select id::text as id from app.businesses",
+  );
+  return result.rows.map((row) => row.id);
+}
+
+/**
+ * Direct database bypass for one synthetic owner. The connection must already
+ * be the app_runtime login. The function never prints SQL errors.
+ */
+export async function probeDirectTenantAccess(
+  db: SqlConnection,
+  input: { userId: string; ownBusinessId: string; otherBusinessId: string },
+): Promise<DirectProbe> {
+  let runtimeReadDenied = false;
+  try {
+    await db.query("select id::text as id from app.businesses");
+  } catch (error) {
+    runtimeReadDenied = permissionDenied(error);
+  }
+  const visible = await asRequest(db, input.userId, visibleIds);
+  await asRequest(db, input.userId, async (tx) => {
+    await tx.query("delete from app.business_creation_keys");
+    await tx.query("delete from app.oauth_consents");
+    await tx.query("update app.client_grants set business_id = null");
+    await tx.query("delete from app.businesses");
+  });
+  const remaining = await asRequest(db, input.userId, visibleIds);
+  return {
+    runtimeReadDenied,
+    ownVisible:
+      visible.includes(input.ownBusinessId) &&
+      !visible.includes(input.otherBusinessId),
+    otherVisible: visible.includes(input.otherBusinessId),
+    deleted:
+      !remaining.includes(input.ownBusinessId) &&
+      !remaining.includes(input.otherBusinessId),
+  };
+}
+
+export function classifyDirectProbe(probe: DirectProbe): AcceptanceCase[] {
+  return [
+    acceptanceCase(
+      "direct.runtime_cannot_read",
+      probe.runtimeReadDenied ? "pass" : "fail",
+      probe.runtimeReadDenied ? "permission_denied" : "rows_visible",
+    ),
+    acceptanceCase(
+      "direct.tenant_isolation",
+      probe.ownVisible && !probe.otherVisible ? "pass" : "fail",
+      probe.otherVisible
+        ? "other_tenant_visible"
+        : probe.ownVisible
+          ? "own_tenant_only"
+          : "own_tenant_absent",
+    ),
+    acceptanceCase(
+      "direct.cleanup",
+      probe.deleted ? "pass" : "fail",
+      probe.deleted ? "own_rows_removed" : "own_rows_remain",
+    ),
+  ];
+}
+
+export function blockedCases(
+  ids: readonly string[],
+  reason: string,
+): AcceptanceCase[] {
+  return ids.map((id) => acceptanceCase(id, "fail", `blocked:${reason}`));
+}

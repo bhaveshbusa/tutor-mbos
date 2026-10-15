@@ -18,6 +18,7 @@
     "test": "vitest run",
     "hygiene": "node scripts/check-repo-hygiene.ts",
     "migrate:development": "tsx scripts/apply-migrations.ts",
+    "accept:development": "tsx scripts/hosted-acceptance.ts",
     "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm hygiene && pnpm build"
   },
   "dependencies": {

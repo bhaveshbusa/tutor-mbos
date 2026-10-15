@@ -81,7 +81,7 @@ Agent workspaces, pull request workflows and the repository never hold these val
 The Vercel projects and Supabase projects already exist. Do not recreate them.
 
 1. **Vercel token.** Create a token scoped to team `lets-play-game` (`team_2QehRm248FPmHJTzKS0rvS6b`) at Vercel → Account Settings → Tokens. Prefer separate tokens for the `development` and `production` GitHub environments so either can be revoked alone. Vercel tokens are team-scoped, not project-scoped; the workflows pin the project IDs and verify the linked project before deploying.
-2. **GitHub environment `development`.** Create it at GitHub → Settings → Environments. Restrict deployment branches to `main`. Add secrets `VERCEL_TOKEN`, `SUPABASE_MIGRATION_DATABASE_URL` and `APP_RUNTIME_PASSWORD`.
+2. **GitHub environment `development`.** Create it at GitHub → Settings → Environments. Restrict deployment branches to `main`. Add secrets `VERCEL_TOKEN`, `SUPABASE_MIGRATION_DATABASE_URL` and `APP_RUNTIME_PASSWORD`. Acceptance also needs `SUPABASE_DEVELOPMENT_ACCESS_TOKEN` (`auth_config_read` and `data_api_config_read` only) and `TUTOR_MBOS_APP_DATABASE_URL` (the development `app_runtime` connection, not the migration URL). See `docs/release.md`.
 3. **GitHub environment `production`.** Create it. Restrict deployment branches to `main`. Add required reviewers (the owner) and enable *Prevent self-review*. Add secret `VERCEL_TOKEN`. Do not add `PRODUCTION_RELEASES_ENABLED` until final sign-off.
 4. **Vercel runtime variables.** Add the variables in the table above to each project's Production environment.
 5. **Vercel project settings.** For both projects: Framework Preset *Next.js*, Node.js version *24.x*. A Git connection is optional; `vercel.json` disables Git-triggered deployments so only the workflows deploy.
@@ -105,6 +105,14 @@ The Vercel projects and Supabase projects already exist. Do not recreate them.
 *Migrate development* (`.github/workflows/migrate-development.yml`) remains a manual recovery entry for the same migration job. It uses the same concurrency group and queue, so it waits for an in-progress development delivery instead of overlapping it, and it does not cancel a delivery that is already pending. Routine pushes do not need that dispatch. Recovery does not run the Vercel preflight; it applies reviewed SQL only.
 
 To rerun the whole sequence: GitHub → Actions → *Deploy development* → *Run workflow* on `main`.
+
+## Development acceptance
+
+`.github/workflows/accept-development.yml` runs only on manual dispatch from `main`. It uses the `development` environment and the concurrency group `development-acceptance`, so it does not cancel or queue ahead of delivery. It pulls the development Vercel project, checks the binding, then runs `scripts/hosted-acceptance.ts`.
+
+The script uses Auth signup, the deployed UI, API, and MCP routes, OAuth discovery, and dynamic registration. It reads Auth and PostgREST settings with `GET` requests only. Direct database checks use `app_runtime` and `SET LOCAL ROLE app_request`. Missing acceptance secrets are reported by name and the corresponding cases fail. ChatGPT and a second real MCP client stay recorded gaps: those products' account consent is not available to GitHub Actions or the Management API. The workflow prints sanitized pass, fail, and gap lines. It does not print tokens, messages, or connection values, and it does not change production.
+
+Dispatch it after the development promotion for the commit under test: GitHub → Actions → *Accept development* → *Run workflow* on `main`.
 
 ## Production release
 
