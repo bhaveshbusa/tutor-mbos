@@ -79,6 +79,10 @@ describe("versioned migrations", () => {
     ).rejects.toThrow(/permission denied/);
     await connection.exec("reset role");
     await assertTenantPrivileges(connection);
+    await connection.exec("revoke usage on schema auth from app_request");
+    await expect(assertTenantPrivileges(connection)).rejects.toThrow(
+      /cannot execute auth.uid/,
+    );
   });
 
   it("keeps populated rows when the corrective migration is applied", async () => {

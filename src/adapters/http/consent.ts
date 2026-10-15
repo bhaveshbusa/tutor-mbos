@@ -103,7 +103,13 @@ export async function revokeSupabaseOauthGrant(
         },
       },
     );
-    if (response.ok || response.status === 404) return "gone";
+    if (response.ok) return "gone";
+    if (response.status === 404) {
+      const body = (await response.json().catch(() => null)) as {
+        error_code?: unknown;
+      } | null;
+      if (body?.error_code === "oauth_consent_not_found") return "gone";
+    }
     return "failed";
   } catch {
     return "failed";

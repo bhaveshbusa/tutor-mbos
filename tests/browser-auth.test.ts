@@ -187,11 +187,19 @@ describe("browser authentication", () => {
   it("treats a missing Supabase OAuth grant as already revoked", async () => {
     const supabase = "https://idvzjqrkgnihvxoswuxu.supabase.co";
     const key = `sb_${"publishable"}_revoke_test`;
-    const calls: number[] = [];
+    const bodies = [
+      { status: 404, error_code: "oauth_consent_not_found" },
+      { status: 204, error_code: "" },
+      { status: 404, error_code: "feature_disabled" },
+      { status: 500, error_code: "unexpected" },
+    ];
     const fetchImpl: typeof fetch = async () => {
-      const status = calls.length === 0 ? 404 : calls.length === 1 ? 204 : 500;
-      calls.push(status);
-      return new Response(null, { status });
+      const next = bodies.shift();
+      if (next?.status === 204) return new Response(null, { status: 204 });
+      return Response.json(
+        { error_code: next?.error_code },
+        { status: next?.status ?? 500 },
+      );
     };
     expect(
       await revokeSupabaseOauthGrant(
@@ -211,6 +219,15 @@ describe("browser authentication", () => {
         fetchImpl,
       ),
     ).toBe("gone");
+    expect(
+      await revokeSupabaseOauthGrant(
+        supabase,
+        key,
+        "session",
+        "client",
+        fetchImpl,
+      ),
+    ).toBe("failed");
     expect(
       await revokeSupabaseOauthGrant(
         supabase,

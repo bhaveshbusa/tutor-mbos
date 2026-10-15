@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { createAccessHandlers, type AccessDeps } from "@/adapters/http/access";
-import { handleConsentDecision } from "@/adapters/http/consent";
+import {
+  handleConsentDecision,
+  revokeSupabaseOauthGrant,
+} from "@/adapters/http/consent";
 import { authenticateMaterial } from "@/server/application/authenticate";
 import { verifyAccessToken } from "@/server/application/access-token";
 import {
@@ -509,6 +512,47 @@ describe("HTTP API access", () => {
     expect(chatgpt.status).toBe(303);
   });
 
+  it("does not reconnect when two live grants share one redirect", async () => {
+    const { mint, deps, store } = await world();
+    const owner = await mint(TENANT_A.userId);
+    const shared = "https://shared.example/callback";
+    for (const clientId of [API_CLIENT, CHATGPT_CLIENT]) {
+      await store.recordConsent(
+        { path: "ui-session", userId: TENANT_A.userId, clientId: null },
+        {
+          oauthClientId: clientId,
+          permissions: ["business.read"],
+          scopes: ["openid"],
+          authorizationId: clientId,
+          decision: "approved",
+          redirectUri: shared,
+        },
+      );
+    }
+    const response = await handleConsentDecision(
+      ui("https://example.test/api/oauth/decision", owner, {
+        method: "POST",
+        body: new URLSearchParams({
+          authorization_id: "authz-shared",
+          decision: "approve",
+        }),
+      }),
+      deps,
+      {
+        async details() {
+          return { redirectUrl: `${shared}?code=1` };
+        },
+        async decide() {
+          return { redirectUrl: `${shared}?code=1` };
+        },
+        async revokeGrant() {
+          return { ok: true };
+        },
+      },
+    );
+    expect(response.status).toBe(409);
+  });
+
   it("denies a new client when Supabase has no grant to delete", async () => {
     const { mint, deps } = await world();
     const owner = await mint(TENANT_A.userId);
@@ -580,6 +624,51 @@ describe("HTTP API access", () => {
         )
       ).status,
     ).toBe(403);
+  });
+
+  it("leaves the app grant when Supabase reports the OAuth server disabled", async () => {
+    const { handlers, mint, deps } = await world();
+    const owner = await mint(TENANT_A.userId);
+    await deps.store!.recordConsent(
+      { path: "ui-session", userId: TENANT_A.userId, clientId: null },
+      {
+        oauthClientId: API_CLIENT,
+        permissions: ["business.read"],
+        scopes: ["openid"],
+        authorizationId: "disabled",
+        decision: "approved",
+        redirectUri: "https://api-client.example/callback",
+      },
+    );
+    deps.revokeAuthGrant = async (sessionToken, clientId) => {
+      const result = await revokeSupabaseOauthGrant(
+        "https://idvzjqrkgnihvxoswuxu.supabase.co",
+        `sb_${"publishable"}_disabled`,
+        sessionToken,
+        clientId,
+        async () =>
+          Response.json({ error_code: "feature_disabled" }, { status: 404 }),
+      );
+      return result === "gone" ? "ok" : "failed";
+    };
+    const revoked = await handlers.revoke(
+      ui("https://example.test/api/v1/grants/revoke", owner, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ clientId: API_CLIENT }),
+      }),
+    );
+    expect(revoked.status).toBe(502);
+    const token = await mint(TENANT_A.userId, { client_id: API_CLIENT });
+    expect(
+      (
+        await handlers.getBusiness(
+          new Request("https://example.test/api/v1/business", {
+            headers: { authorization: `Bearer ${token}` },
+          }),
+        )
+      ).status,
+    ).toBe(200);
   });
 
   it("does not revoke the app grant when the authentication server refuses", async () => {

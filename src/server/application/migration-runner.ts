@@ -100,15 +100,19 @@ export async function applyMigrations(
  * auth.uid(), which stays granted by Supabase Auth rather than this app.
  */
 export async function assertTenantPrivileges(db: SqlConnection): Promise<void> {
-  const result = await db.query<{ app_usage: boolean; uid_execute: boolean }>(
-    `select has_schema_privilege('authenticated', 'app', 'USAGE') as app_usage,
-            has_function_privilege('app_request', 'auth.uid()', 'EXECUTE') as uid_execute`,
+  const result = await db.query<{ app_usage: boolean }>(
+    `select has_schema_privilege('authenticated', 'app', 'USAGE') as app_usage`,
   );
   const row = result.rows[0];
   if (!row || row.app_usage) {
     throw new Error("authenticated retains usage on schema app");
   }
-  if (!row.uid_execute) {
+  try {
+    await db.transaction(async (tx) => {
+      await tx.exec("set local role app_request");
+      await tx.query("select auth.uid()");
+    });
+  } catch {
     throw new Error("app_request cannot execute auth.uid()");
   }
 }

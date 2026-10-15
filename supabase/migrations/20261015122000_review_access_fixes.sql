@@ -102,6 +102,7 @@ revoke all on all tables in schema app from authenticated;
 revoke all on all sequences in schema app from authenticated;
 revoke all on all functions in schema app from authenticated;
 revoke all on app.setup_report from authenticated;
+revoke all on function app.record_client_consent(text, text[], text[], text, text, text) from public, anon;
 grant execute on function app.create_business(text, text) to app_request;
 grant execute on function app.record_client_consent(text, text[], text[], text, text, text) to app_request;
 grant execute on function app.revoke_client_grant(text) to app_request;

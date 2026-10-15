@@ -84,8 +84,14 @@ export function readStoredAccessToken(
   const key = authStorageKey(supabaseUrl);
   const direct = cookies.find((cookie) => cookie.name === key)?.value;
   const chunked = cookies
-    .filter((cookie) => cookie.name.startsWith(`${key}.`))
-    .sort((left, right) => left.name.localeCompare(right.name))
+    .flatMap((cookie) => {
+      if (!cookie.name.startsWith(`${key}.`)) return [];
+      const index = Number(cookie.name.slice(key.length + 1));
+      return Number.isInteger(index) && index >= 0
+        ? [{ index, value: cookie.value }]
+        : [];
+    })
+    .sort((left, right) => left.index - right.index)
     .map((cookie) => cookie.value)
     .join("");
   const raw = direct || chunked;
