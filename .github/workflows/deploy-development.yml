@@ -1,9 +1,10 @@
 name: Deploy development
 
-# Every push to main runs CI, then development migrations and privilege
-# checks, then a prebuilt deploy that is smoke tested before promotion.
-# Credentials come from the protected development environment only.
-# Pull requests do not run this workflow.
+# Every push to main runs CI, then a name-only Vercel preflight, then
+# development migrations and privilege checks, then a prebuilt deploy that
+# is smoke tested before promotion. Credentials come from the protected
+# development environment only. Pull requests do not run this workflow.
+# queue: max keeps a pending delivery when a recovery run is dispatched.
 on:
   push:
     branches: [main]
@@ -15,6 +16,7 @@ permissions:
 concurrency:
   group: development-delivery
   cancel-in-progress: false
+  queue: max
 
 jobs:
   checks:
@@ -22,9 +24,47 @@ jobs:
     with:
       ref: ${{ github.sha }}
 
+  preflight:
+    name: Verify tutor-mbos-dev configuration
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: development
+    env:
+      DEPLOY_ENVIRONMENT: development
+      VERCEL_ORG_ID: team_2QehRm248FPmHJTzKS0rvS6b
+      VERCEL_PROJECT_ID: prj_ysIJHdIKYk2MQwvOKermUvIMuGVa
+      VERCEL_CLI_VERSION: 63.1.2
+      VERCEL_TELEMETRY_DISABLED: "1"
+    steps:
+      - name: Require main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Development deployments run from main only."
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Require deployment credentials
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          if [ -z "$VERCEL_TOKEN" ]; then
+            echo "::error::Set VERCEL_TOKEN at GitHub → Settings → Environments → development → Secrets. See docs/cloud-foundation.md. Development migrations and promotion do not run until this step passes."
+            exit 1
+          fi
+      - name: Pull Vercel project settings and environment
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: pnpm dlx "vercel@${VERCEL_CLI_VERSION}" pull --yes --environment=production
+      - name: Verify deployment target binding
+        run: node scripts/assert-deploy-target.ts "$DEPLOY_ENVIRONMENT"
+
   migrate:
     name: Migrate tutor-mbos-dev
-    needs: checks
+    needs: preflight
     uses: ./.github/workflows/apply-development-migrations.yml
 
   deploy:

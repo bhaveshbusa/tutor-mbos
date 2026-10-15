@@ -90,19 +90,19 @@ The Vercel projects and Supabase projects already exist. Do not recreate them.
 
 ## Development deployment
 
-`.github/workflows/deploy-development.yml` runs on every push to `main` and on manual dispatch from `main`. It does not run on pull requests. The sequence is serialized with the manual migration recovery workflow by the concurrency group `development-delivery`.
+`.github/workflows/deploy-development.yml` runs on every push to `main` and on manual dispatch from `main`. It does not run on pull requests. The sequence is serialized with the manual migration recovery workflow by the concurrency group `development-delivery`, with `cancel-in-progress: false` and `queue: max`. A recovery dispatch does not cancel a delivery that is already queued.
 
 1. Reusable CI (all checks above).
-2. Development migrations through `.github/workflows/apply-development-migrations.yml`: ledger drift check, privilege check, then pending SQL. This uses `SUPABASE_MIGRATION_DATABASE_URL` and `APP_RUNTIME_PASSWORD` from GitHub → Settings → Environments → `development` → Secrets. If either secret is absent, the workflow stops here and does not promote.
-3. `vercel pull` for project `prj_ysIJHdIKYk2MQwvOKermUvIMuGVa`.
-4. `scripts/assert-deploy-target.ts development`: linked team/project and pulled runtime variables must match the development binding. `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` and `TUTOR_MBOS_APP_DATABASE_URL` must be present. If either is absent, the workflow stops before build, deploy and promotion and names Vercel project `tutor-mbos-dev` → Settings → Environment Variables → Production.
+2. Name-only preflight on project `prj_ysIJHdIKYk2MQwvOKermUvIMuGVa`: require `VERCEL_TOKEN`, `vercel pull`, then `scripts/assert-deploy-target.ts development`. The linked team and project must match the development binding, and `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` and `TUTOR_MBOS_APP_DATABASE_URL` must be present by name. A Secret-type value is pulled as `[SENSITIVE]`, so this step does not read the database username. If the token or either name is absent, the workflow stops before migrations, build, deploy and promotion and names the setup location.
+3. Development migrations through `.github/workflows/apply-development-migrations.yml`: ledger drift check, privilege check, then pending SQL. This uses `SUPABASE_MIGRATION_DATABASE_URL` and `APP_RUNTIME_PASSWORD` from GitHub → Settings → Environments → `development` → Secrets. If either secret is absent, the workflow stops here and does not promote.
+4. `vercel pull` again, then the same target check, so the build uses the reviewed project settings.
 5. `vercel build --prod` in CI (no `VERCEL_TOKEN`), then a secret scan of `.vercel/output`.
 6. `vercel deploy --prebuilt --prod --skip-domain` to `tutor-mbos-dev`. This creates the deployment without moving traffic. Development uses that project's main target because the project only ever holds synthetic data.
 7. `scripts/smoke-health.ts` against that deployment URL: `/api/v1/health` must return `200`, `environment: development`, the development Supabase project ref and the deployed commit.
 8. `vercel promote` only after the smoke test passes.
 9. If `SMOKE_ALIAS_URL` is set, the promoted alias is smoke tested again.
 
-*Migrate development* (`.github/workflows/migrate-development.yml`) remains a manual recovery entry for the same migration job. It uses the same concurrency group, so it waits for an in-progress development delivery instead of overlapping it. Routine pushes do not need that dispatch.
+*Migrate development* (`.github/workflows/migrate-development.yml`) remains a manual recovery entry for the same migration job. It uses the same concurrency group and queue, so it waits for an in-progress development delivery instead of overlapping it, and it does not cancel a delivery that is already pending. Routine pushes do not need that dispatch. Recovery does not run the Vercel preflight; it applies reviewed SQL only.
 
 To rerun the whole sequence: GitHub → Actions → *Deploy development* → *Run workflow* on `main`.
 

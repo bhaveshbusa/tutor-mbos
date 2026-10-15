@@ -49,8 +49,9 @@ const DEVELOPMENT_RUNTIME_LOCATION =
   "Vercel project tutor-mbos-dev → Settings → Environment Variables → Production";
 
 /**
- * Names required for a development deployment to be promoted. Values are not
- * read. Absence fails the development workflow before promotion.
+ * Names required before development migrations or promotion. Values are not
+ * read. A Secret-type value pulled as `[SENSITIVE]` still counts as present.
+ * Absence fails the development preflight before hosted SQL and promotion.
  */
 export function developmentSetupGaps(
   pulledEnv: Record<string, string | undefined>,

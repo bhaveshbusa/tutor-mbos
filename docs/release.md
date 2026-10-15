@@ -13,7 +13,7 @@ A candidate reaches production only through `.github/workflows/release-productio
 ## Database migrations
 
 - Migrations live in `supabase/migrations` and are checksummed in `supabase/migrations/manifest.json`.
-- Apply the same reviewed files to development before any production consideration. A push to `main` runs CI, then those migrations and privilege checks, then development deploy, smoke and promotion. *Migrate development* is only a manual recovery entry and shares the `development-delivery` concurrency group with that sequence. Both refuse a production database URL and the `app_runtime` login. Pull requests do not receive migration or deploy secrets.
+- Apply the same reviewed files to development before any production consideration. A push to `main` runs CI, then a name-only check of the development Vercel configuration, then those migrations and privilege checks, then development deploy, smoke and promotion. A missing publishable key or `TUTOR_MBOS_APP_DATABASE_URL` stops the run before hosted SQL and before promotion. *Migrate development* is only a manual recovery entry. It shares the `development-delivery` concurrency group with `queue: max` and `cancel-in-progress: false`, so a recovery dispatch waits behind an in-progress delivery and does not cancel a delivery that is already queued. Both refuse a production database URL and the `app_runtime` login. Pull requests do not receive migration or deploy secrets.
 - Fresh-install and populated-upgrade tests, a failed-migration rollback test, and a target/drift check run in CI without secrets.
 - Never edit a migration that has been applied. Add a corrective migration.
 - The runner takes a session advisory lock, checks the recorded ledger against the reviewed files, and only then applies each pending file in its own transaction, in manifest order. A recorded version that is not in the reviewed set, a checksum or name that does not match the file, or a history that skips an earlier version stops the run before any pending SQL.
@@ -32,15 +32,15 @@ The running app uses `TUTOR_MBOS_APP_DATABASE_URL` on the Vercel development pro
 
 Names only. Do not copy secret values into the repository, a pull request, or an agent workspace.
 
-| Name | Location | Evidence on 15 October 2026 |
-| --- | --- | --- |
-| `TUTOR_MBOS_ENV` | Vercel project `tutor-mbos-dev` → Settings → Environment Variables → Production | Present. Metadata-only read. |
-| `NEXT_PUBLIC_SUPABASE_URL` | Same Vercel location | Present. Metadata-only read. |
-| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Same Vercel location | Absent. Promotion fails until it is set. |
-| `TUTOR_MBOS_APP_DATABASE_URL` | Same Vercel location | Absent. Username must be `app_runtime`. Promotion fails until it is set. |
-| `SUPABASE_MIGRATION_DATABASE_URL` | GitHub → Settings → Environments → `development` → Secrets | Availability unverified. The migration step fails before promotion if it is absent. |
-| `APP_RUNTIME_PASSWORD` | Same GitHub secrets location | Availability unverified. The migration step fails before promotion if it is absent. |
-| `VERCEL_TOKEN` | Same GitHub secrets location | Required by the existing development deploy. Not re-read for this note. |
+| Name | Location |
+| --- | --- |
+| `TUTOR_MBOS_ENV` | Vercel project `tutor-mbos-dev` → Settings → Environment Variables → Production |
+| `NEXT_PUBLIC_SUPABASE_URL` | Same Vercel location |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Same Vercel location. The preflight stops before migrations and promotion until it is set. |
+| `TUTOR_MBOS_APP_DATABASE_URL` | Same Vercel location. Username must be `app_runtime`. The preflight stops before migrations and promotion until the name is set. Vercel writes `[SENSITIVE]` for a Secret-type value, so the check confirms the name only. |
+| `SUPABASE_MIGRATION_DATABASE_URL` | GitHub → Settings → Environments → `development` → Secrets. The migration step stops before SQL until it is set. |
+| `APP_RUNTIME_PASSWORD` | Same GitHub secrets location. The migration step stops before SQL until it is set. |
+| `VERCEL_TOKEN` | Same GitHub secrets location. The preflight stops before migrations and promotion until it is set. |
 
 Supabase Auth settings still to record on development project `idvzjqrkgnihvxoswuxu`: OAuth server enabled, exact site and redirect URLs, and the secure password change setting. Hosted acceptance still open: development migration apply, a hosted MCP token audience sample, a live ChatGPT handshake, a second MCP client handshake, and positive and negative checks for two synthetic tenants. Review handoffs stay on Linear and the pull request.
 

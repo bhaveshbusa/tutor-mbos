@@ -1,9 +1,11 @@
 name: Migrate development
 
 # Manual recovery only. A push to main runs the same migration inside
-# Deploy development, before that deployment is promoted. This entry shares
-# the development-delivery concurrency group so the two cannot overlap.
-# Pull requests do not run it, and it cannot target production.
+# Deploy development, after the name-only preflight and before promotion.
+# This entry shares the development-delivery concurrency group so the two
+# cannot overlap. queue: max keeps a pending delivery instead of cancelling
+# it when this recovery is dispatched. Pull requests do not run it, and it
+# cannot target production.
 on:
   workflow_dispatch:
 
@@ -13,6 +15,7 @@ permissions:
 concurrency:
   group: development-delivery
   cancel-in-progress: false
+  queue: max
 
 jobs:
   migrate:

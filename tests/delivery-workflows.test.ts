@@ -19,6 +19,11 @@ interface Job {
 interface Workflow {
   on: Record<string, unknown>;
   permissions?: Record<string, string>;
+  concurrency?: {
+    group?: string;
+    "cancel-in-progress"?: boolean;
+    queue?: string;
+  };
   jobs: Record<string, Job>;
 }
 
@@ -68,20 +73,32 @@ describe("CI workflow", () => {
 describe("development deployment", () => {
   const workflow = load("deploy-development.yml");
 
-  it("deploys only from main pushes or manual dispatch, after CI and migrations", () => {
+  it("deploys only from main pushes or manual dispatch, after CI, preflight and migrations", () => {
     expect(workflow.on).toEqual({
       push: { branches: ["main"] },
       workflow_dispatch: null,
     });
     expect(workflow.jobs.checks?.uses).toBe("./.github/workflows/ci.yml");
-    expect(workflow.jobs.migrate?.needs).toBe("checks");
+    expect(workflow.jobs.preflight?.needs).toBe("checks");
+    expect(environmentOf(workflow.jobs.preflight!)).toBe("development");
+    expect(workflow.jobs.migrate?.needs).toBe("preflight");
     expect(workflow.jobs.migrate?.uses).toBe(
       "./.github/workflows/apply-development-migrations.yml",
     );
     expect(workflow.jobs.deploy?.needs).toBe("migrate");
-    expect(raw(`${WORKFLOW_DIR}/deploy-development.yml`)).toContain(
-      "group: development-delivery",
+    expect(workflow.concurrency).toEqual({
+      group: "development-delivery",
+      "cancel-in-progress": false,
+      queue: "max",
+    });
+    const preflightRuns = (workflow.jobs.preflight?.steps ?? [])
+      .map((step) => step.run ?? "")
+      .join("\n");
+    expect(preflightRuns.indexOf("VERCEL_TOKEN")).toBeLessThan(
+      preflightRuns.indexOf("scripts/assert-deploy-target.ts"),
     );
+    expect(preflightRuns).not.toContain("migrate:development");
+    expect(preflightRuns).not.toMatch(/\bdeploy\s+--prebuilt/);
   });
 
   it("targets the development binding through the development environment", () => {
@@ -106,9 +123,11 @@ describe("development migration recovery", () => {
     expect(workflow.jobs.migrate?.uses).toBe(
       "./.github/workflows/apply-development-migrations.yml",
     );
-    expect(raw(`${WORKFLOW_DIR}/migrate-development.yml`)).toContain(
-      "group: development-delivery",
-    );
+    expect(workflow.concurrency).toEqual({
+      group: "development-delivery",
+      "cancel-in-progress": false,
+      queue: "max",
+    });
     expect(
       raw(`${WORKFLOW_DIR}/apply-development-migrations.yml`),
     ).not.toContain("concurrency:");
