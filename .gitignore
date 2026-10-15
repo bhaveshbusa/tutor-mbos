@@ -10,6 +10,9 @@ next-env.d.ts
 # Vercel CLI state (project link and pulled environment values)
 .vercel/
 
+# Acceptance cleanup manifest written by the protected workflow
+acceptance-cleanup-manifest.json
+
 # Environment files: only the placeholder example is tracked
 .env
 .env.*

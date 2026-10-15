@@ -5,10 +5,17 @@
  * executed from a coding workspace.
  */
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { parseDotenv } from "./assert-deploy-target.ts";
 import { resolveProtectionBypass } from "./smoke-health.ts";
+import {
+  CLEANUP_CLIENT_NAMES,
+  reviewCleanupManifest,
+  type CleanupClientName,
+  type CleanupIdentity,
+  type CleanupManifest,
+} from "../src/server/application/acceptance-cleanup.ts";
 import {
   APP_DATABASE_URL_SECRET,
   EXPECTED_AUTHORIZATION_PATH,
@@ -32,6 +39,7 @@ import {
   type AcceptanceReport,
   type AuthConfigSnapshot,
   type DirectProbe,
+  type DirectProbeInput,
 } from "../src/server/application/hosted-acceptance.ts";
 import { pgConnection } from "../src/server/application/pg-connection.ts";
 import {
@@ -46,6 +54,12 @@ import {
 } from "../src/server/config/environments.ts";
 
 const GENERIC_REDIRECT = "https://example.com/oauth/callback";
+const MANIFEST_PATH = "acceptance-cleanup-manifest.json";
+const APPROVE_PERMISSIONS = [
+  "business.read",
+  "reports.read",
+  "business.onboard",
+] as const;
 const SESSION_IDS = [
   "login.tenant_a",
   "login.tenant_b",
@@ -56,6 +70,9 @@ const SESSION_IDS = [
   "ui.tenant_b_positive",
   "ui.tenant_a_negative",
   "ui.tenant_b_negative",
+  "ui.tenant_a_page",
+  "ui.tenant_b_page",
+  "ui.consent_page",
   "data_api.app_profile",
   "generic_client.consent",
   "generic_client.audience",
@@ -65,8 +82,19 @@ const SESSION_IDS = [
   "generic_client.api_ui_token_as_bearer",
   "generic_client.mcp_positive",
   "generic_client.mcp_negative",
+  "generic_client.setup_report",
+  "generic_client.setup_status",
   "generic_client.tenant_b_positive",
   "generic_client.tenant_b_negative",
+  "generic_client.tenant_b_api_no_bearer",
+  "generic_client.tenant_b_api_ui_token_as_bearer",
+  "generic_client.tenant_b_mcp_positive",
+  "generic_client.tenant_b_mcp_negative",
+  "generic_client.tenant_b_setup_report",
+  "generic_client.tenant_b_setup_status",
+  "generic_client.restricted_business",
+  "generic_client.restricted_report",
+  "generic_client.restricted_setup_status",
   "generic_client.revocation",
   "generic_client.reconnection",
   "generic_client.denial",
@@ -92,18 +120,25 @@ export interface HostedAcceptanceInput {
   bypass?: string | null;
   fetchImpl?: typeof fetch;
   randomBytes?: (size: number) => Buffer;
+  runId: string;
+  runNonce: string;
+  writeManifest?: (body: string) => void;
   probeDatabase?: (
     url: string,
-    input: { userId: string; ownBusinessId: string; otherBusinessId: string },
+    input: DirectProbeInput,
   ) => Promise<DirectProbe>;
   schema: string;
 }
 
 interface RegisteredClient {
+  name: CleanupClientName;
   clientId: string;
   clientSecret: string | null;
-  registrationUri: string | null;
-  registrationToken: string | null;
+}
+
+interface ConsentOptions {
+  permissions?: readonly string[];
+  remember?: boolean;
 }
 
 interface Tenant {
@@ -203,8 +238,11 @@ export async function runHostedAcceptance(
   const results: AcceptanceCase[] = [];
   const fetchImpl = input.fetchImpl ?? fetch;
   const rng = input.randomBytes ?? randomBytes;
-  const nonce = rng(8).toString("hex");
+  const nonce = input.runNonce;
   let deployedCommit = "";
+  let closingCommit = "";
+  let openingOk = false;
+  let closingChecked = false;
   const tenants: Tenant[] = (["tenant-a", "tenant-b"] as const).map(
     (label) => ({
       label,
@@ -220,8 +258,14 @@ export async function runHostedAcceptance(
   );
   const tenantA = requiredTenant(tenants[0]);
   const tenantB = requiredTenant(tenants[1]);
+  const registered: RegisteredClient[] = [];
   let registration: RegisteredClient | null = null;
   let denialRegistration: RegisteredClient | null = null;
+  let restrictedRegistration: RegisteredClient | null = null;
+  let manifestState: { ok: boolean; reason: string } = {
+    ok: false,
+    reason: "manifest_absent",
+  };
 
   const request = async (
     url: string,
@@ -293,16 +337,100 @@ export async function runHostedAcceptance(
       healthBody.environment === "development" &&
       healthBody.supabaseProjectRef === target.ref &&
       deployedCommit === input.commit;
+    const nonceReady = /^[a-f0-9]{32}$/.test(nonce);
+    openingOk = healthPass && nonceReady;
     results.push(
       acceptanceCase(
         "health",
-        healthPass ? "pass" : "fail",
-        healthPass
+        openingOk ? "pass" : "fail",
+        openingOk
           ? "development_commit_match"
-          : `http_${health.status} commit=${deployedCommit === input.commit ? "match" : "mismatch"}`,
+          : !nonceReady
+            ? "run_nonce_absent"
+            : `http_${health.status} commit=${deployedCommit === input.commit ? "match" : "mismatch"}`,
       ),
     );
 
+    if (!openingOk) {
+      publishManifest();
+    } else {
+      await runMutableChecks();
+    }
+  } catch (error) {
+    results.push(
+      acceptanceCase(
+        "runner.exception",
+        "fail",
+        error instanceof Error ? error.name : "Error",
+      ),
+    );
+  } finally {
+    if (openingOk && !closingChecked) {
+      try {
+        await closingHealth();
+      } catch (error) {
+        results.push(
+          acceptanceCase(
+            "health.closing",
+            "fail",
+            error instanceof Error ? error.name : "Error",
+          ),
+        );
+      }
+    }
+    publishManifest();
+  }
+
+  results.push(
+    acceptanceCase(
+      "cleanup.manifest",
+      manifestState.ok ? "pass" : "fail",
+      manifestState.reason,
+    ),
+  );
+
+  for (const gap of EVIDENCE_GAPS) {
+    if (!results.some((row) => row.id === gap.id)) results.push(gap);
+  }
+  for (const id of [
+    "health",
+    "health.closing",
+    "auth.protected_resource",
+    "auth.oauth_server_enabled",
+    "auth.dynamic_registration",
+    "auth.authorization_path",
+    "auth.site_url",
+    "auth.redirect_allow_list",
+    "auth.secure_password_change",
+    "auth.exposed_schemas",
+    "direct.runtime_cannot_read",
+    "direct.tenant_isolation",
+    "direct.cleanup",
+    "cleanup.manifest",
+    "recovery.request_accepted",
+    "recovery.email_callback",
+    "recovery.completion",
+    "ui.browser_interaction",
+    "ui.login_page",
+    "login.foreign_origin",
+    ...KEY_IDS,
+    ...REAL_CLIENT_GAPS.map((row) => row.id),
+  ]) {
+    if (!results.some((row) => row.id === id)) {
+      results.push(acceptanceCase(id, "fail", "not_executed"));
+    }
+  }
+
+  return {
+    environment: "development",
+    source: input.commit,
+    deployedCommit,
+    closingCommit,
+    schema: input.schema,
+    results,
+  };
+
+  async function runMutableChecks(): Promise<void> {
     const resourceReply = await request(
       `${target.site}/.well-known/oauth-protected-resource`,
       { headers: { accept: "application/json" } },
@@ -326,6 +454,7 @@ export async function runHostedAcceptance(
       ),
     );
     await foreignOrigin();
+    await loginPage();
 
     if (!input.publishableKey) {
       await recovery(tenantA);
@@ -337,62 +466,8 @@ export async function runHostedAcceptance(
     }
     await runManagement();
     await runDirectDatabase();
-  } catch (error) {
-    results.push(
-      acceptanceCase(
-        "runner.exception",
-        "fail",
-        error instanceof Error ? error.name : "Error",
-      ),
-    );
-  } finally {
-    await cleanup();
+    await closingHealth();
   }
-
-  for (const gap of REAL_CLIENT_GAPS) {
-    if (!results.some((row) => row.id === gap.id)) results.push(gap);
-  }
-  results.push(
-    acceptanceCase(
-      "recovery.completion",
-      "gap",
-      "inbox_unavailable: recovery completion needs the allowlisted message. This workflow does not read mail or call the admin API.",
-    ),
-  );
-  for (const id of [
-    "health",
-    "auth.protected_resource",
-    "auth.oauth_server_enabled",
-    "auth.dynamic_registration",
-    "auth.authorization_path",
-    "auth.site_url",
-    "auth.redirect_allow_list",
-    "auth.secure_password_change",
-    "auth.exposed_schemas",
-    "direct.runtime_cannot_read",
-    "direct.tenant_isolation",
-    "direct.cleanup",
-    "cleanup.tenant_a",
-    "cleanup.tenant_b",
-    "cleanup.generic_client",
-    "recovery.completion",
-    "recovery.allowlisted",
-    "login.foreign_origin",
-    ...KEY_IDS,
-    ...REAL_CLIENT_GAPS.map((row) => row.id),
-  ]) {
-    if (!results.some((row) => row.id === id)) {
-      results.push(acceptanceCase(id, "fail", "not_executed"));
-    }
-  }
-
-  return {
-    environment: "development",
-    source: input.commit,
-    deployedCommit,
-    schema: input.schema,
-    results,
-  };
 
   async function runManagement(): Promise<void> {
     if (!input.managementToken) {
@@ -559,6 +634,7 @@ export async function runHostedAcceptance(
       tenant.refreshToken =
         typeof body?.refresh_token === "string" ? body.refresh_token : null;
       const confirmed = created.status < 300 && Boolean(tenant.accessToken);
+      publishManifest();
       results.push(
         acceptanceCase(
           `signup.${tenant.label.replace("tenant-", "tenant_")}`,
@@ -588,6 +664,7 @@ export async function runHostedAcceptance(
     await recovery(tenantA);
     await refreshUi(tenantA);
     for (const tenant of tenants) await createOwnBusiness(tenant);
+    await businessPages();
     await negativeUi(tenantA, tenantB);
     await negativeUi(tenantB, tenantA);
     await authenticatedDataApi(tenantA);
@@ -614,11 +691,11 @@ export async function runHostedAcceptance(
     results.push(
       acceptanceCase(
         "generic_client.consent",
-        approvedA ? "pass" : "fail",
-        approvedA ? "approved" : "not_approved",
+        approvedA.ok ? "pass" : "fail",
+        approvedA.ok ? "approved" : "not_approved",
       ),
     );
-    if (!approvedA || !tenantA.delegatedToken) {
+    if (!approvedA.ok || !tenantA.delegatedToken) {
       results.push(
         ...blockedCases(
           GENERIC_IDS.filter((id) => id !== "generic_client.consent"),
@@ -641,12 +718,18 @@ export async function runHostedAcceptance(
       metadata.token_endpoint as string,
       "approve",
     );
-    if (!approvedB || !tenantB.delegatedToken) {
+    if (!approvedB.ok || !tenantB.delegatedToken) {
       results.push(
         ...blockedCases(
           [
             "generic_client.tenant_b_positive",
             "generic_client.tenant_b_negative",
+            "generic_client.tenant_b_api_no_bearer",
+            "generic_client.tenant_b_api_ui_token_as_bearer",
+            "generic_client.tenant_b_mcp_positive",
+            "generic_client.tenant_b_mcp_negative",
+            "generic_client.tenant_b_setup_report",
+            "generic_client.tenant_b_setup_status",
           ],
           "consent",
         ),
@@ -672,14 +755,31 @@ export async function runHostedAcceptance(
           metadata.token_endpoint as string,
           "deny",
         )
-      : false;
+      : { ok: false, token: null };
     results.push(
       acceptanceCase(
         "generic_client.denial",
-        denied ? "pass" : "fail",
-        denied ? "denied" : "not_denied",
+        denied.ok ? "pass" : "fail",
+        denied.ok ? "access_denied_no_code" : "not_denied",
       ),
     );
+    restrictedRegistration = await register(
+      metadata.registration_endpoint as string,
+      "tutor-mbos-generic-restricted",
+    );
+    if (!restrictedRegistration) {
+      results.push(...blockedCases(RESTRICTED_IDS, "dynamic_registration"));
+      return;
+    }
+    const restricted = await consent(
+      tenantA,
+      restrictedRegistration,
+      metadata.authorization_endpoint as string,
+      metadata.token_endpoint as string,
+      "approve",
+      { permissions: ["business.read"], remember: false },
+    );
+    await restrictedChecks(restricted.token);
   }
 
   async function foreignOrigin(): Promise<void> {
@@ -748,12 +848,12 @@ export async function runHostedAcceptance(
       reply.status === 303 &&
       location === `${target.site}/login?recovery=sent` &&
       !location.includes("example.com");
-    if (!results.some((row) => row.id === "recovery.allowlisted")) {
+    if (!results.some((row) => row.id === "recovery.request_accepted")) {
       results.push(
         acceptanceCase(
-          "recovery.allowlisted",
+          "recovery.request_accepted",
           pass ? "pass" : "fail",
-          pass ? "allowlisted_redirect" : `http_${reply.status}`,
+          pass ? "request_initiated" : `http_${reply.status}`,
         ),
       );
     }
@@ -949,23 +1049,23 @@ export async function runHostedAcceptance(
     const body = json(reply) as {
       client_id?: unknown;
       client_secret?: unknown;
-      registration_client_uri?: unknown;
-      registration_access_token?: unknown;
     };
-    if (reply.status >= 300 || typeof body?.client_id !== "string") return null;
-    return {
+    if (
+      reply.status >= 300 ||
+      typeof body?.client_id !== "string" ||
+      !CLEANUP_CLIENT_NAMES.includes(name as CleanupClientName)
+    ) {
+      return null;
+    }
+    const client: RegisteredClient = {
+      name: name as CleanupClientName,
       clientId: body.client_id,
       clientSecret:
         typeof body.client_secret === "string" ? body.client_secret : null,
-      registrationUri:
-        typeof body.registration_client_uri === "string"
-          ? body.registration_client_uri
-          : null,
-      registrationToken:
-        typeof body.registration_access_token === "string"
-          ? body.registration_access_token
-          : null,
     };
+    registered.push(client);
+    publishManifest();
+    return client;
   }
 
   async function consent(
@@ -974,16 +1074,18 @@ export async function runHostedAcceptance(
     authorizationEndpoint: string,
     tokenEndpoint: string,
     decision: "approve" | "deny",
-  ): Promise<boolean> {
+    options: ConsentOptions = {},
+  ): Promise<{ ok: boolean; token: string | null }> {
     const verifier = rng(32).toString("base64url");
     const challenge = createHash("sha256").update(verifier).digest("base64url");
+    const state = rng(16).toString("hex");
     const authorize = new URL(authorizationEndpoint);
     authorize.searchParams.set("response_type", "code");
     authorize.searchParams.set("client_id", client.clientId);
     authorize.searchParams.set("redirect_uri", GENERIC_REDIRECT);
     authorize.searchParams.set("code_challenge", challenge);
     authorize.searchParams.set("code_challenge_method", "S256");
-    authorize.searchParams.set("state", rng(16).toString("hex"));
+    authorize.searchParams.set("state", state);
     authorize.searchParams.set("scope", "openid email profile");
     authorize.searchParams.set("resource", resourceUrl(target.site));
     const started = await request(authorize.toString());
@@ -1001,15 +1103,29 @@ export async function runHostedAcceptance(
     } catch {
       onConsent = false;
     }
-    if (!authorizationId || !onConsent) return false;
+    if (!authorizationId || !onConsent) return { ok: false, token: null };
+    if (!results.some((row) => row.id === "ui.consent_page")) {
+      const page = await request(consentUrl, {
+        headers: { cookie: cookieHeader(tenant), accept: "text/html" },
+      });
+      const rendered =
+        page.status === 200 && page.text.includes("Authorize a client");
+      results.push(
+        acceptanceCase(
+          "ui.consent_page",
+          rendered ? "pass" : "fail",
+          rendered ? "rendered_consent" : `http_${page.status}`,
+        ),
+      );
+    }
     const form = new URLSearchParams();
     form.set("authorization_id", authorizationId);
     form.set("decision", decision);
-    if (decision === "approve") {
-      form.append("permissions", "business.read");
-      form.append("permissions", "reports.read");
-      form.append("permissions", "business.onboard");
-    }
+    const permissions =
+      options.permissions ??
+      (decision === "approve" ? APPROVE_PERMISSIONS : []);
+    for (const permission of permissions)
+      form.append("permissions", permission);
     const decided = await request(`${target.site}/api/oauth/decision`, {
       method: "POST",
       headers: {
@@ -1019,10 +1135,11 @@ export async function runHostedAcceptance(
       },
       body: form.toString(),
     });
-    if (decided.status !== 303) return false;
-    if (decision === "deny") return true;
+    if (decision === "deny")
+      return denyResult(decided, state, tokenEndpoint, client);
+    if (decided.status !== 303) return { ok: false, token: null };
     const code = queryValue(decided.headers.get("location"), "code");
-    if (!code) return false;
+    if (!code) return { ok: false, token: null };
     const tokenBody = new URLSearchParams({
       grant_type: "authorization_code",
       code,
@@ -1042,9 +1159,10 @@ export async function runHostedAcceptance(
       refresh_token?: unknown;
     };
     if (token.status !== 200 || typeof issued?.access_token !== "string") {
-      return false;
+      return { ok: false, token: null };
     }
-    tenant.delegatedToken = issued.access_token;
+    let accessToken = issued.access_token;
+    if (options.remember !== false) tenant.delegatedToken = accessToken;
     if (typeof issued.refresh_token === "string" && decision === "approve") {
       const refreshed = await request(tokenEndpoint, {
         method: "POST",
@@ -1061,7 +1179,10 @@ export async function runHostedAcceptance(
       const next = json(refreshed) as { access_token?: unknown };
       const pass =
         refreshed.status === 200 && typeof next?.access_token === "string";
-      if (pass) tenant.delegatedToken = next.access_token as string;
+      if (pass) {
+        accessToken = next.access_token as string;
+        if (options.remember !== false) tenant.delegatedToken = accessToken;
+      }
       if (!results.some((row) => row.id === "generic_client.refresh")) {
         results.push(
           acceptanceCase(
@@ -1080,7 +1201,38 @@ export async function runHostedAcceptance(
         ),
       );
     }
-    return true;
+    return { ok: true, token: accessToken };
+  }
+
+  async function denyResult(
+    decided: Reply,
+    state: string,
+    tokenEndpoint: string,
+    client: RegisteredClient,
+  ): Promise<{ ok: boolean; token: null }> {
+    let redirectOk = false;
+    try {
+      const parsed = new URL(decided.headers.get("location") ?? "");
+      redirectOk =
+        decided.status === 303 &&
+        `${parsed.origin}${parsed.pathname}` === GENERIC_REDIRECT &&
+        parsed.searchParams.get("error") === "access_denied" &&
+        parsed.searchParams.get("state") === state &&
+        !parsed.searchParams.has("code");
+    } catch {
+      redirectOk = false;
+    }
+    const tokenAttempt = await request(tokenEndpoint, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        redirect_uri: GENERIC_REDIRECT,
+        client_id: client.clientId,
+        code: "",
+      }).toString(),
+    });
+    return { ok: redirectOk && tokenAttempt.status !== 200, token: null };
   }
 
   async function delegatedChecks(
@@ -1120,13 +1272,36 @@ export async function runHostedAcceptance(
           : `http_${forged.status}`,
       ),
     );
-    if (prefix !== "generic_client") return;
+    const noBearerId =
+      prefix === "generic_client"
+        ? "generic_client.api_no_bearer"
+        : "generic_client.tenant_b_api_no_bearer";
+    const uiBearerId =
+      prefix === "generic_client"
+        ? "generic_client.api_ui_token_as_bearer"
+        : "generic_client.tenant_b_api_ui_token_as_bearer";
+    const mcpPositiveId =
+      prefix === "generic_client"
+        ? "generic_client.mcp_positive"
+        : "generic_client.tenant_b_mcp_positive";
+    const mcpNegativeId =
+      prefix === "generic_client"
+        ? "generic_client.mcp_negative"
+        : "generic_client.tenant_b_mcp_negative";
+    const reportId =
+      prefix === "generic_client"
+        ? "generic_client.setup_report"
+        : "generic_client.tenant_b_setup_report";
+    const statusId =
+      prefix === "generic_client"
+        ? "generic_client.setup_status"
+        : "generic_client.tenant_b_setup_status";
     const missing = await request(`${target.site}/api/v1/business`, {
       headers: { accept: "application/json" },
     });
     results.push(
       acceptanceCase(
-        "generic_client.api_no_bearer",
+        noBearerId,
         missing.status === 401 ? "pass" : "fail",
         `http_${missing.status}`,
       ),
@@ -1140,15 +1315,18 @@ export async function runHostedAcceptance(
     });
     results.push(
       acceptanceCase(
-        "generic_client.api_ui_token_as_bearer",
+        uiBearerId,
         upgraded.status === 401 ? "pass" : "fail",
         `http_${upgraded.status}`,
       ),
     );
-    const mcpOwn = await mcpCreate(actor, actor.businessId);
+    const mcpOwn = await mcpCall(actor.delegatedToken, "create_business", {
+      displayName: "Synthetic delegated",
+      idempotencyKey: `tos3-mcp-${actor.label}-${nonce}`,
+    });
     results.push(
       acceptanceCase(
-        "generic_client.mcp_positive",
+        mcpPositiveId,
         mcpOwn.status === 200 && mcpOwn.id === actor.businessId
           ? "pass"
           : "fail",
@@ -1157,10 +1335,14 @@ export async function runHostedAcceptance(
           : `http_${mcpOwn.status}`,
       ),
     );
-    const mcpForged = await mcpCreate(actor, other.businessId);
+    const mcpForged = await mcpCall(actor.delegatedToken, "create_business", {
+      displayName: "Synthetic delegated",
+      idempotencyKey: `tos3-mcp-${actor.label}-${nonce}`,
+      tenantId: other.businessId,
+    });
     results.push(
       acceptanceCase(
-        "generic_client.mcp_negative",
+        mcpNegativeId,
         mcpForged.id === actor.businessId && mcpForged.id !== other.businessId
           ? "pass"
           : "fail",
@@ -1169,18 +1351,35 @@ export async function runHostedAcceptance(
           : `http_${mcpForged.status}`,
       ),
     );
+    const report = await setupReport(actor.delegatedToken);
+    results.push(
+      acceptanceCase(
+        reportId,
+        report.ok && report.businessId === actor.businessId ? "pass" : "fail",
+        report.ok ? "setup_report" : `http_${report.status}`,
+      ),
+    );
+    const status = await mcpCall(actor.delegatedToken, "setup_status", {});
+    results.push(
+      acceptanceCase(
+        statusId,
+        status.ok && status.businessId === actor.businessId ? "pass" : "fail",
+        status.ok ? "setup_status" : `http_${status.status}`,
+      ),
+    );
   }
 
   async function bearerBusiness(
     tenant: Tenant,
     forgedId: string | null,
+    token: string | null = tenant.delegatedToken,
   ): Promise<{ status: number; id: string | null }> {
     const url = forgedId
       ? `${target.site}/api/v1/business?tenantId=${encodeURIComponent(forgedId)}`
       : `${target.site}/api/v1/business`;
     const reply = await request(url, {
       headers: {
-        authorization: `Bearer ${tenant.delegatedToken}`,
+        authorization: `Bearer ${token ?? ""}`,
         ...(forgedId ? { "x-tenant-id": forgedId } : {}),
         accept: "application/json",
       },
@@ -1188,14 +1387,47 @@ export async function runHostedAcceptance(
     return { status: reply.status, id: businessId(json(reply)) };
   }
 
-  async function mcpCreate(
-    tenant: Tenant,
-    forgedId: string | null,
-  ): Promise<{ status: number; id: string | null }> {
+  async function setupReport(token: string | null): Promise<{
+    status: number;
+    ok: boolean;
+    businessId: string | null;
+  }> {
+    const reply = await request(`${target.site}/api/v1/reports/setup`, {
+      headers: {
+        authorization: `Bearer ${token ?? ""}`,
+        accept: "application/json",
+      },
+    });
+    const body = json(reply) as {
+      dataset?: unknown;
+      businessId?: unknown;
+      ready?: unknown;
+    };
+    return {
+      status: reply.status,
+      ok:
+        reply.status === 200 &&
+        body?.dataset === "setup" &&
+        body.ready === true &&
+        typeof body.businessId === "string",
+      businessId: typeof body?.businessId === "string" ? body.businessId : null,
+    };
+  }
+
+  async function mcpCall(
+    token: string | null,
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<{
+    status: number;
+    ok: boolean;
+    id: string | null;
+    businessId: string | null;
+  }> {
     const reply = await request(`${target.site}/api/mcp`, {
       method: "POST",
       headers: {
-        authorization: `Bearer ${tenant.delegatedToken}`,
+        authorization: `Bearer ${token ?? ""}`,
         "content-type": "application/json",
         accept: "application/json",
       },
@@ -1203,14 +1435,7 @@ export async function runHostedAcceptance(
         jsonrpc: "2.0",
         id: 1,
         method: "tools/call",
-        params: {
-          name: "create_business",
-          arguments: {
-            displayName: "Synthetic delegated",
-            idempotencyKey: `tos3-mcp-${tenant.label}-${nonce}`,
-            ...(forgedId ? { tenantId: forgedId } : {}),
-          },
-        },
+        params: { name, arguments: args },
       }),
     });
     const text = (
@@ -1218,13 +1443,56 @@ export async function runHostedAcceptance(
         result?: { content?: { text?: string }[]; isError?: boolean };
       }
     )?.result;
-    let id: string | null = null;
+    let parsed: unknown = null;
     try {
-      id = businessId(JSON.parse(text?.content?.[0]?.text ?? ""));
+      parsed = JSON.parse(text?.content?.[0]?.text ?? "");
     } catch {
-      id = null;
+      parsed = null;
     }
-    return { status: reply.status, id: text?.isError ? null : id };
+    const id = businessId(parsed);
+    const reportId = (parsed as { businessId?: unknown } | null)?.businessId;
+    const businessIdValue = typeof reportId === "string" ? reportId : id;
+    return {
+      status: reply.status,
+      ok: reply.status === 200 && text?.isError !== true,
+      id: text?.isError ? null : id,
+      businessId: text?.isError ? null : businessIdValue,
+    };
+  }
+
+  async function restrictedChecks(token: string | null): Promise<void> {
+    const own = token
+      ? await bearerBusiness(tenantA, null, token)
+      : { status: 0, id: null };
+    const report = token
+      ? await setupReport(token)
+      : { status: 0, ok: false, businessId: null };
+    const status = token
+      ? await mcpCall(token, "setup_status", {})
+      : { status: 0, ok: false, id: null, businessId: null };
+    results.push(
+      acceptanceCase(
+        "generic_client.restricted_business",
+        own.status === 200 && own.id === tenantA.businessId ? "pass" : "fail",
+        own.status === 200 ? "business_read" : `http_${own.status}`,
+      ),
+    );
+    results.push(
+      acceptanceCase(
+        "generic_client.restricted_report",
+        report.status === 403 ? "pass" : "fail",
+        `http_${report.status}`,
+      ),
+    );
+    results.push(
+      acceptanceCase(
+        "generic_client.restricted_setup_status",
+        !status.ok && status.businessId !== tenantA.businessId
+          ? "pass"
+          : "fail",
+        status.ok ? "reports_read_allowed" : `http_${status.status}`,
+      ),
+    );
   }
 
   async function revokeAndReconnect(
@@ -1273,7 +1541,7 @@ export async function runHostedAcceptance(
       tokenEndpoint,
       "approve",
     );
-    const reread = again ? await bearerBusiness(tenant, null) : null;
+    const reread = again.ok ? await bearerBusiness(tenant, null) : null;
     results.push(
       acceptanceCase(
         "generic_client.reconnection",
@@ -1308,13 +1576,15 @@ export async function runHostedAcceptance(
       return;
     }
     try {
+      const probeInput = {
+        userId: tenantA.userId,
+        ownBusinessId: tenantA.businessId,
+        otherBusinessId: tenantB.businessId,
+        clientIds: registered.map((client) => client.clientId),
+      };
       const probe = input.probeDatabase
-        ? await input.probeDatabase(input.appDatabaseUrl, {
-            userId: tenantA.userId,
-            ownBusinessId: tenantA.businessId,
-            otherBusinessId: tenantB.businessId,
-          })
-        : await probeWithPg();
+        ? await input.probeDatabase(input.appDatabaseUrl, probeInput)
+        : await probeWithPg(probeInput);
       results.push(...classifyDirectProbe(probe));
     } catch (error) {
       results.push(
@@ -1323,85 +1593,127 @@ export async function runHostedAcceptance(
     }
   }
 
-  async function probeWithPg(): Promise<DirectProbe> {
+  async function probeWithPg(
+    probeInput: DirectProbeInput,
+  ): Promise<DirectProbe> {
     const connection = pgConnection(input.appDatabaseUrl ?? "");
     try {
-      return await probeDirectTenantAccess(connection, {
-        userId: tenantA.userId ?? "",
-        ownBusinessId: tenantA.businessId ?? "",
-        otherBusinessId: tenantB.businessId ?? "",
-      });
+      return await probeDirectTenantAccess(connection, probeInput);
     } finally {
       await connection.close();
     }
   }
 
-  async function cleanup(): Promise<void> {
-    for (const tenant of tenants) {
-      const id = `cleanup.${tenant.label.replace("tenant-", "tenant_")}`;
-      if (!tenant.accessToken || !input.publishableKey) {
-        results.push(acceptanceCase(id, "fail", "session_absent"));
-        continue;
-      }
-      try {
-        const reply = await request(`${target.supabaseUrl}/auth/v1/user`, {
-          method: "DELETE",
-          headers: {
-            apikey: input.publishableKey,
-            authorization: `Bearer ${tenant.accessToken}`,
-          },
-        });
-        results.push(
-          acceptanceCase(
-            id,
-            reply.status === 200 || reply.status === 204 ? "pass" : "fail",
-            `http_${reply.status}`,
-          ),
-        );
-      } catch (error) {
-        results.push(
-          acceptanceCase(
-            id,
-            "fail",
-            error instanceof Error ? error.name : "Error",
-          ),
-        );
-      }
-    }
-    const clients = [registration, denialRegistration].filter(
-      (client): client is RegisteredClient => client !== null,
-    );
-    if (clients.length === 0) {
-      results.push(
-        acceptanceCase("cleanup.generic_client", "fail", "client_absent"),
-      );
-      return;
-    }
-    let removed = true;
-    for (const client of clients) {
-      if (!client.registrationUri || !client.registrationToken) {
-        removed = false;
-        continue;
-      }
-      try {
-        const reply = await request(client.registrationUri, {
-          method: "DELETE",
-          headers: { authorization: `Bearer ${client.registrationToken}` },
-        });
-        if (reply.status !== 204 && reply.status !== 200) removed = false;
-      } catch {
-        removed = false;
-      }
-    }
+  async function closingHealth(): Promise<void> {
+    closingChecked = true;
+    const health = await request(`${target.site}/api/v1/health`, {
+      headers: { accept: "application/json" },
+    });
+    const body = json(health) as { commit?: unknown; environment?: unknown };
+    closingCommit = typeof body?.commit === "string" ? body.commit : "";
+    const pass =
+      health.status === 200 &&
+      body?.environment === "development" &&
+      closingCommit === deployedCommit &&
+      closingCommit === input.commit;
     results.push(
       acceptanceCase(
-        "cleanup.generic_client",
-        removed ? "pass" : "fail",
-        removed ? "registration_removed" : "registration_remains",
+        "health.closing",
+        pass ? "pass" : "fail",
+        pass ? "commit_unchanged" : "commit_changed",
       ),
     );
   }
+
+  function publishManifest(): void {
+    const identity: CleanupIdentity = {
+      projectRef: target.ref,
+      commit: input.commit,
+      runId: input.runId,
+      runNonce: nonce,
+    };
+    const manifest: CleanupManifest = {
+      version: 1,
+      environment: "development",
+      projectRef: target.ref,
+      commit: input.commit,
+      runId: input.runId,
+      runNonce: nonce,
+      users: tenants.flatMap((tenant) =>
+        tenant.userId ? [{ label: tenant.label, id: tenant.userId }] : [],
+      ),
+      clients: registered.map((client) => ({
+        name: client.name,
+        id: client.clientId,
+      })),
+    };
+    const reviewed = reviewCleanupManifest(manifest, identity);
+    manifestState = reviewed.ok
+      ? {
+          ok: true,
+          reason:
+            manifest.users.length > 0
+              ? "deferred_admin_cleanup"
+              : "no_hosted_users",
+        }
+      : { ok: false, reason: reviewed.reason };
+    if (!reviewed.ok) return;
+    try {
+      input.writeManifest?.(JSON.stringify(manifest));
+    } catch {
+      manifestState = { ok: false, reason: "manifest_unwritable" };
+    }
+  }
+
+  async function loginPage(): Promise<void> {
+    const page = await request(`${target.site}/login`, {
+      headers: { accept: "text/html" },
+    });
+    const rendered =
+      page.status === 200 &&
+      page.text.includes("Sign in") &&
+      page.text.includes("Account recovery");
+    results.push(
+      acceptanceCase(
+        "ui.login_page",
+        rendered ? "pass" : "fail",
+        rendered ? "rendered_login" : `http_${page.status}`,
+      ),
+    );
+  }
+
+  async function businessPages(): Promise<void> {
+    for (const tenant of tenants) {
+      const ownName =
+        tenant.label === "tenant-a" ? "Synthetic A" : "Synthetic B";
+      const otherName =
+        tenant.label === "tenant-a" ? "Synthetic B" : "Synthetic A";
+      const page = await request(`${target.site}/business`, {
+        headers: {
+          cookie: cookieHeader(tenant),
+          accept: "text/html",
+        },
+      });
+      const rendered =
+        page.status === 200 &&
+        page.text.includes(ownName) &&
+        !page.text.includes(otherName);
+      results.push(
+        acceptanceCase(
+          `ui.${tenant.label.replace("tenant-", "tenant_")}_page`,
+          rendered ? "pass" : "fail",
+          rendered ? "rendered_business" : `http_${page.status}`,
+        ),
+      );
+    }
+  }
 }
+
+const RESTRICTED_IDS = [
+  "generic_client.restricted_business",
+  "generic_client.restricted_report",
+  "generic_client.restricted_setup_status",
+] as const;
 
 const GENERIC_IDS = [
   "generic_client.consent",
@@ -1412,14 +1724,42 @@ const GENERIC_IDS = [
   "generic_client.api_ui_token_as_bearer",
   "generic_client.mcp_positive",
   "generic_client.mcp_negative",
+  "generic_client.setup_report",
+  "generic_client.setup_status",
   "generic_client.tenant_b_positive",
   "generic_client.tenant_b_negative",
+  "generic_client.tenant_b_api_no_bearer",
+  "generic_client.tenant_b_api_ui_token_as_bearer",
+  "generic_client.tenant_b_mcp_positive",
+  "generic_client.tenant_b_mcp_negative",
+  "generic_client.tenant_b_setup_report",
+  "generic_client.tenant_b_setup_status",
+  ...RESTRICTED_IDS,
   "generic_client.revocation",
   "generic_client.reconnection",
   "generic_client.denial",
   "generic_client.bearer_not_upgraded",
   "generic_client.refresh",
 ] as const;
+
+const EVIDENCE_GAPS: readonly AcceptanceCase[] = [
+  ...REAL_CLIENT_GAPS,
+  acceptanceCase(
+    "recovery.email_callback",
+    "gap",
+    "The recovery request response is not an email callback. This workflow does not read mail, so it cannot show delivery or a return to /auth/recovery.",
+  ),
+  acceptanceCase(
+    "recovery.completion",
+    "gap",
+    "Recovery completion follows the email callback. This workflow does not read mail or call the admin API.",
+  ),
+  acceptanceCase(
+    "ui.browser_interaction",
+    "gap",
+    "Rendered HTML checks fetch /login, /business, and /oauth/consent. No browser drives those forms. Cookie HTTP API calls are not rendered UI acceptance.",
+  ),
+];
 
 function secretName(name: string): string {
   return `secret_absent:${name}`;
@@ -1494,6 +1834,18 @@ async function main(): Promise<number> {
   const pulled = existsSync(envFile)
     ? parseDotenv(readFileSync(envFile, "utf8"))
     : {};
+  const runNonce = process.env.ACCEPTANCE_RUN_NONCE ?? "";
+  if (!/^[a-f0-9]{32}$/.test(runNonce)) {
+    console.error(
+      "::error::ACCEPTANCE_RUN_NONCE must be 32 hex characters before signup.",
+    );
+    return 2;
+  }
+  const runId = process.env.GITHUB_RUN_ID ?? "";
+  if (!/^[0-9]+$/.test(runId)) {
+    console.error("::error::GITHUB_RUN_ID is absent.");
+    return 2;
+  }
   const material = resolveAcceptanceMaterial(process.env, pulled);
   mask(material.publishableKey);
   mask(material.managementToken);
@@ -1503,9 +1855,14 @@ async function main(): Promise<number> {
   console.log(`Deployment protection bypass: ${bypass.source}.`);
   const report = await runHostedAcceptance({
     commit: process.env.GITHUB_SHA ?? "",
+    runId,
+    runNonce,
     ...material,
     bypass: bypass.value ?? null,
     schema: reviewedSchema(),
+    writeManifest: (body) => {
+      writeFileSync(MANIFEST_PATH, body);
+    },
   });
   console.log(formatAcceptanceReport(report));
   return acceptanceTally(report.results).exitCode;

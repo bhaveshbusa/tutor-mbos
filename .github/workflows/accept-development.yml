@@ -2,7 +2,9 @@ name: Accept development
 
 # Manual hosted acceptance for tutor-mbos-dev. It does not deploy, migrate,
 # change Auth settings, or run on pull requests. Dispatch it from main after
-# the development promotion for that commit. Coding CI stays secretless.
+# the development promotion for that commit. It shares development-delivery
+# with queue: max, so it waits behind an in-progress delivery and a later
+# delivery waits behind it. Neither cancels the other. Coding CI stays secretless.
 on:
   workflow_dispatch:
 
@@ -10,8 +12,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: development-acceptance
+  group: development-delivery
   cancel-in-progress: false
+  queue: max
 
 jobs:
   accept:
@@ -36,6 +39,15 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup
+      - name: Require Auth admin cleanup credential
+        env:
+          SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY: ${{ secrets.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY }}
+        run: |
+          if [ -z "$SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY" ]; then
+            echo "::error::SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY is absent. Expected secret scope: GitHub environment development (Settings → Environments → development → Secrets). Purpose: development-only GET and DELETE of Auth users and OAuth clients created by this acceptance run. Not the Management API token and not a database credential. The business-test step does not receive it."
+            exit 1
+          fi
+          echo "SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY is present. Expected secret scope: GitHub environment development."
       - name: Report acceptance credentials
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
@@ -53,7 +65,7 @@ jobs:
             echo "SUPABASE_DEVELOPMENT_ACCESS_TOKEN is present. Expected secret scope: GitHub environment development."
           fi
           if [ -z "$TUTOR_MBOS_APP_DATABASE_URL" ]; then
-            echo "::error::TUTOR_MBOS_APP_DATABASE_URL is absent. Expected secret scope: GitHub environment development (Settings → Environments → development → Secrets). Purpose: development app_runtime connection for direct tenant reads and cleanup. Not the migration URL."
+            echo "::error::TUTOR_MBOS_APP_DATABASE_URL is absent. Expected secret scope: GitHub environment development (Settings → Environments → development → Secrets). Purpose: development app_runtime connection for direct tenant reads and scoped business-row cleanup. Not the migration URL."
           else
             echo "TUTOR_MBOS_APP_DATABASE_URL is present. Expected secret scope: GitHub environment development."
           fi
@@ -63,6 +75,11 @@ jobs:
         run: pnpm dlx "vercel@${VERCEL_CLI_VERSION}" pull --yes --environment=production
       - name: Verify deployment target binding
         run: node scripts/assert-deploy-target.ts "$DEPLOY_ENVIRONMENT"
+      - name: Create acceptance run nonce
+        run: |
+          nonce=$(openssl rand -hex 16)
+          echo "::add-mask::$nonce"
+          echo "ACCEPTANCE_RUN_NONCE=$nonce" >> "$GITHUB_ENV"
       - name: Run hosted acceptance
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
@@ -70,4 +87,11 @@ jobs:
           SUPABASE_DEVELOPMENT_ACCESS_TOKEN: ${{ secrets.SUPABASE_DEVELOPMENT_ACCESS_TOKEN }}
           TUTOR_MBOS_APP_DATABASE_URL: ${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}
           NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
+          ACCEPTANCE_RUN_NONCE: ${{ env.ACCEPTANCE_RUN_NONCE }}
         run: pnpm accept:development
+      - name: Clean acceptance Auth resources
+        if: always()
+        env:
+          SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY: ${{ secrets.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY }}
+          ACCEPTANCE_RUN_NONCE: ${{ env.ACCEPTANCE_RUN_NONCE }}
+        run: pnpm accept:development:cleanup

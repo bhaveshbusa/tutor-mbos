@@ -14,6 +14,7 @@ import {
   classifyAuthSettings,
   classifyExposedSchemas,
   classifyIssuedAudience,
+  dataApiDenied,
   formatAcceptanceReport,
   probeDirectTenantAccess,
   sanitizeDetail,
@@ -55,6 +56,11 @@ interface DoubleOptions {
   autoconfirm?: boolean;
   oauth?: boolean;
   rotateCookie?: boolean;
+  healthStatus?: number;
+  healthCommit?: string;
+  closingCommit?: string;
+  denyLocation?: string;
+  dataApi?: { status: number; code: string };
 }
 
 function developmentDouble(options: DoubleOptions = {}) {
@@ -64,15 +70,19 @@ function developmentDouble(options: DoubleOptions = {}) {
     { id: string; access: string; refresh: string }
   >();
   const businesses = new Map<string, string>();
-  const authorizations = new Map<
-    string,
-    { clientId: string; userId?: string }
-  >();
+  const authorizations = new Map<string, { clientId: string; state: string }>();
   const codes = new Map<string, { userId: string; clientId: string }>();
   const revoked = new Set<string>();
+  const clientPerms = new Map<string, string[]>();
   let userCount = 0;
   let clientCount = 0;
   let authCount = 0;
+  let healthReads = 0;
+  const clientIds = [
+    "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee5",
+    "ffffffff-ffff-4fff-8fff-fffffffffff6",
+    "99999999-9999-4999-8999-999999999997",
+  ];
 
   const userIdFor = (email: string) => {
     const existing = users.get(email);
@@ -126,11 +136,45 @@ function developmentDouble(options: DoubleOptions = {}) {
     };
 
     if (url.pathname === "/api/v1/health") {
+      healthReads += 1;
+      if (
+        healthReads === 1 &&
+        options.healthStatus &&
+        options.healthStatus !== 200
+      ) {
+        return json(options.healthStatus, { status: "down" });
+      }
+      const bodyCommit =
+        healthReads === 1
+          ? (options.healthCommit ?? commit)
+          : (options.closingCommit ?? options.healthCommit ?? commit);
       return json(200, {
         status: "ok",
         environment: "development",
         supabaseProjectRef: ENVIRONMENT_BINDINGS.development.supabaseProjectRef,
-        commit,
+        commit: bodyCommit,
+      });
+    }
+    if (url.pathname === "/login") {
+      return new Response(
+        "<main><h1>Sign in</h1><h2>Account recovery</h2></main>",
+        { status: 200, headers: { "content-type": "text/html" } },
+      );
+    }
+    if (url.pathname === "/business") {
+      const email = emailFromCookie(header("cookie"));
+      const own = email.includes("tenant-a") ? "Synthetic A" : "Synthetic B";
+      const other = own === "Synthetic A" ? "Synthetic B" : "Synthetic A";
+      const shown = options.leak ? other : own;
+      return new Response(`<main><h1>${shown}</h1></main>`, {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      });
+    }
+    if (url.pathname === "/oauth/consent") {
+      return new Response("<main><h1>Authorize a client</h1></main>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
       });
     }
     if (url.pathname === "/.well-known/oauth-protected-resource") {
@@ -169,6 +213,9 @@ function developmentDouble(options: DoubleOptions = {}) {
       return json(200, { paths: { "/": {} } });
     }
     if (url.pathname === "/rest/v1/businesses") {
+      if (options.dataApi) {
+        return json(options.dataApi.status, { code: options.dataApi.code });
+      }
       return json(404, { code: "PGRST205" });
     }
     if (url.pathname === "/auth/v1/signup") {
@@ -208,6 +255,10 @@ function developmentDouble(options: DoubleOptions = {}) {
         }
         const key = `${String(claims.sub)}:${claims.client_id}`;
         if (revoked.has(key)) return json(403, { title: "Forbidden" });
+        const perms = clientPerms.get(claims.client_id) ?? [];
+        if (!perms.includes("business.read")) {
+          return json(403, { title: "Forbidden" });
+        }
         const own = businessFor(String(claims.sub));
         const other = [...businesses.values()].find((id) => id !== own) ?? own;
         const id = options.leak ? other : own;
@@ -225,21 +276,15 @@ function developmentDouble(options: DoubleOptions = {}) {
     }
     if (url.pathname === "/auth/v1/oauth/register") {
       clientCount += 1;
-      const clientId =
-        clientCount === 1
-          ? "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee5"
-          : "ffffffff-ffff-4fff-8fff-fffffffffff6";
-      return json(201, {
-        client_id: clientId,
-        registration_client_uri: `${supabaseUrl}/auth/v1/oauth/clients/${clientId}`,
-        registration_access_token: `registration-${clientCount}`,
-      });
+      const clientId = clientIds[clientCount - 1] ?? clientIds[0]!;
+      return json(201, { client_id: clientId });
     }
     if (url.pathname === "/auth/v1/oauth/authorize") {
       authCount += 1;
       const id = `auth-${authCount}`;
       authorizations.set(id, {
         clientId: url.searchParams.get("client_id") ?? "",
+        state: url.searchParams.get("state") ?? "",
       });
       return redirect(302, `${site}/oauth/consent?authorization_id=${id}`);
     }
@@ -249,11 +294,12 @@ function developmentDouble(options: DoubleOptions = {}) {
       const pending = authorizations.get(authorizationId);
       if (!pending) return json(400, { title: "Bad request" });
       if (decision === "deny") {
-        return redirect(
-          303,
-          "https://example.com/oauth/callback?error=access_denied",
-        );
+        const location =
+          options.denyLocation ??
+          `https://example.com/oauth/callback?error=access_denied&state=${encodeURIComponent(pending.state)}`;
+        return redirect(303, location);
       }
+      clientPerms.set(pending.clientId, form().getAll("permissions"));
       const email = emailFromCookie(header("cookie"));
       const user = users.get(email);
       if (!user) return json(401, { title: "Unauthorized" });
@@ -284,12 +330,58 @@ function developmentDouble(options: DoubleOptions = {}) {
         refresh_token: `oauth-refresh-${userId}`,
       });
     }
+    if (url.pathname === "/api/v1/reports/setup") {
+      const bearer = header("authorization").replace(/^Bearer\s+/i, "");
+      if (bearer.split(".").length !== 3) {
+        return json(401, { title: "Unauthorized" });
+      }
+      const claims = payloadOf(bearer);
+      if (typeof claims.client_id !== "string") {
+        return json(401, { title: "Unauthorized" });
+      }
+      const perms = clientPerms.get(claims.client_id) ?? [];
+      if (!perms.includes("reports.read")) return json(403, { code: "42501" });
+      const own = businessFor(String(claims.sub));
+      const other = [...businesses.values()].find((id) => id !== own) ?? own;
+      return json(200, {
+        dataset: "setup",
+        businessId: options.leak ? other : own,
+        ready: true,
+      });
+    }
     if (url.pathname === "/api/mcp") {
       const bearer = header("authorization").replace(/^Bearer\s+/i, "");
       const claims = payloadOf(bearer);
+      const perms =
+        typeof claims.client_id === "string"
+          ? (clientPerms.get(claims.client_id) ?? [])
+          : [];
       const own = businessFor(String(claims.sub));
       const other = [...businesses.values()].find((id) => id !== own) ?? own;
       const id = options.leak ? other : own;
+      const tool = String(
+        (jsonBody().params as { name?: string } | undefined)?.name ?? "",
+      );
+      if (tool === "setup_status") {
+        const allowed = perms.includes("reports.read");
+        return json(200, {
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            isError: !allowed,
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  allowed
+                    ? { dataset: "setup", businessId: id, ready: true }
+                    : { code: "forbidden" },
+                ),
+              },
+            ],
+          },
+        });
+      }
       return json(200, {
         jsonrpc: "2.0",
         id: 1,
@@ -313,13 +405,13 @@ function developmentDouble(options: DoubleOptions = {}) {
       return json(200, { revoked: true });
     }
     if (url.pathname === "/auth/v1/user" && init?.method === "DELETE") {
-      return new Response(null, { status: 204 });
+      return json(405, { error: "method_not_allowed" });
     }
     if (
       url.pathname.startsWith("/auth/v1/oauth/clients/") &&
       init?.method === "DELETE"
     ) {
-      return new Response(null, { status: 204 });
+      return json(405, { error: "method_not_allowed" });
     }
     if (
       url.pathname ===
@@ -362,11 +454,15 @@ function input(
     schema: "20261015120000:abc",
     fetchImpl,
     randomBytes: (size: number) => Buffer.alloc(size, 7),
+    runId: "4242",
+    runNonce: "07".repeat(16),
     probeDatabase: async () => ({
       runtimeReadDenied: true,
       ownVisible: true,
       otherVisible: false,
       deleted: true,
+      aborted: false,
+      abortReason: null,
     }),
     ...overrides,
   };
@@ -396,8 +492,42 @@ describe("hosted acceptance harness", () => {
         ?.detail,
     ).toBe("security_update_password_require_reauthentication=false");
     expect(
-      report.results.find((row) => row.id === "cleanup.tenant_a")?.status,
+      report.results.find((row) => row.id === "cleanup.manifest")?.detail,
+    ).toBe("deferred_admin_cleanup");
+    expect(
+      report.results.find(
+        (row) => row.id === "generic_client.tenant_b_mcp_positive",
+      )?.status,
     ).toBe("pass");
+    expect(
+      report.results.find(
+        (row) => row.id === "generic_client.restricted_report",
+      )?.status,
+    ).toBe("pass");
+    expect(
+      report.results.find((row) => row.id === "ui.login_page")?.status,
+    ).toBe("pass");
+    expect(
+      report.results.find((row) => row.id === "ui.tenant_b_page")?.status,
+    ).toBe("pass");
+    expect(
+      report.results.find((row) => row.id === "ui.consent_page")?.status,
+    ).toBe("pass");
+    expect(
+      report.results.find((row) => row.id === "recovery.request_accepted")
+        ?.detail,
+    ).toBe("request_initiated");
+    expect(
+      report.results.find((row) => row.id === "recovery.email_callback")
+        ?.status,
+    ).toBe("gap");
+    expect(
+      report.results.find((row) => row.id === "ui.browser_interaction")?.status,
+    ).toBe("gap");
+    expect(report.closingCommit).toBe(commit);
+    expect(doubled.urls.some((url) => url === "DELETE /auth/v1/user")).toBe(
+      false,
+    );
     const text = formatAcceptanceReport(report);
     expect(text).toContain("generic_client_is_not_chatgpt=true");
     expect(text).toContain("schema_source=reviewed_manifest");
@@ -455,6 +585,8 @@ describe("hosted acceptance harness", () => {
             ownVisible: true,
             otherVisible: false,
             deleted: true,
+            aborted: false,
+            abortReason: null,
           };
         },
       }),
@@ -483,10 +615,118 @@ describe("hosted acceptance harness", () => {
     expect(text).toContain(
       "TUTOR_MBOS_APP_DATABASE_URL is absent. Expected secret scope: GitHub environment development",
     );
+    expect(text).toContain("group: development-delivery");
+    expect(text).toContain("queue: max");
+    expect(text).not.toContain("development-acceptance");
+    expect(text).toContain(
+      "SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY is absent. Expected secret scope: GitHub environment development",
+    );
+    const parsed = parse(text) as {
+      jobs: {
+        accept: {
+          steps: {
+            name?: string;
+            run?: string;
+            if?: string;
+            env?: Record<string, string>;
+          }[];
+        };
+      };
+    };
+    const steps = parsed.jobs.accept.steps;
+    const preflight = steps.findIndex((step) =>
+      step.run?.includes("SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY"),
+    );
+    const pull = steps.findIndex((step) => step.run?.includes("vercel"));
+    const accept = steps.find((step) => step.run === "pnpm accept:development");
+    const cleanup = steps.find((step) =>
+      step.run?.includes("accept:development:cleanup"),
+    );
+    expect(preflight).toBeGreaterThan(-1);
+    expect(pull).toBeGreaterThan(preflight);
+    expect(accept?.env).not.toHaveProperty(
+      "SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY",
+    );
+    expect(cleanup?.if).toBe("always()");
+    expect(cleanup?.env).toHaveProperty("SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY");
+    expect(cleanup?.env).not.toHaveProperty("TUTOR_MBOS_APP_DATABASE_URL");
+    expect(cleanup?.env).not.toHaveProperty(
+      "SUPABASE_DEVELOPMENT_ACCESS_TOKEN",
+    );
     const script = readFileSync("scripts/hosted-acceptance.ts", "utf8");
     expect(script).not.toContain("/auth/v1/admin");
     expect(script).not.toContain("auth.users");
+    expect(script).not.toContain("SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY");
+    expect(script).not.toContain("registration_client_uri");
     expect(script).not.toMatch(/method:\s*"PATCH"/);
+    expect(script).not.toMatch(/method:\s*"DELETE"/);
+  });
+
+  it("stops before signup when health does not match the source", async () => {
+    let probed = false;
+    const doubled = developmentDouble({ healthStatus: 503 });
+    const report = await runHostedAcceptance(
+      input(doubled.fetchImpl, {
+        probeDatabase: async () => {
+          probed = true;
+          return {
+            runtimeReadDenied: true,
+            ownVisible: true,
+            otherVisible: false,
+            deleted: true,
+            aborted: false,
+            abortReason: null,
+          };
+        },
+      }),
+    );
+    expect(report.results.find((row) => row.id === "health")?.status).toBe(
+      "fail",
+    );
+    expect(
+      report.results.find((row) => row.id === "signup.tenant_a")?.detail,
+    ).toBe("not_executed");
+    expect(doubled.urls.some((url) => url.includes("/auth/v1/signup"))).toBe(
+      false,
+    );
+    expect(
+      doubled.urls.some((url) => url.includes("/api/oauth/decision")),
+    ).toBe(false);
+    expect(probed).toBe(false);
+  });
+
+  it("fails when the closing health commit differs from the source", async () => {
+    const doubled = developmentDouble({ closingCommit: "c".repeat(40) });
+    const report = await runHostedAcceptance(input(doubled.fetchImpl));
+    expect(report.source).toBe(commit);
+    expect(report.deployedCommit).toBe(commit);
+    expect(report.closingCommit).toBe("c".repeat(40));
+    expect(
+      report.results.find((row) => row.id === "health.closing")?.status,
+    ).toBe("fail");
+    const text = formatAcceptanceReport(report);
+    expect(text).toContain(`source=${commit}`);
+    expect(text).toContain(`deployed_commit=${commit}`);
+    expect(text).toContain(`closing_commit=${"c".repeat(40)}`);
+  });
+
+  it("rejects an OAuth denial that is only a redirect", async () => {
+    const doubled = developmentDouble({ denyLocation: `${site}/business` });
+    const report = await runHostedAcceptance(input(doubled.fetchImpl));
+    expect(
+      report.results.find((row) => row.id === "generic_client.denial")?.status,
+    ).toBe("fail");
+  });
+
+  it("does not treat a PostgREST outage as an isolation denial", async () => {
+    const doubled = developmentDouble({
+      dataApi: { status: 503, code: "PGRST002" },
+    });
+    const report = await runHostedAcceptance(input(doubled.fetchImpl));
+    expect(
+      report.results.find((row) => row.id === "data_api.anon_businesses")
+        ?.status,
+    ).toBe("fail");
   });
 });
 
@@ -511,6 +751,19 @@ describe("acceptance classifiers", () => {
     expect(classifyExposedSchemas("public, app").detail).toBe(
       "db_schema=public,app",
     );
+    expect(dataApiDenied(404, { code: "PGRST205" })).toBe(true);
+    expect(dataApiDenied(406, { code: "PGRST106" })).toBe(true);
+    expect(dataApiDenied(401, { code: "PGRST301" })).toBe(true);
+    expect(dataApiDenied(401, { code: "PGRST302" })).toBe(true);
+    expect(dataApiDenied(401, { code: "PGRST303" })).toBe(true);
+    expect(dataApiDenied(403, { code: "42501" })).toBe(true);
+    expect(dataApiDenied(401, { code: "42501" })).toBe(true);
+    expect(dataApiDenied(503, { code: "PGRST002" })).toBe(false);
+    expect(dataApiDenied(504, { code: "PGRST003" })).toBe(false);
+    expect(dataApiDenied(500, { code: "PGRST000" })).toBe(false);
+    expect(dataApiDenied(404, { code: "PGRST116" })).toBe(false);
+    expect(dataApiDenied(200, { code: "PGRST205" })).toBe(false);
+    expect(dataApiDenied(403, { code: "PGRST301" })).toBe(false);
     expect(
       classifyIssuedAudience("authenticated", `${site}/api/mcp`).detail,
     ).toContain("resource_audience=absent");
@@ -562,6 +815,7 @@ describe("direct tenant probe", () => {
       userId: userA,
       ownBusinessId: createdA.business.id,
       otherBusinessId: createdB.business.id,
+      clientIds: [],
     });
     expect(probe.runtimeReadDenied).toBe(true);
     expect(probe.ownVisible).toBe(true);
@@ -572,6 +826,117 @@ describe("direct tenant probe", () => {
       createdB.business.id,
     );
     expect(await store.readBusiness(actor(userA))).toBeNull();
+    await db.close();
+  });
+
+  it("stops before any write when a permissive policy makes other tenants visible", async () => {
+    const { db, connection, store } = await migratedDatabase();
+    const userA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
+    const userB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2";
+    const userC = "12121212-1212-4121-8121-121212121212";
+    const actor = (userId: string) => ({
+      path: "ui-session" as const,
+      userId,
+      clientId: null,
+    });
+    const createdA = await store.createBusiness(actor(userA), {
+      displayName: "Synthetic A",
+      idempotencyKey: "tos3-a",
+    });
+    const createdB = await store.createBusiness(actor(userB), {
+      displayName: "Synthetic B",
+      idempotencyKey: "tos3-b",
+    });
+    const createdC = await store.createBusiness(actor(userC), {
+      displayName: "Synthetic C",
+      idempotencyKey: "tos3-c",
+    });
+    await connection.exec(
+      "alter policy businesses_owner on app.businesses using (true) with check (true)",
+    );
+    await connection.exec(
+      "alter policy creation_keys_owner on app.business_creation_keys using (true) with check (true)",
+    );
+    await connection.exec("create role app_runtime login noinherit");
+    await connection.exec(
+      "grant app_request to app_runtime with inherit false, set true",
+    );
+    await connection.exec("set session authorization app_runtime");
+    const probe = await probeDirectTenantAccess(connection, {
+      userId: userA,
+      ownBusinessId: createdA.business.id,
+      otherBusinessId: createdB.business.id,
+      clientIds: [],
+    });
+    expect(probe.otherVisible).toBe(true);
+    expect(probe.deleted).toBe(false);
+    expect(probe.aborted).toBe(true);
+    expect(probe.abortReason).toBe("visibility");
+    const claims = JSON.stringify({
+      sub: userA,
+      role: "authenticated",
+      aud: "authenticated",
+    });
+    const remaining = await connection.transaction(async (tx) => {
+      await tx.query("select set_config('request.jwt.claims', $1, true)", [
+        claims,
+      ]);
+      await tx.query("select set_config('request.jwt.claim.sub', $1, true)", [
+        userA,
+      ]);
+      await tx.exec("set local role app_request");
+      return tx.query<{ id: string }>(
+        "select id::text as id from app.businesses",
+      );
+    });
+    expect(remaining.rows.map((row) => row.id).sort()).toEqual(
+      [createdA.business.id, createdB.business.id, createdC.business.id].sort(),
+    );
+    await db.close();
+  });
+
+  it("rolls back when the scoped creation-key count is not exactly one", async () => {
+    const { db, connection, store } = await migratedDatabase();
+    const userA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
+    const userB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2";
+    const actor = (userId: string) => ({
+      path: "ui-session" as const,
+      userId,
+      clientId: null,
+    });
+    const createdA = await store.createBusiness(actor(userA), {
+      displayName: "Synthetic A",
+      idempotencyKey: "tos3-a",
+    });
+    const createdB = await store.createBusiness(actor(userB), {
+      displayName: "Synthetic B",
+      idempotencyKey: "tos3-b",
+    });
+    await connection.query(
+      `insert into app.business_creation_keys (owner_user_id, idempotency_key, business_id)
+       values ($1::uuid, 'extra', $2::uuid)`,
+      [userA, createdA.business.id],
+    );
+    await connection.exec("create role app_runtime login noinherit");
+    await connection.exec(
+      "grant app_request to app_runtime with inherit false, set true",
+    );
+    await connection.exec("set session authorization app_runtime");
+    const probe = await probeDirectTenantAccess(connection, {
+      userId: userA,
+      ownBusinessId: createdA.business.id,
+      otherBusinessId: createdB.business.id,
+      clientIds: [],
+    });
+    expect(probe.deleted).toBe(false);
+    expect(probe.abortReason).toBe("count");
+    await connection.exec("reset session authorization");
+    expect((await store.readBusiness(actor(userA)))?.id).toBe(
+      createdA.business.id,
+    );
+    expect((await store.readBusiness(actor(userB)))?.id).toBe(
+      createdB.business.id,
+    );
     await db.close();
   });
 });

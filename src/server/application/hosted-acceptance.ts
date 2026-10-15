@@ -16,6 +16,7 @@ export interface AcceptanceReport {
   environment: "development";
   source: string;
   deployedCommit: string;
+  closingCommit: string;
   schema: string;
   results: AcceptanceCase[];
 }
@@ -43,7 +44,7 @@ export const MANAGEMENT_TOKEN_PURPOSE =
  * app_request. It is not the migration URL and it is not a privileged login.
  */
 export const APP_DATABASE_URL_PURPOSE =
-  "Development app_runtime connection for direct tenant reads and cleanup.";
+  "Development app_runtime connection for direct tenant reads and scoped business-row cleanup.";
 
 export const EXPECTED_AUTHORIZATION_PATH = "/oauth/consent";
 
@@ -122,6 +123,7 @@ export function formatAcceptanceReport(report: AcceptanceReport): string {
     "environment=development",
     `source=${sanitizeDetail(report.source) || "absent"}`,
     `deployed_commit=${sanitizeDetail(report.deployedCommit) || "absent"}`,
+    `closing_commit=${sanitizeDetail(report.closingCommit) || "absent"}`,
     "schema_source=reviewed_manifest",
     `schema=${sanitizeDetail(report.schema)}`,
     ...report.results.map(
@@ -292,11 +294,22 @@ export function openApiExposesApp(document: unknown): boolean {
   );
 }
 
+const DATA_API_REFUSALS: Record<number, readonly string[]> = {
+  401: ["PGRST301", "PGRST302", "PGRST303", "42501"],
+  403: ["42501"],
+  404: ["PGRST205"],
+  406: ["PGRST106"],
+};
+
+/**
+ * A Data API isolation denial is only an expected authorization or schema
+ * refusal. 500, 503, and 504, including PGRST000–PGRST003, are outages.
+ */
 export function dataApiDenied(status: number, body: unknown): boolean {
-  if (status === 200) return false;
+  const allowed = DATA_API_REFUSALS[status];
+  if (!allowed) return false;
   const code = (body as { code?: unknown } | null)?.code;
-  if (typeof code === "string" && /^PGRST\d+$/.test(code)) return true;
-  return status === 401 || status === 403 || status === 404 || status === 406;
+  return typeof code === "string" && allowed.includes(code);
 }
 
 export interface DirectProbe {
@@ -304,6 +317,22 @@ export interface DirectProbe {
   ownVisible: boolean;
   otherVisible: boolean;
   deleted: boolean;
+  aborted: boolean;
+  abortReason: "visibility" | "count" | null;
+}
+
+export interface DirectProbeInput {
+  userId: string;
+  ownBusinessId: string;
+  otherBusinessId: string;
+  clientIds?: readonly string[];
+}
+
+class CleanupCountError extends Error {
+  constructor() {
+    super("cleanup_count");
+    this.name = "cleanup_count";
+  }
 }
 
 function permissionDenied(error: unknown): boolean {
@@ -347,12 +376,16 @@ async function visibleIds(tx: Sql): Promise<string[]> {
 
 /**
  * Direct database bypass for one synthetic owner. The connection must already
- * be the app_runtime login. The function never prints SQL errors.
+ * be the app_runtime login. Mutations name that owner's business, user, and
+ * client ids. Unexpected visibility returns before any write. A row count
+ * other than the scoped expectation throws, and the transaction rolls back.
+ * The function never prints SQL errors.
  */
 export async function probeDirectTenantAccess(
   db: SqlConnection,
-  input: { userId: string; ownBusinessId: string; otherBusinessId: string },
+  input: DirectProbeInput,
 ): Promise<DirectProbe> {
+  const clientIds = [...(input.clientIds ?? [])];
   let runtimeReadDenied = false;
   try {
     await db.query("select id::text as id from app.businesses");
@@ -360,23 +393,99 @@ export async function probeDirectTenantAccess(
     runtimeReadDenied = permissionDenied(error);
   }
   const visible = await asRequest(db, input.userId, visibleIds);
-  await asRequest(db, input.userId, async (tx) => {
-    await tx.query("delete from app.business_creation_keys");
-    await tx.query("delete from app.oauth_consents");
-    await tx.query("update app.client_grants set business_id = null");
-    await tx.query("delete from app.businesses");
-  });
+  const ownVisible =
+    visible.includes(input.ownBusinessId) &&
+    !visible.includes(input.otherBusinessId);
+  const otherVisible = visible.includes(input.otherBusinessId);
+  const exact = visible.length === 1 && visible[0] === input.ownBusinessId;
+  if (!exact || clientIds.length > 3) {
+    return {
+      runtimeReadDenied,
+      ownVisible,
+      otherVisible,
+      deleted: false,
+      aborted: true,
+      abortReason: "visibility",
+    };
+  }
+  let removed = false;
+  try {
+    await asRequest(db, input.userId, async (tx) => {
+      await deleteOwnedRows(tx, input, clientIds);
+    });
+    removed = true;
+  } catch {
+    removed = false;
+  }
   const remaining = await asRequest(db, input.userId, visibleIds);
+  const deleted =
+    removed &&
+    !remaining.includes(input.ownBusinessId) &&
+    !remaining.includes(input.otherBusinessId);
   return {
     runtimeReadDenied,
-    ownVisible:
-      visible.includes(input.ownBusinessId) &&
-      !visible.includes(input.otherBusinessId),
-    otherVisible: visible.includes(input.otherBusinessId),
-    deleted:
-      !remaining.includes(input.ownBusinessId) &&
-      !remaining.includes(input.otherBusinessId),
+    ownVisible,
+    otherVisible,
+    deleted,
+    aborted: !deleted,
+    abortReason: deleted ? null : "count",
   };
+}
+
+async function deleteOwnedRows(
+  tx: Sql,
+  input: DirectProbeInput,
+  clientIds: readonly string[],
+): Promise<void> {
+  const keys = await tx.query<{ business_id: string }>(
+    `delete from app.business_creation_keys
+     where business_id = $1::uuid and owner_user_id = $2::uuid
+     returning business_id::text`,
+    [input.ownBusinessId, input.userId],
+  );
+  if (keys.rows.length !== 1) throw new CleanupCountError();
+  if (clientIds.length > 0) {
+    const consents = await tx.query<{ oauth_client_id: string }>(
+      `delete from app.oauth_consents
+       where owner_user_id = $1::uuid
+         and oauth_client_id = any($2::text[])
+       returning oauth_client_id`,
+      [input.userId, clientIds],
+    );
+    if (
+      consents.rows.length > clientIds.length * 8 ||
+      consents.rows.some((row) => !clientIds.includes(row.oauth_client_id))
+    ) {
+      throw new CleanupCountError();
+    }
+    const grants = await tx.query<{ oauth_client_id: string }>(
+      `update app.client_grants
+       set business_id = null
+       where owner_user_id = $1::uuid
+         and business_id = $2::uuid
+         and oauth_client_id = any($3::text[])
+       returning oauth_client_id`,
+      [input.userId, input.ownBusinessId, clientIds],
+    );
+    if (
+      grants.rows.length > clientIds.length ||
+      grants.rows.some((row) => !clientIds.includes(row.oauth_client_id))
+    ) {
+      throw new CleanupCountError();
+    }
+  }
+  const businesses = await tx.query<{ id: string }>(
+    `delete from app.businesses
+     where id = $1::uuid and owner_user_id = $2::uuid
+     returning id::text`,
+    [input.ownBusinessId, input.userId],
+  );
+  if (
+    businesses.rows.length !== 1 ||
+    businesses.rows[0]?.id !== input.ownBusinessId
+  ) {
+    throw new CleanupCountError();
+  }
 }
 
 export function classifyDirectProbe(probe: DirectProbe): AcceptanceCase[] {
@@ -398,7 +507,13 @@ export function classifyDirectProbe(probe: DirectProbe): AcceptanceCase[] {
     acceptanceCase(
       "direct.cleanup",
       probe.deleted ? "pass" : "fail",
-      probe.deleted ? "own_rows_removed" : "own_rows_remain",
+      probe.deleted
+        ? "own_rows_removed"
+        : probe.abortReason === "count"
+          ? "aborted_row_count"
+          : probe.abortReason === "visibility"
+            ? "aborted_unexpected_visibility"
+            : "own_rows_remain",
     ),
   ];
 }
