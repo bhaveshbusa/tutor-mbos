@@ -10,6 +10,7 @@ interface Step {
 }
 interface Job {
   uses?: string;
+  needs?: string | string[];
   environment?: string | { name: string };
   env?: Record<string, string>;
   steps?: Step[];
@@ -67,12 +68,20 @@ describe("CI workflow", () => {
 describe("development deployment", () => {
   const workflow = load("deploy-development.yml");
 
-  it("deploys only from main pushes or manual dispatch, after CI", () => {
+  it("deploys only from main pushes or manual dispatch, after CI and migrations", () => {
     expect(workflow.on).toEqual({
       push: { branches: ["main"] },
       workflow_dispatch: null,
     });
     expect(workflow.jobs.checks?.uses).toBe("./.github/workflows/ci.yml");
+    expect(workflow.jobs.migrate?.needs).toBe("checks");
+    expect(workflow.jobs.migrate?.uses).toBe(
+      "./.github/workflows/apply-development-migrations.yml",
+    );
+    expect(workflow.jobs.deploy?.needs).toBe("migrate");
+    expect(raw(`${WORKFLOW_DIR}/deploy-development.yml`)).toContain(
+      "group: development-delivery",
+    );
   });
 
   it("targets the development binding through the development environment", () => {
@@ -85,6 +94,38 @@ describe("development deployment", () => {
       ENVIRONMENT_BINDINGS.development.vercelProjectId,
     );
     expect(deploy.env?.DEPLOY_ENVIRONMENT).toBe("development");
+  });
+});
+
+describe("development migration recovery", () => {
+  const workflow = load("migrate-development.yml");
+  const applied = load("apply-development-migrations.yml");
+
+  it("is a manual recovery entry serialized with development delivery", () => {
+    expect(Object.keys(workflow.on)).toEqual(["workflow_dispatch"]);
+    expect(workflow.jobs.migrate?.uses).toBe(
+      "./.github/workflows/apply-development-migrations.yml",
+    );
+    expect(raw(`${WORKFLOW_DIR}/migrate-development.yml`)).toContain(
+      "group: development-delivery",
+    );
+    expect(
+      raw(`${WORKFLOW_DIR}/apply-development-migrations.yml`),
+    ).not.toContain("concurrency:");
+  });
+
+  it("uses the development environment and stops before any SQL when secrets are absent", () => {
+    const migrate = applied.jobs.migrate!;
+    expect(environmentOf(migrate)).toBe("development");
+    expect(Object.keys(applied.on)).toEqual(["workflow_call"]);
+    const runs = (migrate.steps ?? []).map((step) => step.run ?? "").join("\n");
+    expect(runs).toContain(
+      "GitHub → Settings → Environments → development → Secrets",
+    );
+    expect(runs.indexOf("SUPABASE_MIGRATION_DATABASE_URL")).toBeLessThan(
+      runs.indexOf("pnpm migrate:development"),
+    );
+    expect(runs).not.toContain("vercel");
   });
 });
 

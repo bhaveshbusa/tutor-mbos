@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   checkDeployTarget,
+  developmentSetupGaps,
   parseDotenv,
 } from "../scripts/assert-deploy-target.ts";
 import {
@@ -66,6 +67,21 @@ describe("checkDeployTarget", () => {
     expect(checkDeployTarget("staging", [devLink], devEnv)).toEqual([
       'Unknown deployment environment "staging".',
     ]);
+  });
+});
+
+describe("developmentSetupGaps", () => {
+  it("names the Vercel location when promotion configuration is absent", () => {
+    expect(developmentSetupGaps({})).toEqual([
+      "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY is absent. Set it at Vercel project tutor-mbos-dev → Settings → Environment Variables → Production.",
+      "TUTOR_MBOS_APP_DATABASE_URL is absent. Set it at Vercel project tutor-mbos-dev → Settings → Environment Variables → Production. The username must be app_runtime. It is not the migration URL.",
+    ]);
+    expect(
+      developmentSetupGaps({
+        NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: "configured",
+        TUTOR_MBOS_APP_DATABASE_URL: "configured",
+      }),
+    ).toEqual([]);
   });
 });
 

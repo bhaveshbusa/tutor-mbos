@@ -1,8 +1,9 @@
 name: Deploy development
 
-# Every push to main is checked, built in CI and deployed as prebuilt output to
-# the tutor-mbos-dev Vercel project (synthetic data only). The deployment is
-# smoke tested before it is promoted.
+# Every push to main runs CI, then development migrations and privilege
+# checks, then a prebuilt deploy that is smoke tested before promotion.
+# Credentials come from the protected development environment only.
+# Pull requests do not run this workflow.
 on:
   push:
     branches: [main]
@@ -12,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: deploy-development
+  group: development-delivery
   cancel-in-progress: false
 
 jobs:
@@ -21,9 +22,14 @@ jobs:
     with:
       ref: ${{ github.sha }}
 
+  migrate:
+    name: Migrate tutor-mbos-dev
+    needs: checks
+    uses: ./.github/workflows/apply-development-migrations.yml
+
   deploy:
     name: Deploy to tutor-mbos-dev
-    needs: checks
+    needs: migrate
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment:
@@ -52,7 +58,7 @@ jobs:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
         run: |
           if [ -z "$VERCEL_TOKEN" ]; then
-            echo "::error::Secret VERCEL_TOKEN is not set on the GitHub 'development' environment. See docs/cloud-foundation.md."
+            echo "::error::Set VERCEL_TOKEN at GitHub → Settings → Environments → development → Secrets. See docs/cloud-foundation.md. Promotion does not run until this step passes."
             exit 1
           fi
       - name: Pull Vercel project settings and environment

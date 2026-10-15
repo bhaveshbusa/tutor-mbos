@@ -1,0 +1,40 @@
+name: Apply development migrations
+
+# Called by the development delivery sequence and by the manual recovery
+# workflow. It is not triggered by pull requests and has no production target.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    name: Apply migrations to tutor-mbos-dev
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: development
+    steps:
+      - name: Require main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Development migrations run from main only."
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Require migration credentials
+        env:
+          SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
+          APP_RUNTIME_PASSWORD: ${{ secrets.APP_RUNTIME_PASSWORD }}
+        run: |
+          if [ -z "$SUPABASE_MIGRATION_DATABASE_URL" ] || [ -z "$APP_RUNTIME_PASSWORD" ]; then
+            echo "::error::Set SUPABASE_MIGRATION_DATABASE_URL and APP_RUNTIME_PASSWORD at GitHub → Settings → Environments → development → Secrets. See docs/release.md. Development promotion does not run until this step passes."
+            exit 1
+          fi
+      - name: Apply versioned migrations and privilege checks
+        env:
+          SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
+          APP_RUNTIME_PASSWORD: ${{ secrets.APP_RUNTIME_PASSWORD }}
+        run: pnpm migrate:development

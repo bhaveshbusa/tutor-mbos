@@ -81,7 +81,7 @@ Agent workspaces, pull request workflows and the repository never hold these val
 The Vercel projects and Supabase projects already exist. Do not recreate them.
 
 1. **Vercel token.** Create a token scoped to team `lets-play-game` (`team_2QehRm248FPmHJTzKS0rvS6b`) at Vercel → Account Settings → Tokens. Prefer separate tokens for the `development` and `production` GitHub environments so either can be revoked alone. Vercel tokens are team-scoped, not project-scoped; the workflows pin the project IDs and verify the linked project before deploying.
-2. **GitHub environment `development`.** Create it at GitHub → Settings → Environments. Restrict deployment branches to `main`. Add secret `VERCEL_TOKEN`.
+2. **GitHub environment `development`.** Create it at GitHub → Settings → Environments. Restrict deployment branches to `main`. Add secrets `VERCEL_TOKEN`, `SUPABASE_MIGRATION_DATABASE_URL` and `APP_RUNTIME_PASSWORD`.
 3. **GitHub environment `production`.** Create it. Restrict deployment branches to `main`. Add required reviewers (the owner) and enable *Prevent self-review*. Add secret `VERCEL_TOKEN`. Do not add `PRODUCTION_RELEASES_ENABLED` until final sign-off.
 4. **Vercel runtime variables.** Add the variables in the table above to each project's Production environment.
 5. **Vercel project settings.** For both projects: Framework Preset *Next.js*, Node.js version *24.x*. A Git connection is optional; `vercel.json` disables Git-triggered deployments so only the workflows deploy.
@@ -90,18 +90,21 @@ The Vercel projects and Supabase projects already exist. Do not recreate them.
 
 ## Development deployment
 
-`.github/workflows/deploy-development.yml` runs on every push to `main` and on manual dispatch from `main`:
+`.github/workflows/deploy-development.yml` runs on every push to `main` and on manual dispatch from `main`. It does not run on pull requests. The sequence is serialized with the manual migration recovery workflow by the concurrency group `development-delivery`.
 
 1. Reusable CI (all checks above).
-2. `vercel pull` for project `prj_ysIJHdIKYk2MQwvOKermUvIMuGVa`.
-3. `scripts/assert-deploy-target.ts development`: linked team/project and pulled runtime variables must match the development binding.
-4. `vercel build --prod` in CI (no `VERCEL_TOKEN`), then a secret scan of `.vercel/output`.
-5. `vercel deploy --prebuilt --prod --skip-domain` to `tutor-mbos-dev`. This creates the deployment without moving traffic. Development uses that project's main target because the project only ever holds synthetic data.
-6. `scripts/smoke-health.ts` against that deployment URL: `/api/v1/health` must return `200`, `environment: development`, the development Supabase project ref and the deployed commit.
-7. `vercel promote` only after the smoke test passes.
-8. If `SMOKE_ALIAS_URL` is set, the promoted alias is smoke tested again.
+2. Development migrations through `.github/workflows/apply-development-migrations.yml`: ledger drift check, privilege check, then pending SQL. This uses `SUPABASE_MIGRATION_DATABASE_URL` and `APP_RUNTIME_PASSWORD` from GitHub → Settings → Environments → `development` → Secrets. If either secret is absent, the workflow stops here and does not promote.
+3. `vercel pull` for project `prj_ysIJHdIKYk2MQwvOKermUvIMuGVa`.
+4. `scripts/assert-deploy-target.ts development`: linked team/project and pulled runtime variables must match the development binding. `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` and `TUTOR_MBOS_APP_DATABASE_URL` must be present. If either is absent, the workflow stops before build, deploy and promotion and names Vercel project `tutor-mbos-dev` → Settings → Environment Variables → Production.
+5. `vercel build --prod` in CI (no `VERCEL_TOKEN`), then a secret scan of `.vercel/output`.
+6. `vercel deploy --prebuilt --prod --skip-domain` to `tutor-mbos-dev`. This creates the deployment without moving traffic. Development uses that project's main target because the project only ever holds synthetic data.
+7. `scripts/smoke-health.ts` against that deployment URL: `/api/v1/health` must return `200`, `environment: development`, the development Supabase project ref and the deployed commit.
+8. `vercel promote` only after the smoke test passes.
+9. If `SMOKE_ALIAS_URL` is set, the promoted alias is smoke tested again.
 
-To trigger manually: GitHub → Actions → *Deploy development* → *Run workflow* on `main`.
+*Migrate development* (`.github/workflows/migrate-development.yml`) remains a manual recovery entry for the same migration job. It uses the same concurrency group, so it waits for an in-progress development delivery instead of overlapping it. Routine pushes do not need that dispatch.
+
+To rerun the whole sequence: GitHub → Actions → *Deploy development* → *Run workflow* on `main`.
 
 ## Production release
 
