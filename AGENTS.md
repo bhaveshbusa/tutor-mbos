@@ -9,6 +9,8 @@ All development and testing occur in Cursor/Devin cloud workspaces and cloud CI.
 
 One accountable implementation owner per issue and per shared authentication/schema/API contract. Cursor and Devin are interchangeable; record assignment before starting. Include relevant automated tests with every implementation. Codex coordinates review/integration/releases through cloud tools.
 
+Codex is the sole review dispatcher. The implementation owner posts review readiness on Linear with the full repository pull request URL, the exact HEAD, the scope, and CI evidence. The implementation owner does not mention the reviewer, delegate a review issue, add a review-trigger label, or retrigger a review from a status or comment. Codex prepares the review issue while it is undelegated, checks the pull request and SHA ledger, then delegates once. A delegation and a mention are two triggers; use one. Follow-ups stay in the retained session thread, without a mention, a second delegation, or a new issue. A new commit does not start a second review while one is active: finish or stop the active review and record the supersession first. CI, status, and stopped-session notices that do not change the verdict stay silent.
+
 Use Supabase-managed authentication/OAuth, explicit client authorization, user-scoped business data access and tenant RLS. No token bypass, user-editable authorization claims or privileged business-request clients. Test isolation through direct API/database paths, reports, exports and caches.
 
 Keep business logic and reporting definitions shared across UI/API/MCP. Version configurable policies; preserve financial history and unknown values. Mutations require safe retries and concurrency handling. Never expose arbitrary SQL as a query tool.

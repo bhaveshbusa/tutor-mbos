@@ -2,8 +2,15 @@ name: Apply development migrations
 
 # Called by the development delivery sequence and by the manual recovery
 # workflow. It is not triggered by pull requests and has no production target.
+# Callers must pass the development environment secrets by name. A reusable
+# workflow otherwise receives an empty string for an environment secret.
 on:
   workflow_call:
+    secrets:
+      SUPABASE_MIGRATION_DATABASE_URL:
+        required: true
+      APP_RUNTIME_PASSWORD:
+        required: true
 
 permissions:
   contents: read
@@ -29,8 +36,21 @@ jobs:
           SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
           APP_RUNTIME_PASSWORD: ${{ secrets.APP_RUNTIME_PASSWORD }}
         run: |
-          if [ -z "$SUPABASE_MIGRATION_DATABASE_URL" ] || [ -z "$APP_RUNTIME_PASSWORD" ]; then
-            echo "::error::Set SUPABASE_MIGRATION_DATABASE_URL and APP_RUNTIME_PASSWORD at GitHub → Settings → Environments → development → Secrets. See docs/release.md. Development promotion does not run until this step passes."
+          status=0
+          if [ -z "$SUPABASE_MIGRATION_DATABASE_URL" ]; then
+            echo "::error::SUPABASE_MIGRATION_DATABASE_URL is absent. Expected secret scope: GitHub environment development (Settings → Environments → development → Secrets)."
+            status=1
+          else
+            echo "SUPABASE_MIGRATION_DATABASE_URL is present. Expected secret scope: GitHub environment development."
+          fi
+          if [ -z "$APP_RUNTIME_PASSWORD" ]; then
+            echo "::error::APP_RUNTIME_PASSWORD is absent. Expected secret scope: GitHub environment development (Settings → Environments → development → Secrets)."
+            status=1
+          else
+            echo "APP_RUNTIME_PASSWORD is present. Expected secret scope: GitHub environment development."
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Development migrations stop before SQL until each absent secret above is present."
             exit 1
           fi
       - name: Apply versioned migrations and privilege checks

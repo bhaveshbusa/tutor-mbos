@@ -66,6 +66,9 @@ jobs:
     name: Migrate tutor-mbos-dev
     needs: preflight
     uses: ./.github/workflows/apply-development-migrations.yml
+    secrets:
+      SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
+      APP_RUNTIME_PASSWORD: ${{ secrets.APP_RUNTIME_PASSWORD }}
 
   deploy:
     name: Deploy to tutor-mbos-dev

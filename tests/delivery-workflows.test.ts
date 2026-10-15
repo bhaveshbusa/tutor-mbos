@@ -15,6 +15,7 @@ interface Job {
   env?: Record<string, string>;
   steps?: Step[];
   permissions?: Record<string, string>;
+  secrets?: Record<string, string> | string;
 }
 interface Workflow {
   on: Record<string, unknown>;
@@ -136,15 +137,50 @@ describe("development migration recovery", () => {
   it("uses the development environment and stops before any SQL when secrets are absent", () => {
     const migrate = applied.jobs.migrate!;
     expect(environmentOf(migrate)).toBe("development");
+    const call = applied.on.workflow_call as {
+      secrets?: Record<string, { required?: boolean }>;
+    };
     expect(Object.keys(applied.on)).toEqual(["workflow_call"]);
+    expect(call.secrets).toEqual({
+      SUPABASE_MIGRATION_DATABASE_URL: { required: true },
+      APP_RUNTIME_PASSWORD: { required: true },
+    });
     const runs = (migrate.steps ?? []).map((step) => step.run ?? "").join("\n");
     expect(runs).toContain(
-      "GitHub → Settings → Environments → development → Secrets",
+      "SUPABASE_MIGRATION_DATABASE_URL is absent. Expected secret scope: GitHub environment development",
     );
-    expect(runs.indexOf("SUPABASE_MIGRATION_DATABASE_URL")).toBeLessThan(
+    expect(runs).toContain(
+      "APP_RUNTIME_PASSWORD is absent. Expected secret scope: GitHub environment development",
+    );
+    expect(runs).toContain("SUPABASE_MIGRATION_DATABASE_URL is present.");
+    expect(runs).toContain("APP_RUNTIME_PASSWORD is present.");
+    expect(runs).not.toContain("||");
+    expect(runs).not.toMatch(
+      /echo\s+["']\$\{?(SUPABASE_MIGRATION_DATABASE_URL|APP_RUNTIME_PASSWORD)/,
+    );
+    expect(runs).not.toMatch(/\b(printenv|env|sha256sum|wc)\b/);
+    expect(runs.indexOf("is absent")).toBeLessThan(
       runs.indexOf("pnpm migrate:development"),
     );
     expect(runs).not.toContain("vercel");
+  });
+
+  it("forwards only the two development migration secrets by name", () => {
+    const forwarded = {
+      SUPABASE_MIGRATION_DATABASE_URL:
+        "${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}",
+      APP_RUNTIME_PASSWORD: "${{ secrets.APP_RUNTIME_PASSWORD }}",
+    };
+    for (const file of ["deploy-development.yml", "migrate-development.yml"]) {
+      const caller = load(file).jobs.migrate!;
+      expect(caller.uses, file).toBe(
+        "./.github/workflows/apply-development-migrations.yml",
+      );
+      expect(environmentOf(caller), file).toBeUndefined();
+      expect(caller.secrets, file).toEqual(forwarded);
+      expect(JSON.stringify(caller), file).not.toContain("inherit");
+      expect(JSON.stringify(caller), file).not.toContain("VERCEL_TOKEN");
+    }
   });
 });
 
@@ -201,6 +237,18 @@ describe("all workflows", () => {
         load(file.split("/").pop()!).jobs,
       )) {
         if (!environmentOf(job)) {
+          const forwardedMigration =
+            job.uses ===
+              "./.github/workflows/apply-development-migrations.yml" &&
+            name === "migrate";
+          if (forwardedMigration) {
+            expect(job.secrets, `${file} job ${name}`).toEqual({
+              SUPABASE_MIGRATION_DATABASE_URL:
+                "${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}",
+              APP_RUNTIME_PASSWORD: "${{ secrets.APP_RUNTIME_PASSWORD }}",
+            });
+            continue;
+          }
           expect(JSON.stringify(job), `${file} job ${name}`).not.toMatch(
             /secrets\./,
           );

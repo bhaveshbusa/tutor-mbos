@@ -19,7 +19,7 @@ A candidate reaches production only through `.github/workflows/release-productio
 - The runner takes a session advisory lock, checks the recorded ledger against the reviewed files, and only then applies each pending file in its own transaction, in manifest order. A recorded version that is not in the reviewed set, a checksum or name that does not match the file, or a history that skips an earlier version stops the run before any pending SQL.
 - Destructive changes need a reviewed recovery plan and verified backup coverage. Emergency fixes do not skip these gates unless the user explicitly authorizes the exception.
 
-Development migration credentials are GitHub environment secrets, not repository files and not agent workspace variables:
+Development migration credentials are GitHub environment secrets, not repository files and not agent workspace variables. The development deploy and the manual recovery workflow pass these two names into the reusable migration workflow. GitHub leaves an environment secret empty in a reusable workflow unless the caller passes it. The called job keeps `environment: development`, so the passed name resolves to that environment. Before any SQL, the workflow reports each secret as present or absent and does not print the value.
 
 | Secret | Purpose |
 | --- | --- |
