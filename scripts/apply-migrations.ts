@@ -10,7 +10,8 @@ import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import * as access from "../src/server/config/access.ts";
 import {
-  formatRuntimeRoleEvidence,
+  assertLedgerMatches,
+  formatRuntimePrivilegeEvidence,
   formatSchemaLedgerLine,
   provisionAppRuntime,
   readSchemaLedger,
@@ -116,8 +117,9 @@ async function main(): Promise<void> {
     const ledger = await readSchemaLedger(db);
     for (const entry of ledger) console.log(formatSchemaLedgerLine(entry));
     try {
-      const role = await provisionAppRuntime(db, appPassword);
-      console.log(formatRuntimeRoleEvidence(role));
+      assertLedgerMatches(ledger, manifest.migrations);
+      const evidence = await provisionAppRuntime(db, appPassword);
+      console.log(formatRuntimePrivilegeEvidence(evidence));
       console.log("app_runtime is ready for user-scoped requests.");
     } catch (error) {
       runtimeFailure = safeRuntimeFailure(error, appPassword);
