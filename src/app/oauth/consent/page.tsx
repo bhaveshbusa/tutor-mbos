@@ -25,13 +25,17 @@ export default async function ConsentPage({
   const request = new Request("http://localhost/oauth/consent", {
     headers: cookie ? { cookie } : {},
   });
-  const response = await withAccess(request, process.env, (deps) =>
-    resolveConsentEntry(
-      request,
-      deps,
-      createSupabaseConsentGateway(process.env),
-      authorizationId,
-    ),
+  const response = await withAccess(
+    request,
+    process.env,
+    (deps) =>
+      resolveConsentEntry(
+        request,
+        deps,
+        createSupabaseConsentGateway(process.env),
+        authorizationId,
+      ),
+    { session: "stored" },
   );
   if (response.status === 303) {
     const location = response.headers.get("location");
@@ -49,8 +53,9 @@ export default async function ConsentPage({
       </p>
       {repeat ? (
         <p>
-          This authorization was already decided, and no single live grant
-          matches it. Start the client connection again before approving.
+          This authorization was already decided, and it does not match exactly
+          one registered client redirect. Start the client connection again
+          before approving.
         </p>
       ) : null}
       <form action="/api/oauth/decision" method="post">

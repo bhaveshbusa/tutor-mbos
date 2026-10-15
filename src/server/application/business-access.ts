@@ -180,6 +180,7 @@ export async function recordClientConsent(
     scopes: readonly string[];
     authorizationId: string;
     decision: "approved" | "denied";
+    redirectUri?: string | null;
   },
 ): Promise<{ ok: true } | Failure> {
   if (actor.path !== "ui-session")

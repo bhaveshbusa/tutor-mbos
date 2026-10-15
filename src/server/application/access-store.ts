@@ -39,6 +39,7 @@ export interface ConsentInput {
   scopes: readonly string[];
   authorizationId: string;
   decision: "approved" | "denied";
+  redirectUri?: string | null;
 }
 
 export interface AccessStore {
@@ -54,7 +55,7 @@ export interface AccessStore {
   ): Promise<GrantRecord | null>;
   recordConsent(actor: VerifiedActor, input: ConsentInput): Promise<void>;
   revokeGrant(actor: VerifiedActor, clientId: string): Promise<boolean>;
-  listLiveGrantClientIds(actor: VerifiedActor): Promise<string[]>;
+  listLiveGrantRedirects(actor: VerifiedActor): Promise<string[]>;
 }
 
 function claimsFor(actor: VerifiedActor): string {
@@ -201,13 +202,14 @@ export function createPgAccessStore(db: SqlConnection): AccessStore {
     async recordConsent(actor, input) {
       await withActor(db, actor, (tx) =>
         tx.query(
-          "select app.record_client_consent($1, $2::text[], $3::text[], $4, $5)",
+          "select app.record_client_consent($1, $2::text[], $3::text[], $4, $5, $6)",
           [
             input.oauthClientId,
             input.permissions,
             input.scopes,
             input.authorizationId,
             input.decision,
+            input.redirectUri ?? null,
           ],
         ),
       );
@@ -221,16 +223,19 @@ export function createPgAccessStore(db: SqlConnection): AccessStore {
       );
       return result.rows[0]?.revoke_client_grant === true;
     },
-    async listLiveGrantClientIds(actor) {
+    async listLiveGrantRedirects(actor) {
       const result = await withActor(db, actor, (tx) =>
-        tx.query<{ oauth_client_id: string }>(
-          `select oauth_client_id
+        tx.query<{ registered_redirect_uri: string | null }>(
+          `select registered_redirect_uri
            from app.client_grants
            where revoked_at is null
-           order by oauth_client_id`,
+             and registered_redirect_uri is not null
+           order by registered_redirect_uri`,
         ),
       );
-      return result.rows.map((row) => row.oauth_client_id);
+      return result.rows.flatMap((row) =>
+        row.registered_redirect_uri ? [row.registered_redirect_uri] : [],
+      );
     },
   };
 }

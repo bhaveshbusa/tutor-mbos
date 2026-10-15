@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   applyMigrations,
+  assertTenantPrivileges,
   hashSql,
   loadMigrationFiles,
 } from "@/server/application/migration-runner";
@@ -77,6 +78,7 @@ describe("versioned migrations", () => {
       connection.query("select * from app.businesses"),
     ).rejects.toThrow(/permission denied/);
     await connection.exec("reset role");
+    await assertTenantPrivileges(connection);
   });
 
   it("keeps populated rows when the corrective migration is applied", async () => {

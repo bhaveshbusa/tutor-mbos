@@ -17,7 +17,7 @@ import {
   type JsonWebKey,
 } from "@/server/application/access-token";
 import { applySetCookies, serializeAuthCookie } from "./auth-cookies";
-import { oauthGrantRevokeUrl } from "./consent";
+import { revokeSupabaseOauthGrant } from "./consent";
 import { createPgAccessStore } from "@/server/application/access-store";
 import { pgConnection } from "@/server/application/pg-connection";
 import type { AccessDeps } from "./access";
@@ -64,12 +64,56 @@ export function authConfigured(env: EnvSource): boolean {
   return inspectAppDatabaseUrl(databaseUrl, runtime.config.environment).ok;
 }
 
+const SESSION_REFRESH_MARGIN_MS = 90_000;
+
+export function authStorageKey(supabaseUrl: string): string {
+  return `sb-${new URL(supabaseUrl).hostname.split(".")[0]}-auth-token`;
+}
+
+/**
+ * Reads the UI access token from the request cookie and does not call Auth.
+ * A token inside the refresh window is treated as absent so a Server Component
+ * cannot rotate the refresh token and then drop the new cookies.
+ */
+export function readStoredAccessToken(
+  request: Request,
+  supabaseUrl: string,
+  now = Date.now(),
+): string | null {
+  const cookies = parseCookieHeader(request.headers.get("cookie") ?? "");
+  const key = authStorageKey(supabaseUrl);
+  const direct = cookies.find((cookie) => cookie.name === key)?.value;
+  const chunked = cookies
+    .filter((cookie) => cookie.name.startsWith(`${key}.`))
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .map((cookie) => cookie.value)
+    .join("");
+  const raw = direct || chunked;
+  if (!raw) return null;
+  const encoded = raw.startsWith("base64-") ? raw.slice("base64-".length) : raw;
+  let session: { access_token?: unknown; expires_at?: unknown };
+  try {
+    session = JSON.parse(
+      Buffer.from(encoded, "base64url").toString("utf8"),
+    ) as { access_token?: unknown; expires_at?: unknown };
+  } catch {
+    return null;
+  }
+  if (typeof session.access_token !== "string" || !session.access_token) {
+    return null;
+  }
+  if (typeof session.expires_at !== "number") return null;
+  if (session.expires_at * 1000 - now < SESSION_REFRESH_MARGIN_MS) return null;
+  return session.access_token;
+}
+
 export async function withAccess(
   request: Request,
   env: EnvSource,
   run: (deps: AccessDeps) => Promise<Response>,
-  fetchImpl: typeof fetch = fetch,
+  options: { fetch?: typeof fetch; session?: "refresh" | "stored" } = {},
 ): Promise<Response> {
+  const fetchImpl = options.fetch ?? fetch;
   const runtime = loadRuntimeConfig(env);
   const publishableKey = env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
   if (!runtime.ok || !publishableKey || looksLikeSecret(publishableKey)) {
@@ -129,23 +173,19 @@ export async function withAccess(
       });
     },
     revokeAuthGrant: async (sessionToken, clientId) => {
-      try {
-        const response = await fetchImpl(
-          oauthGrantRevokeUrl(runtime.config.supabaseUrl, clientId),
-          {
-            method: "DELETE",
-            headers: {
-              authorization: `Bearer ${sessionToken}`,
-              apikey: publishableKey,
-            },
-          },
-        );
-        return response.ok ? "ok" : "failed";
-      } catch {
-        return "failed";
-      }
+      const result = await revokeSupabaseOauthGrant(
+        runtime.config.supabaseUrl,
+        publishableKey,
+        sessionToken,
+        clientId,
+        fetchImpl,
+      );
+      return result === "gone" ? "ok" : "failed";
     },
     sessionToken: async (incoming) => {
+      if (options.session === "stored") {
+        return readStoredAccessToken(incoming, runtime.config.supabaseUrl);
+      }
       const session = await readUiSession(
         incoming,
         runtime.config.supabaseUrl,

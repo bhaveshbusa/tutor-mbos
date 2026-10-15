@@ -9,15 +9,19 @@ export default async function BusinessPage() {
   const request = new Request("http://localhost/api/v1/business", {
     headers: cookie ? { cookie } : {},
   });
-  const response = await withAccess(request, process.env, (deps) =>
-    createAccessHandlers(deps).getBusiness(
-      new Request(request, {
-        headers: {
-          ...Object.fromEntries(request.headers),
-          origin: deps.siteOrigin,
-        },
-      }),
-    ),
+  const response = await withAccess(
+    request,
+    process.env,
+    (deps) =>
+      createAccessHandlers(deps).getBusiness(
+        new Request(request, {
+          headers: {
+            ...Object.fromEntries(request.headers),
+            origin: deps.siteOrigin,
+          },
+        }),
+      ),
+    { session: "stored" },
   );
   if (response.status === 401) {
     return (

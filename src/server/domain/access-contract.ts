@@ -74,7 +74,7 @@ export function isBusinessPermission(
   return (BUSINESS_PERMISSIONS as readonly string[]).includes(value);
 }
 
-/** Drops anything outside the catalogue, including claims a client invented. */
+/** MCP protocol versions this server can negotiate. */
 export const MCP_PROTOCOL_VERSIONS = ["2025-03-26", "2025-06-18"] as const;
 
 export const MCP_PROTOCOL_VERSION = "2025-06-18";
@@ -89,6 +89,7 @@ export function negotiateMcpProtocol(requested: unknown): string {
   return MCP_PROTOCOL_VERSION;
 }
 
+/** Drops anything outside the catalogue, including claims a client invented. */
 export function knownPermissions(
   values: readonly string[],
 ): BusinessPermission[] {

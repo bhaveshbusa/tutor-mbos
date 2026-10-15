@@ -1,15 +1,23 @@
--- Corrective migration. Denial revokes the previous grant, and the
+-- Corrective migration. Denial revokes the previous grant. Approval stores
+-- the client's registered redirect so reconnection can match it. The
 -- authenticated API role loses direct access to schema app. The request
--- path remains app_request. Hosted development apply must still confirm
--- that the migration role can grant execute on auth.uid() to app_request;
--- this file does not change that grant.
+-- path remains app_request. This file does not change grants on schema
+-- auth: authenticated keeps auth.uid() and auth.jwt() for platform RLS,
+-- and app_request already receives those grants in 20261015120000.
+-- Not applied to a hosted database. Revised in place before any apply.
 
-create or replace function app.record_client_consent(
+alter table app.client_grants
+  add column registered_redirect_uri text;
+
+drop function app.record_client_consent(text, text[], text[], text, text);
+
+create function app.record_client_consent(
   p_oauth_client_id text,
   p_permissions text[],
   p_scopes text[],
   p_authorization_id text,
-  p_decision text
+  p_decision text,
+  p_redirect_uri text
 )
 returns void
 language plpgsql
@@ -62,19 +70,22 @@ begin
       owner_user_id,
       business_id,
       oauth_client_id,
-      permissions
+      permissions,
+      registered_redirect_uri
     )
     values (
       auth.uid(),
       (select b.id from app.businesses b where b.owner_user_id = auth.uid()),
       p_oauth_client_id,
-      p_permissions
+      p_permissions,
+      p_redirect_uri
     )
     on conflict (owner_user_id, oauth_client_id) do update
     set permissions = excluded.permissions,
         revoked_at = null,
         granted_at = now(),
-        business_id = coalesce(client_grants.business_id, excluded.business_id);
+        business_id = coalesce(client_grants.business_id, excluded.business_id),
+        registered_redirect_uri = excluded.registered_redirect_uri;
   else
     update app.client_grants
     set revoked_at = now(),
@@ -92,9 +103,6 @@ revoke all on all sequences in schema app from authenticated;
 revoke all on all functions in schema app from authenticated;
 revoke all on app.setup_report from authenticated;
 grant execute on function app.create_business(text, text) to app_request;
-grant execute on function app.record_client_consent(text, text[], text[], text, text) to app_request;
+grant execute on function app.record_client_consent(text, text[], text[], text, text, text) to app_request;
 grant execute on function app.revoke_client_grant(text) to app_request;
 grant execute on function app.permissions_allowed(text[]) to app_request;
-revoke execute on function auth.uid() from authenticated;
-revoke execute on function auth.jwt() from authenticated;
-revoke usage on schema auth from authenticated;

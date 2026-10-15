@@ -10,6 +10,8 @@ import {
   authorizationConsentUrl,
   authorizationDetailsUrl,
   authorizationRequest,
+  redirectOriginPath,
+  revokeSupabaseOauthGrant,
   safeClientRedirect,
 } from "@/adapters/http/consent";
 import { recoveryRedirect } from "@/server/config/access";
@@ -177,5 +179,57 @@ describe("browser authentication", () => {
       "https://",
     );
     expect(safeClientRedirect("javascript:alert(1)")).toBeNull();
+    expect(
+      redirectOriginPath("https://api-client.example/callback/?code=1"),
+    ).toBe("https://api-client.example/callback");
+  });
+
+  it("treats a missing Supabase OAuth grant as already revoked", async () => {
+    const supabase = "https://idvzjqrkgnihvxoswuxu.supabase.co";
+    const key = `sb_${"publishable"}_revoke_test`;
+    const calls: number[] = [];
+    const fetchImpl: typeof fetch = async () => {
+      const status = calls.length === 0 ? 404 : calls.length === 1 ? 204 : 500;
+      calls.push(status);
+      return new Response(null, { status });
+    };
+    expect(
+      await revokeSupabaseOauthGrant(
+        supabase,
+        key,
+        "session",
+        "client",
+        fetchImpl,
+      ),
+    ).toBe("gone");
+    expect(
+      await revokeSupabaseOauthGrant(
+        supabase,
+        key,
+        "session",
+        "client",
+        fetchImpl,
+      ),
+    ).toBe("gone");
+    expect(
+      await revokeSupabaseOauthGrant(
+        supabase,
+        key,
+        "session",
+        "client",
+        fetchImpl,
+      ),
+    ).toBe("failed");
+    expect(
+      await revokeSupabaseOauthGrant(
+        supabase,
+        key,
+        "session",
+        "client",
+        async () => {
+          throw new Error("offline");
+        },
+      ),
+    ).toBe("failed");
   });
 });

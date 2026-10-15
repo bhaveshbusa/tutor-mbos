@@ -7,6 +7,7 @@ import { readFileSync } from "node:fs";
 import { inspectMigrationDatabaseUrl } from "../src/server/config/access.ts";
 import {
   applyMigrations,
+  assertTenantPrivileges,
   loadMigrationFiles,
   type MigrationManifest,
 } from "../src/server/application/migration-runner.ts";
@@ -34,6 +35,7 @@ const db = pgConnection(databaseUrl);
 
 try {
   const applied = await applyMigrations(db, files, manifest.lockKey);
+  await assertTenantPrivileges(db);
   console.log(
     applied.length === 0
       ? "Migrations already applied."

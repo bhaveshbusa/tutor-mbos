@@ -212,7 +212,7 @@ describe("tenant isolation", () => {
       async revokeGrant() {
         return false;
       },
-      async listLiveGrantClientIds() {
+      async listLiveGrantRedirects() {
         return [];
       },
     };

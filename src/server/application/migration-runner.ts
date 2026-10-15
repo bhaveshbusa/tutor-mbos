@@ -93,3 +93,22 @@ export async function applyMigrations(
     await db.query("select pg_advisory_unlock($1)", [lockKey]);
   }
 }
+
+/**
+ * Hosted development apply checks these privileges after the migration set.
+ * authenticated must not use schema app. app_request must still execute
+ * auth.uid(), which stays granted by Supabase Auth rather than this app.
+ */
+export async function assertTenantPrivileges(db: SqlConnection): Promise<void> {
+  const result = await db.query<{ app_usage: boolean; uid_execute: boolean }>(
+    `select has_schema_privilege('authenticated', 'app', 'USAGE') as app_usage,
+            has_function_privilege('app_request', 'auth.uid()', 'EXECUTE') as uid_execute`,
+  );
+  const row = result.rows[0];
+  if (!row || row.app_usage) {
+    throw new Error("authenticated retains usage on schema app");
+  }
+  if (!row.uid_execute) {
+    throw new Error("app_request cannot execute auth.uid()");
+  }
+}

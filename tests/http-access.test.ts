@@ -390,6 +390,18 @@ describe("HTTP API access", () => {
         scopes: ["openid"],
         authorizationId: "earlier",
         decision: "approved",
+        redirectUri: "https://api-client.example/callback",
+      },
+    );
+    await store.recordConsent(
+      { path: "ui-session", userId: TENANT_A.userId, clientId: null },
+      {
+        oauthClientId: CHATGPT_CLIENT,
+        permissions: ["reports.read"],
+        scopes: ["openid"],
+        authorizationId: "chatgpt",
+        decision: "approved",
+        redirectUri: "https://chatgpt.example/callback",
       },
     );
     const response = await handleConsentDecision(
@@ -404,7 +416,7 @@ describe("HTTP API access", () => {
       {
         async details() {
           return {
-            redirectUrl: `https://api-client.example/callback?code=1&client_id=${API_CLIENT}`,
+            redirectUrl: "https://api-client.example/callback?code=1&state=abc",
           };
         },
         async decide() {
@@ -416,7 +428,33 @@ describe("HTTP API access", () => {
       },
     );
     expect(response.status).toBe(303);
-    expect(response.headers.get("location")).toContain("client_id=");
+    expect(response.headers.get("location")).toBe(
+      "https://api-client.example/callback?code=1&state=abc",
+    );
+    const spoofed = await handleConsentDecision(
+      ui("https://example.test/api/oauth/decision", owner, {
+        method: "POST",
+        body: new URLSearchParams({
+          authorization_id: "authz-spoof",
+          decision: "approve",
+        }),
+      }),
+      deps,
+      {
+        async details() {
+          return {
+            redirectUrl: `https://evil.example/callback?code=1&client_id=${API_CLIENT}`,
+          };
+        },
+        async decide() {
+          return { redirectUrl: "https://evil.example/callback?code=1" };
+        },
+        async revokeGrant() {
+          return { ok: true };
+        },
+      },
+    );
+    expect(spoofed.status).toBe(409);
     await store.revokeGrant(
       { path: "ui-session", userId: TENANT_A.userId, clientId: null },
       API_CLIENT,
@@ -433,7 +471,7 @@ describe("HTTP API access", () => {
       {
         async details() {
           return {
-            redirectUrl: `https://api-client.example/callback?code=2&client_id=${API_CLIENT}`,
+            redirectUrl: "https://api-client.example/callback?code=2",
           };
         },
         async decide() {
@@ -445,6 +483,103 @@ describe("HTTP API access", () => {
       },
     );
     expect(again.status).toBe(409);
+    const chatgpt = await handleConsentDecision(
+      ui("https://example.test/api/oauth/decision", owner, {
+        method: "POST",
+        body: new URLSearchParams({
+          authorization_id: "authz-chatgpt-back",
+          decision: "approve",
+        }),
+      }),
+      deps,
+      {
+        async details() {
+          return {
+            redirectUrl: "https://chatgpt.example/callback/?code=9",
+          };
+        },
+        async decide() {
+          return { redirectUrl: "https://chatgpt.example/callback/?code=9" };
+        },
+        async revokeGrant() {
+          return { ok: true };
+        },
+      },
+    );
+    expect(chatgpt.status).toBe(303);
+  });
+
+  it("denies a new client when Supabase has no grant to delete", async () => {
+    const { mint, deps } = await world();
+    const owner = await mint(TENANT_A.userId);
+    let decided = false;
+    const denied = await handleConsentDecision(
+      ui("https://example.test/api/oauth/decision", owner, {
+        method: "POST",
+        body: new URLSearchParams({
+          authorization_id: "authz-first-deny",
+          decision: "deny",
+        }),
+      }),
+      deps,
+      {
+        async details() {
+          return {
+            clientId: API_CLIENT,
+            clientName: "API client",
+            redirectUri: "https://api-client.example/callback",
+            scopes: ["openid"],
+          };
+        },
+        async decide() {
+          decided = true;
+          return {
+            redirectUrl:
+              "https://api-client.example/callback?error=access_denied",
+          };
+        },
+        async revokeGrant() {
+          return { ok: true };
+        },
+      },
+    );
+    expect(decided).toBe(true);
+    expect(denied.status).toBe(303);
+  });
+
+  it("revokes the app grant when Supabase already has no OAuth grant", async () => {
+    const { handlers, mint, deps } = await world();
+    const owner = await mint(TENANT_A.userId);
+    await deps.store!.recordConsent(
+      { path: "ui-session", userId: TENANT_A.userId, clientId: null },
+      {
+        oauthClientId: API_CLIENT,
+        permissions: ["business.read"],
+        scopes: ["openid"],
+        authorizationId: "retry",
+        decision: "approved",
+        redirectUri: "https://api-client.example/callback",
+      },
+    );
+    deps.revokeAuthGrant = async () => "ok";
+    const revoked = await handlers.revoke(
+      ui("https://example.test/api/v1/grants/revoke", owner, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ clientId: API_CLIENT }),
+      }),
+    );
+    expect(revoked.status).toBe(200);
+    const token = await mint(TENANT_A.userId, { client_id: API_CLIENT });
+    expect(
+      (
+        await handlers.getBusiness(
+          new Request("https://example.test/api/v1/business", {
+            headers: { authorization: `Bearer ${token}` },
+          }),
+        )
+      ).status,
+    ).toBe(403);
   });
 
   it("does not revoke the app grant when the authentication server refuses", async () => {

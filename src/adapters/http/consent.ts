@@ -33,9 +33,6 @@ export interface ConsentGateway {
   ): Promise<{ ok: true } | { error: string }>;
 }
 
-const CLIENT_ID =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
 export function authorizationDetailsUrl(
   supabaseUrl: string,
   authorizationId: string,
@@ -82,6 +79,37 @@ export function authorizationRequest(
   };
 }
 
+/**
+ * A missing Supabase OAuth grant is success. DELETE returns 204 when a grant
+ * existed and 404 oauth_consent_not_found when it did not. Other statuses and
+ * network errors stay failures so a live grant is not dropped by mistake.
+ */
+export async function revokeSupabaseOauthGrant(
+  supabaseUrl: string,
+  publishableKey: string,
+  sessionToken: string,
+  clientId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<"gone" | "failed"> {
+  if (!supabaseUrl || !publishableKey || !sessionToken) return "failed";
+  try {
+    const response = await fetchImpl(
+      oauthGrantRevokeUrl(supabaseUrl, clientId),
+      {
+        method: "DELETE",
+        headers: {
+          authorization: `Bearer ${sessionToken}`,
+          apikey: publishableKey,
+        },
+      },
+    );
+    if (response.ok || response.status === 404) return "gone";
+    return "failed";
+  } catch {
+    return "failed";
+  }
+}
+
 export function safeClientRedirect(value: string): string | null {
   let url: URL;
   try {
@@ -93,6 +121,16 @@ export function safeClientRedirect(value: string): string | null {
   if (url.protocol === "http:" && url.hostname === "localhost")
     return url.toString();
   return null;
+}
+
+/** Origin and path only. Query and fragment are not part of the client match. */
+export function redirectOriginPath(value: string): string | null {
+  const safe = safeClientRedirect(value);
+  if (!safe) return null;
+  const url = new URL(safe);
+  const path =
+    url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : url.pathname;
+  return `${url.origin}${path}`;
 }
 
 export async function handleConsentDecision(
@@ -169,12 +207,17 @@ export async function handleConsentDecision(
     .getAll("permissions")
     .filter((value): value is string => typeof value === "string");
   const permissions = decision === "approve" ? knownPermissions(requested) : [];
+  const redirectUri = decision === "approve" ? details.redirectUri : null;
+  if (decision === "approve" && !redirectOriginPath(details.redirectUri)) {
+    return problemResponse(400, "Bad request", "invalid_redirect");
+  }
   const recorded = await recordClientConsent(deps.store, actor, {
     oauthClientId: details.clientId,
     permissions,
     scopes: details.scopes,
     authorizationId,
     decision: decision === "approve" ? "approved" : "denied",
+    redirectUri,
   });
   if (!recorded.ok) {
     return problemResponse(recorded.status, "Consent failed", recorded.code);
@@ -251,20 +294,17 @@ async function reconnectResponse(
       "The client redirect was rejected.",
     );
   }
-  const live = await store.listLiveGrantClientIds(actor);
-  const named = clientIdFromRedirect(redirect);
-  const allowed = named ? live.includes(named) : live.length === 1;
-  if (!allowed) {
+  const target = redirectOriginPath(redirect);
+  const live = await store.listLiveGrantRedirects(actor);
+  const matches = target
+    ? live.filter((uri) => redirectOriginPath(uri) === target)
+    : [];
+  if (matches.length !== 1) {
     return options.repeatStatus === 200
       ? Response.json({ view: "repeat" })
       : problemResponse(409, "Consent required", "consent_required");
   }
   return Response.redirect(redirect, 303);
-}
-
-function clientIdFromRedirect(value: string): string | null {
-  const id = new URL(value).searchParams.get("client_id");
-  return id && CLIENT_ID.test(id) ? id : null;
 }
 
 export function createSupabaseConsentGateway(env: EnvSource): ConsentGateway {
@@ -293,22 +333,13 @@ export function createSupabaseConsentGateway(env: EnvSource): ConsentGateway {
       return { error: result.error };
     },
     async revokeGrant(sessionToken, clientId) {
-      if (!supabaseUrl || !publishableKey) return { error: "unconfigured" };
-      try {
-        const response = await fetch(
-          oauthGrantRevokeUrl(supabaseUrl, clientId),
-          {
-            method: "DELETE",
-            headers: {
-              authorization: `Bearer ${sessionToken}`,
-              apikey: publishableKey,
-            },
-          },
-        );
-        return response.ok ? { ok: true } : { error: "rejected" };
-      } catch {
-        return { error: "unavailable" };
-      }
+      const result = await revokeSupabaseOauthGrant(
+        supabaseUrl,
+        publishableKey,
+        sessionToken,
+        clientId,
+      );
+      return result === "gone" ? { ok: true } : { error: "rejected" };
     },
     async decide(authorizationId, sessionToken, decision) {
       const result = await callAuthorization(
