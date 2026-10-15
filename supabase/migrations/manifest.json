@@ -1,0 +1,29 @@
+{
+  "contractVersion": "2026-10-15",
+  "lockKey": 748310015,
+  "migrations": [
+    {
+      "version": "20261015120000",
+      "name": "tenant_security",
+      "sha256": "6c2b8d5fd737be6ae8e692544fde72ddc74c22d1392c1751982840a55e269eff"
+    },
+    {
+      "version": "20261015121000",
+      "name": "restrict_delegated_access",
+      "sha256": "1dac10609dd055ef2dacad846e6431a7d2ef67125d28761f9a0c484489fa14e7"
+    },
+    {
+      "version": "20261015122000",
+      "name": "review_access_fixes",
+      "sha256": "4a038b61668e97332c1983d950f6464ff9b4af06bbb589539fd6e3c171346355"
+    }
+  ],
+  "relations": [
+    "app.access_audit",
+    "app.business_creation_keys",
+    "app.businesses",
+    "app.client_grants",
+    "app.oauth_consents",
+    "app.setup_report"
+  ]
+}

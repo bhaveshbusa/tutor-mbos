@@ -1,0 +1,23 @@
+name: Migrate development
+
+# Manual recovery only. A push to main runs the same migration inside
+# Deploy development, after the name-only preflight and before promotion.
+# This entry shares the development-delivery concurrency group so the two
+# cannot overlap. queue: max keeps a pending delivery instead of cancelling
+# it when this recovery is dispatched. Pull requests do not run it, and it
+# cannot target production.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: development-delivery
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  migrate:
+    name: Apply migrations to tutor-mbos-dev
+    uses: ./.github/workflows/apply-development-migrations.yml

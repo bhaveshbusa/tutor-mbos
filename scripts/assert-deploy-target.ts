@@ -45,6 +45,32 @@ function isDeploymentEnvironment(
   return Object.hasOwn(ENVIRONMENT_BINDINGS, value);
 }
 
+const DEVELOPMENT_RUNTIME_LOCATION =
+  "Vercel project tutor-mbos-dev → Settings → Environment Variables → Production";
+
+/**
+ * Names required before development migrations or promotion. Values are not
+ * read. A Secret-type value pulled as `[SENSITIVE]` still counts as present.
+ * Absence fails the development preflight before hosted SQL and promotion.
+ */
+export function developmentSetupGaps(
+  pulledEnv: Record<string, string | undefined>,
+): string[] {
+  const gaps: string[] = [];
+  const absent = (name: string) => !pulledEnv[name]?.trim();
+  if (absent("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY")) {
+    gaps.push(
+      `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY is absent. Set it at ${DEVELOPMENT_RUNTIME_LOCATION}.`,
+    );
+  }
+  if (absent("TUTOR_MBOS_APP_DATABASE_URL")) {
+    gaps.push(
+      `TUTOR_MBOS_APP_DATABASE_URL is absent. Set it at ${DEVELOPMENT_RUNTIME_LOCATION}. The username must be app_runtime. It is not the migration URL.`,
+    );
+  }
+  return gaps;
+}
+
 export function checkDeployTarget(
   expected: string,
   linked: LinkedProject[],
@@ -94,6 +120,9 @@ function main(argv: string[]): number {
     ? parseDotenv(readFileSync(envFile, "utf8"))
     : {};
   const errors = checkDeployTarget(expected, linked, pulled);
+  if (expected === "development") {
+    errors.push(...developmentSetupGaps(pulled));
+  }
   if (errors.length === 0) {
     console.log(`Deployment target verified for ${expected}.`);
     return 0;

@@ -2,7 +2,7 @@
 
 This document covers TOS-2: repository layout, checks, environment configuration and the development/production delivery workflows. All commands run in cloud agent workspaces or GitHub Actions. Nothing here requires the owner's machine.
 
-**Authentication is not implemented.** `/api/v1/health` is the only working API route. `/api/mcp` fails closed with `503` for every request. TOS-3 delivers Supabase-managed authentication, tenant schema and RLS.
+`/api/v1/health` stays public. Business, report and MCP routes require the access contract in `docs/contracts/access-v1.md`. Without Supabase Auth configuration those routes fail closed. MCP no longer answers anonymously.
 
 ## Layout
 
@@ -47,7 +47,8 @@ Set these on each **Vercel project** under *Settings → Environment Variables*,
 | --- | --- | --- | --- |
 | `TUTOR_MBOS_ENV` | `development` | `production` | Required |
 | `NEXT_PUBLIC_SUPABASE_URL` | `https://idvzjqrkgnihvxoswuxu.supabase.co` | `https://vblwjqfpcmegbugmufif.supabase.co` | Required; must match `TUTOR_MBOS_ENV` |
-| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | `sb_publishable_<dev placeholder>` | `sb_publishable_<prod placeholder>` | Optional until TOS-3; publishable key from Supabase *Project Settings → API Keys* |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | `sb_publishable_<dev placeholder>` | `sb_publishable_<prod placeholder>` | Publishable key from Supabase *Project Settings → API Keys*. Required for sign-in and token checks. |
+| `TUTOR_MBOS_APP_DATABASE_URL` | `postgresql://app_runtime.<dev ref>:<password>@<pooler>:6543/postgres` | set only at a signed-off release | Server-only. Username must be `app_runtime` for that project. Not a service-role or migration URL. |
 
 Rules enforced by `src/server/config/environments.ts` and the deployment workflows:
 
@@ -80,7 +81,7 @@ Agent workspaces, pull request workflows and the repository never hold these val
 The Vercel projects and Supabase projects already exist. Do not recreate them.
 
 1. **Vercel token.** Create a token scoped to team `lets-play-game` (`team_2QehRm248FPmHJTzKS0rvS6b`) at Vercel → Account Settings → Tokens. Prefer separate tokens for the `development` and `production` GitHub environments so either can be revoked alone. Vercel tokens are team-scoped, not project-scoped; the workflows pin the project IDs and verify the linked project before deploying.
-2. **GitHub environment `development`.** Create it at GitHub → Settings → Environments. Restrict deployment branches to `main`. Add secret `VERCEL_TOKEN`.
+2. **GitHub environment `development`.** Create it at GitHub → Settings → Environments. Restrict deployment branches to `main`. Add secrets `VERCEL_TOKEN`, `SUPABASE_MIGRATION_DATABASE_URL` and `APP_RUNTIME_PASSWORD`.
 3. **GitHub environment `production`.** Create it. Restrict deployment branches to `main`. Add required reviewers (the owner) and enable *Prevent self-review*. Add secret `VERCEL_TOKEN`. Do not add `PRODUCTION_RELEASES_ENABLED` until final sign-off.
 4. **Vercel runtime variables.** Add the variables in the table above to each project's Production environment.
 5. **Vercel project settings.** For both projects: Framework Preset *Next.js*, Node.js version *24.x*. A Git connection is optional; `vercel.json` disables Git-triggered deployments so only the workflows deploy.
@@ -89,18 +90,21 @@ The Vercel projects and Supabase projects already exist. Do not recreate them.
 
 ## Development deployment
 
-`.github/workflows/deploy-development.yml` runs on every push to `main` and on manual dispatch from `main`:
+`.github/workflows/deploy-development.yml` runs on every push to `main` and on manual dispatch from `main`. It does not run on pull requests. The sequence is serialized with the manual migration recovery workflow by the concurrency group `development-delivery`, with `cancel-in-progress: false` and `queue: max`. A recovery dispatch does not cancel a delivery that is already queued.
 
 1. Reusable CI (all checks above).
-2. `vercel pull` for project `prj_ysIJHdIKYk2MQwvOKermUvIMuGVa`.
-3. `scripts/assert-deploy-target.ts development`: linked team/project and pulled runtime variables must match the development binding.
-4. `vercel build --prod` in CI (no `VERCEL_TOKEN`), then a secret scan of `.vercel/output`.
-5. `vercel deploy --prebuilt --prod --skip-domain` to `tutor-mbos-dev`. This creates the deployment without moving traffic. Development uses that project's main target because the project only ever holds synthetic data.
-6. `scripts/smoke-health.ts` against that deployment URL: `/api/v1/health` must return `200`, `environment: development`, the development Supabase project ref and the deployed commit.
-7. `vercel promote` only after the smoke test passes.
-8. If `SMOKE_ALIAS_URL` is set, the promoted alias is smoke tested again.
+2. Name-only preflight on project `prj_ysIJHdIKYk2MQwvOKermUvIMuGVa`: require `VERCEL_TOKEN`, `vercel pull`, then `scripts/assert-deploy-target.ts development`. The linked team and project must match the development binding, and `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` and `TUTOR_MBOS_APP_DATABASE_URL` must be present by name. A Secret-type value is pulled as `[SENSITIVE]`, so this step does not read the database username. If the token or either name is absent, the workflow stops before migrations, build, deploy and promotion and names the setup location.
+3. Development migrations through `.github/workflows/apply-development-migrations.yml`: ledger drift check, privilege check, then pending SQL. This uses `SUPABASE_MIGRATION_DATABASE_URL` and `APP_RUNTIME_PASSWORD` from GitHub → Settings → Environments → `development` → Secrets. If either secret is absent, the workflow stops here and does not promote.
+4. `vercel pull` again, then the same target check, so the build uses the reviewed project settings.
+5. `vercel build --prod` in CI (no `VERCEL_TOKEN`), then a secret scan of `.vercel/output`.
+6. `vercel deploy --prebuilt --prod --skip-domain` to `tutor-mbos-dev`. This creates the deployment without moving traffic. Development uses that project's main target because the project only ever holds synthetic data.
+7. `scripts/smoke-health.ts` against that deployment URL: `/api/v1/health` must return `200`, `environment: development`, the development Supabase project ref and the deployed commit.
+8. `vercel promote` only after the smoke test passes.
+9. If `SMOKE_ALIAS_URL` is set, the promoted alias is smoke tested again.
 
-To trigger manually: GitHub → Actions → *Deploy development* → *Run workflow* on `main`.
+*Migrate development* (`.github/workflows/migrate-development.yml`) remains a manual recovery entry for the same migration job. It uses the same concurrency group and queue, so it waits for an in-progress development delivery instead of overlapping it, and it does not cancel a delivery that is already pending. Routine pushes do not need that dispatch. Recovery does not run the Vercel preflight; it applies reviewed SQL only.
+
+To rerun the whole sequence: GitHub → Actions → *Deploy development* → *Run workflow* on `main`.
 
 ## Production release
 

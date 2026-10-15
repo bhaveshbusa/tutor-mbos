@@ -17,21 +17,28 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "hygiene": "node scripts/check-repo-hygiene.ts",
+    "migrate:development": "tsx scripts/apply-migrations.ts",
     "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm hygiene && pnpm build"
   },
   "dependencies": {
+    "@supabase/ssr": "0.12.7",
+    "@supabase/supabase-js": "2.117.3",
     "next": "16.3.8",
+    "pg": "8.23.1",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "zod": "4.6.5"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "0.5.10",
     "@types/node": "24.19.2",
+    "@types/pg": "8.23.1",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "eslint": "9.39.4",
     "eslint-config-next": "16.3.8",
     "prettier": "3.9.9",
+    "tsx": "4.23.15",
     "typescript": "5.9.3",
     "vitest": "4.1.11",
     "yaml": "2.9.0"

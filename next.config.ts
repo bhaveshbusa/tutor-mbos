@@ -23,6 +23,18 @@ const nextConfig: NextConfig = {
   async headers() {
     return [{ source: "/:path*", headers: securityHeaders }];
   },
+  async rewrites() {
+    return [
+      {
+        source: "/.well-known/oauth-protected-resource",
+        destination: "/api/oauth/protected-resource",
+      },
+      {
+        source: "/.well-known/oauth-protected-resource/api/mcp",
+        destination: "/api/oauth/protected-resource",
+      },
+    ];
+  },
 };
 
 export default nextConfig;
