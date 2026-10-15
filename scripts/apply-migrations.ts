@@ -10,6 +10,14 @@ import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import * as access from "../src/server/config/access.ts";
 import {
+  assertLedgerMatches,
+  formatRuntimePrivilegeEvidence,
+  formatSchemaLedgerLine,
+  provisionAppRuntime,
+  readSchemaLedger,
+  safeRuntimeFailure,
+} from "../src/server/application/app-runtime-role.ts";
+import {
   applyMigrations,
   assertTenantPrivileges,
   loadMigrationFiles,
@@ -97,6 +105,7 @@ async function main(): Promise<void> {
   const files = loadMigrationFiles("supabase/migrations", manifest);
   const db = pgConnection(databaseUrl);
 
+  let runtimeFailure: string | undefined;
   try {
     const applied = await applyMigrations(db, files, manifest.lockKey);
     await assertTenantPrivileges(db);
@@ -105,30 +114,22 @@ async function main(): Promise<void> {
         ? "Migrations already applied."
         : `Applied ${applied.join(", ")}.`,
     );
-    await db.exec(`
-    do $$
-    begin
-      if not exists (select 1 from pg_roles where rolname = 'app_runtime') then
-        create role app_runtime login nosuperuser nobypassrls noinherit;
-      else
-        alter role app_runtime login nosuperuser nobypassrls noinherit;
-      end if;
-    end
-    $$;
-  `);
-    await db.query("grant app_request to app_runtime");
-    const quoted = await db.query<{ statement: string }>(
-      "select format('alter role app_runtime password %L', $1) as statement",
-      [appPassword],
-    );
-    const statement = quoted.rows[0]?.statement;
-    if (!statement?.startsWith("alter role app_runtime password ")) {
-      throw new Error("Could not set the app runtime password.");
+    const ledger = await readSchemaLedger(db);
+    for (const entry of ledger) console.log(formatSchemaLedgerLine(entry));
+    try {
+      assertLedgerMatches(ledger, manifest.migrations);
+      const evidence = await provisionAppRuntime(db, appPassword);
+      console.log(formatRuntimePrivilegeEvidence(evidence));
+      console.log("app_runtime is ready for user-scoped requests.");
+    } catch (error) {
+      runtimeFailure = safeRuntimeFailure(error, appPassword);
     }
-    await db.exec(statement);
-    console.log("app_runtime is ready for user-scoped requests.");
   } finally {
     await db.close();
+  }
+  if (runtimeFailure) {
+    console.error(runtimeFailure);
+    process.exit(1);
   }
 }
 

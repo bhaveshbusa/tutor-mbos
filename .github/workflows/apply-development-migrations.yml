@@ -53,6 +53,9 @@ jobs:
             echo "::error::Development migrations stop before SQL until each absent secret above is present."
             exit 1
           fi
+      # Prints each schema ledger version, name, and sha256, then app_runtime
+      # flags, membership options, and privilege checks. It does not print
+      # passwords, verifiers, or connection values.
       - name: Apply versioned migrations and privilege checks
         env:
           SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
