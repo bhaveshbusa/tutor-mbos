@@ -23,7 +23,7 @@ The UI session has all three permissions because it is the account owner. There 
 
 ## Tenancy
 
-One business per owner. Creation is idempotent: a later call returns the existing business and does not rename it or attach the account to a business id from the request. Similar names are distinct rows. Row level security, forced even for the table owner, ties every row to `auth.uid()`. Delegated reads also require a live grant. The `app` schema is not exposed to the Data API (`supabase/config.toml` publishes only `public`). Hosted project settings must be checked separately, because they do not read `config.toml`. `anon` and the `authenticated` API role have no privileges on `app`. A JWT whose role claim is not `authenticated` sees no rows. Requests use `app_request` only.
+One business per owner. Creation is idempotent: a later call returns the existing business and does not rename it or attach the account to a business id from the request. Similar names are distinct rows. Row level security, forced even for the table owner, ties every row to `app.auth_uid()`, a security-definer read of `auth.uid()` owned by the migration login. `app_request` is not granted schema `auth`. Delegated reads also require a live grant. The `app` schema is not exposed to the Data API (`supabase/config.toml` publishes only `public`). Hosted project settings must be checked separately, because they do not read `config.toml`. `anon` and the `authenticated` API role have no privileges on `app`. A JWT whose role claim is not `authenticated` sees no rows. Requests use `app_request` only.
 
 ## Clients
 

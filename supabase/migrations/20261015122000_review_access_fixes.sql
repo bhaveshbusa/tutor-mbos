@@ -1,9 +1,7 @@
 -- Corrective migration. Denial revokes the previous grant. Approval stores
 -- the client's registered redirect so reconnection can match it. The
 -- authenticated API role loses direct access to schema app. The request
--- path remains app_request. This file does not change grants on schema
--- auth: authenticated keeps auth.uid() and auth.jwt() for platform RLS,
--- and app_request already receives those grants in 20261015120000.
+-- path remains app_request. This file does not grant on schema auth.
 -- Not applied to a hosted database. Revised in place before any apply.
 
 alter table app.client_grants
@@ -27,7 +25,7 @@ as $$
 declare
   recent integer;
 begin
-  if auth.uid() is null or (auth.jwt() ->> 'client_id') is not null then
+  if app.auth_uid() is null or (app.auth_jwt() ->> 'client_id') is not null then
     raise exception 'permission_denied' using errcode = '42501';
   end if;
   if p_decision not in ('approved', 'denied') then
@@ -42,7 +40,7 @@ begin
   select count(*)
   into recent
   from app.oauth_consents c
-  where c.owner_user_id = auth.uid()
+  where c.owner_user_id = app.auth_uid()
     and c.decided_at > now() - interval '1 hour';
   if recent >= 20 then
     raise exception 'rate_limited' using errcode = 'P0001';
@@ -57,7 +55,7 @@ begin
     permissions
   )
   values (
-    auth.uid(),
+    app.auth_uid(),
     p_oauth_client_id,
     p_authorization_id,
     p_decision,
@@ -74,8 +72,8 @@ begin
       registered_redirect_uri
     )
     values (
-      auth.uid(),
-      (select b.id from app.businesses b where b.owner_user_id = auth.uid()),
+      app.auth_uid(),
+      (select b.id from app.businesses b where b.owner_user_id = app.auth_uid()),
       p_oauth_client_id,
       p_permissions,
       p_redirect_uri
@@ -90,7 +88,7 @@ begin
     update app.client_grants
     set revoked_at = now(),
         permissions = array[]::text[]
-    where owner_user_id = auth.uid()
+    where owner_user_id = app.auth_uid()
       and oauth_client_id = p_oauth_client_id
       and revoked_at is null;
   end if;

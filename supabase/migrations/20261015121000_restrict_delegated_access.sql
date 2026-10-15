@@ -10,32 +10,32 @@ revoke all on all functions in schema app from public, anon;
 create policy businesses_authenticated_role on app.businesses
   as restrictive for all
   to app_request, authenticated
-  using ((auth.jwt() ->> 'role') = 'authenticated')
-  with check ((auth.jwt() ->> 'role') = 'authenticated');
+  using ((app.auth_jwt() ->> 'role') = 'authenticated')
+  with check ((app.auth_jwt() ->> 'role') = 'authenticated');
 
 create policy grants_authenticated_role on app.client_grants
   as restrictive for all
   to app_request, authenticated
-  using ((auth.jwt() ->> 'role') = 'authenticated')
-  with check ((auth.jwt() ->> 'role') = 'authenticated');
+  using ((app.auth_jwt() ->> 'role') = 'authenticated')
+  with check ((app.auth_jwt() ->> 'role') = 'authenticated');
 
 create policy consents_authenticated_role on app.oauth_consents
   as restrictive for all
   to app_request, authenticated
-  using ((auth.jwt() ->> 'role') = 'authenticated')
-  with check ((auth.jwt() ->> 'role') = 'authenticated');
+  using ((app.auth_jwt() ->> 'role') = 'authenticated')
+  with check ((app.auth_jwt() ->> 'role') = 'authenticated');
 
 create policy creation_keys_authenticated_role on app.business_creation_keys
   as restrictive for all
   to app_request, authenticated
-  using ((auth.jwt() ->> 'role') = 'authenticated')
-  with check ((auth.jwt() ->> 'role') = 'authenticated');
+  using ((app.auth_jwt() ->> 'role') = 'authenticated')
+  with check ((app.auth_jwt() ->> 'role') = 'authenticated');
 
 create policy audit_authenticated_role on app.access_audit
   as restrictive for all
   to app_request, authenticated
-  using ((auth.jwt() ->> 'role') = 'authenticated')
-  with check ((auth.jwt() ->> 'role') = 'authenticated');
+  using ((app.auth_jwt() ->> 'role') = 'authenticated')
+  with check ((app.auth_jwt() ->> 'role') = 'authenticated');
 
 create view app.setup_report
 with (security_invoker = true) as

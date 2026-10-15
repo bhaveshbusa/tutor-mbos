@@ -58,10 +58,72 @@ create table if not exists supabase_migrations.schema_migrations (
 );
 `;
 
+interface RecordedMigration {
+  version: string;
+  statements: unknown;
+  name: string | null;
+}
+
+function recordedSql(statements: unknown, version: string): string {
+  if (
+    !Array.isArray(statements) ||
+    statements.length === 0 ||
+    statements.some((statement) => typeof statement !== "string")
+  ) {
+    throw new Error(`recorded migration ${version} has no statements`);
+  }
+  return (statements as string[]).join("");
+}
+
+/**
+ * The recorded ledger must be a prefix of the reviewed files. Unknown
+ * versions, skipped earlier versions and statement text that no longer
+ * matches the file are rejected before any pending migration runs.
+ */
+export function pendingMigrations(
+  files: readonly LoadedMigration[],
+  recorded: readonly RecordedMigration[],
+): LoadedMigration[] {
+  const byVersion = new Map(recorded.map((row) => [row.version, row]));
+  const expected = new Set(files.map((file) => file.version));
+  for (const version of byVersion.keys()) {
+    if (!expected.has(version)) {
+      throw new Error(
+        `recorded migration ${version} is not in the reviewed set`,
+      );
+    }
+  }
+  let prefix = 0;
+  while (prefix < files.length && byVersion.has(files[prefix]!.version)) {
+    prefix += 1;
+  }
+  for (let index = prefix; index < files.length; index += 1) {
+    if (byVersion.has(files[index]!.version)) {
+      throw new Error(
+        `recorded migration history is missing ${files[prefix]!.version}`,
+      );
+    }
+  }
+  for (let index = 0; index < prefix; index += 1) {
+    const file = files[index]!;
+    const row = byVersion.get(file.version)!;
+    if (
+      row.name !== file.name ||
+      hashSql(recordedSql(row.statements, file.version)) !== file.sha256
+    ) {
+      throw new Error(
+        `recorded migration ${file.version} does not match the reviewed file`,
+      );
+    }
+  }
+  return files.slice(prefix);
+}
+
 /**
  * Applies pending migrations in manifest order, each in its own transaction,
- * while holding a session advisory lock. A failed migration rolls back and
- * leaves earlier versions in place.
+ * while holding a session advisory lock. Recorded history is checked before
+ * any pending file runs. A failed migration rolls back and leaves earlier
+ * versions in place.
  */
 export async function applyMigrations(
   db: SqlConnection,
@@ -72,12 +134,12 @@ export async function applyMigrations(
   const applied: string[] = [];
   try {
     await db.exec(LEDGER);
-    const existing = await db.query<{ version: string }>(
-      "select version from supabase_migrations.schema_migrations",
+    const existing = await db.query<RecordedMigration>(
+      `select version, statements, name
+       from supabase_migrations.schema_migrations`,
     );
-    const have = new Set(existing.rows.map((row) => row.version));
-    for (const file of files) {
-      if (have.has(file.version)) continue;
+    const pending = pendingMigrations(files, existing.rows);
+    for (const file of pending) {
       await db.transaction(async (tx) => {
         await tx.exec(file.sql);
         await tx.query(
@@ -103,8 +165,9 @@ class RolledBackPrivilegeProbe extends Error {
 
 /**
  * Hosted development apply checks these privileges after the migration set.
- * authenticated must not use schema app. app_request must still execute
- * auth.uid(), which stays granted by Supabase Auth rather than this app.
+ * authenticated must not use schema app. app_request must execute
+ * app.auth_uid(), which reads auth.uid() as the migration login that owns
+ * the function. app_request is not granted schema auth.
  *
  * A hosted `postgres` login can administer `app_request` without being allowed
  * to `SET ROLE` to it (Postgres 16+ records that membership with set_option
@@ -131,12 +194,12 @@ export async function assertTenantPrivileges(db: SqlConnection): Promise<void> {
         "do $$ begin execute format('grant app_request to %I with set true, inherit false', current_user); end $$",
       );
       await tx.exec("set local role app_request");
-      await tx.query("select auth.uid()");
+      await tx.query("select app.auth_uid()");
       throw new RolledBackPrivilegeProbe();
     });
   } catch (error) {
     if (error instanceof RolledBackPrivilegeProbe) return;
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`app_request cannot execute auth.uid(): ${message}`);
+    throw new Error(`app_request cannot execute app.auth_uid(): ${message}`);
   }
 }

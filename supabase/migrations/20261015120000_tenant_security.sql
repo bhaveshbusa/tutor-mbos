@@ -6,6 +6,13 @@ begin
   if to_regprocedure('auth.uid()') is null or to_regprocedure('auth.jwt()') is null then
     raise exception 'auth.uid() and auth.jwt() are required (Supabase Auth)';
   end if;
+  begin
+    perform auth.uid();
+    perform auth.jwt();
+  exception
+    when insufficient_privilege then
+      raise exception 'migration login cannot execute auth.uid() or auth.jwt()';
+  end;
 end $$;
 
 do $$
@@ -21,13 +28,37 @@ begin
   end if;
 end $$;
 
-grant usage on schema auth to app_request, authenticated;
-grant execute on function auth.uid() to app_request, authenticated;
-grant execute on function auth.jwt() to app_request, authenticated;
-
 create schema if not exists app;
 revoke all on schema app from public, anon;
 grant usage on schema app to app_request, authenticated;
+
+-- The migration login can already execute the platform identity functions.
+-- These security-definer wrappers keep that ability with the login that
+-- applied the migration. app_request is not granted schema auth.
+create function app.auth_uid()
+returns uuid
+language sql
+stable
+security definer
+set search_path = auth, pg_catalog
+as $$
+  select auth.uid()
+$$;
+
+create function app.auth_jwt()
+returns jsonb
+language sql
+stable
+security definer
+set search_path = auth, pg_catalog
+as $$
+  select auth.jwt()
+$$;
+
+revoke all on function app.auth_uid() from public, anon, authenticated;
+revoke all on function app.auth_jwt() from public, anon, authenticated;
+grant execute on function app.auth_uid() to app_request;
+grant execute on function app.auth_jwt() to app_request;
 
 create or replace function app.permissions_allowed(perms text[])
 returns boolean
@@ -126,19 +157,19 @@ create trigger businesses_owner_immutable
 create policy businesses_owner on app.businesses
   as permissive for all
   to app_request, authenticated
-  using (owner_user_id = auth.uid())
-  with check (owner_user_id = auth.uid());
+  using (owner_user_id = app.auth_uid())
+  with check (owner_user_id = app.auth_uid());
 
 create policy businesses_delegated_select on app.businesses
   as restrictive for select
   to app_request, authenticated
   using (
-    (auth.jwt() ->> 'client_id') is null
+    (app.auth_jwt() ->> 'client_id') is null
     or exists (
       select 1
       from app.client_grants g
-      where g.owner_user_id = auth.uid()
-        and g.oauth_client_id = (auth.jwt() ->> 'client_id')
+      where g.owner_user_id = app.auth_uid()
+        and g.oauth_client_id = (app.auth_jwt() ->> 'client_id')
         and g.revoked_at is null
         and (
           g.business_id is null
@@ -152,12 +183,12 @@ create policy businesses_delegated_insert on app.businesses
   as restrictive for insert
   to app_request, authenticated
   with check (
-    (auth.jwt() ->> 'client_id') is null
+    (app.auth_jwt() ->> 'client_id') is null
     or exists (
       select 1
       from app.client_grants g
-      where g.owner_user_id = auth.uid()
-        and g.oauth_client_id = (auth.jwt() ->> 'client_id')
+      where g.owner_user_id = app.auth_uid()
+        and g.oauth_client_id = (app.auth_jwt() ->> 'client_id')
         and g.revoked_at is null
         and 'business.onboard' = any (g.permissions)
     )
@@ -166,71 +197,71 @@ create policy businesses_delegated_insert on app.businesses
 create policy businesses_owner_update on app.businesses
   as restrictive for update
   to app_request, authenticated
-  using ((auth.jwt() ->> 'client_id') is null)
+  using ((app.auth_jwt() ->> 'client_id') is null)
   with check (
-    (auth.jwt() ->> 'client_id') is null
-    and owner_user_id = auth.uid()
+    (app.auth_jwt() ->> 'client_id') is null
+    and owner_user_id = app.auth_uid()
   );
 
 create policy businesses_owner_delete on app.businesses
   as restrictive for delete
   to app_request, authenticated
-  using ((auth.jwt() ->> 'client_id') is null);
+  using ((app.auth_jwt() ->> 'client_id') is null);
 
 create policy grants_select on app.client_grants
   as permissive for select
   to app_request, authenticated
-  using (owner_user_id = auth.uid());
+  using (owner_user_id = app.auth_uid());
 
 create policy grants_write on app.client_grants
   as permissive for insert
   to app_request, authenticated
   with check (
-    owner_user_id = auth.uid()
-    and (auth.jwt() ->> 'client_id') is null
+    owner_user_id = app.auth_uid()
+    and (app.auth_jwt() ->> 'client_id') is null
   );
 
 create policy grants_update on app.client_grants
   as permissive for update
   to app_request, authenticated
   using (
-    owner_user_id = auth.uid()
-    and (auth.jwt() ->> 'client_id') is null
+    owner_user_id = app.auth_uid()
+    and (app.auth_jwt() ->> 'client_id') is null
   )
   with check (
-    owner_user_id = auth.uid()
-    and (auth.jwt() ->> 'client_id') is null
+    owner_user_id = app.auth_uid()
+    and (app.auth_jwt() ->> 'client_id') is null
   );
 
 create policy consents_owner on app.oauth_consents
   as permissive for all
   to app_request, authenticated
   using (
-    owner_user_id = auth.uid()
-    and (auth.jwt() ->> 'client_id') is null
+    owner_user_id = app.auth_uid()
+    and (app.auth_jwt() ->> 'client_id') is null
   )
   with check (
-    owner_user_id = auth.uid()
-    and (auth.jwt() ->> 'client_id') is null
+    owner_user_id = app.auth_uid()
+    and (app.auth_jwt() ->> 'client_id') is null
   );
 
 create policy creation_keys_owner on app.business_creation_keys
   as permissive for all
   to app_request, authenticated
-  using (owner_user_id = auth.uid())
-  with check (owner_user_id = auth.uid());
+  using (owner_user_id = app.auth_uid())
+  with check (owner_user_id = app.auth_uid());
 
 create policy audit_insert on app.access_audit
   as permissive for insert
   to app_request, authenticated
-  with check (actor_user_id = auth.uid());
+  with check (actor_user_id = app.auth_uid());
 
 create policy audit_select on app.access_audit
   as permissive for select
   to app_request, authenticated
   using (
-    actor_user_id = auth.uid()
-    and (auth.jwt() ->> 'client_id') is null
+    actor_user_id = app.auth_uid()
+    and (app.auth_jwt() ->> 'client_id') is null
   );
 
 create or replace function app.create_business(
@@ -264,15 +295,15 @@ begin
     or char_length(p_idempotency_key) > 200 then
     raise exception 'invalid_idempotency_key' using errcode = 'P0001';
   end if;
-  if auth.uid() is null then
+  if app.auth_uid() is null then
     raise exception 'unauthenticated' using errcode = '42501';
   end if;
-  if (auth.jwt() ->> 'client_id') is not null
+  if (app.auth_jwt() ->> 'client_id') is not null
     and not exists (
       select 1
       from app.client_grants g
-      where g.owner_user_id = auth.uid()
-        and g.oauth_client_id = (auth.jwt() ->> 'client_id')
+      where g.owner_user_id = app.auth_uid()
+        and g.oauth_client_id = (app.auth_jwt() ->> 'client_id')
         and g.revoked_at is null
         and 'business.onboard' = any (g.permissions)
     ) then
@@ -282,7 +313,7 @@ begin
   select k.business_id
   into existing_id
   from app.business_creation_keys k
-  where k.owner_user_id = auth.uid()
+  where k.owner_user_id = app.auth_uid()
     and k.idempotency_key = p_idempotency_key;
   if existing_id is not null then
     return query
@@ -295,29 +326,29 @@ begin
   select b.id, b.display_name, b.owner_user_id
   into existing_id, existing_name, existing_owner
   from app.businesses b
-  where b.owner_user_id = auth.uid();
+  where b.owner_user_id = app.auth_uid();
   if existing_id is not null then
     insert into app.business_creation_keys (owner_user_id, idempotency_key, business_id)
-    values (auth.uid(), p_idempotency_key, existing_id)
+    values (app.auth_uid(), p_idempotency_key, existing_id)
     on conflict do nothing;
     return query select existing_id, existing_name, existing_owner, false;
     return;
   end if;
 
   insert into app.businesses (owner_user_id, display_name)
-  values (auth.uid(), btrim(p_display_name))
+  values (app.auth_uid(), btrim(p_display_name))
   returning * into new_row;
 
   insert into app.business_creation_keys (owner_user_id, idempotency_key, business_id)
-  values (auth.uid(), p_idempotency_key, new_row.id);
+  values (app.auth_uid(), p_idempotency_key, new_row.id);
 
   insert into app.access_audit (
     actor_user_id, business_id, oauth_client_id, action, outcome, detail
   )
   values (
-    auth.uid(),
+    app.auth_uid(),
     new_row.id,
-    auth.jwt() ->> 'client_id',
+    app.auth_jwt() ->> 'client_id',
     'create_business',
     'created',
     '{}'::jsonb
@@ -330,7 +361,7 @@ exception
     select b.id, b.display_name, b.owner_user_id
     into existing_id, existing_name, existing_owner
     from app.businesses b
-    where b.owner_user_id = auth.uid();
+    where b.owner_user_id = app.auth_uid();
     if existing_id is null then
       raise;
     end if;
@@ -353,7 +384,7 @@ as $$
 declare
   recent integer;
 begin
-  if auth.uid() is null or (auth.jwt() ->> 'client_id') is not null then
+  if app.auth_uid() is null or (app.auth_jwt() ->> 'client_id') is not null then
     raise exception 'permission_denied' using errcode = '42501';
   end if;
   if p_decision not in ('approved', 'denied') then
@@ -368,7 +399,7 @@ begin
   select count(*)
   into recent
   from app.oauth_consents c
-  where c.owner_user_id = auth.uid()
+  where c.owner_user_id = app.auth_uid()
     and c.decided_at > now() - interval '1 hour';
   if recent >= 20 then
     raise exception 'rate_limited' using errcode = 'P0001';
@@ -383,7 +414,7 @@ begin
     permissions
   )
   values (
-    auth.uid(),
+    app.auth_uid(),
     p_oauth_client_id,
     p_authorization_id,
     p_decision,
@@ -399,8 +430,8 @@ begin
       permissions
     )
     values (
-      auth.uid(),
-      (select b.id from app.businesses b where b.owner_user_id = auth.uid()),
+      app.auth_uid(),
+      (select b.id from app.businesses b where b.owner_user_id = app.auth_uid()),
       p_oauth_client_id,
       p_permissions
     )
@@ -422,12 +453,12 @@ as $$
 declare
   updated integer;
 begin
-  if auth.uid() is null or (auth.jwt() ->> 'client_id') is not null then
+  if app.auth_uid() is null or (app.auth_jwt() ->> 'client_id') is not null then
     raise exception 'permission_denied' using errcode = '42501';
   end if;
   update app.client_grants
   set revoked_at = now()
-  where owner_user_id = auth.uid()
+  where owner_user_id = app.auth_uid()
     and oauth_client_id = p_oauth_client_id
     and revoked_at is null;
   get diagnostics updated = row_count;
@@ -435,7 +466,7 @@ begin
     actor_user_id, oauth_client_id, action, outcome, detail
   )
   values (
-    auth.uid(),
+    app.auth_uid(),
     p_oauth_client_id,
     'revoke_grant',
     case when updated > 0 then 'revoked' else 'absent' end,

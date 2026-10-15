@@ -5,6 +5,7 @@ import {
   assertTenantPrivileges,
   hashSql,
   loadMigrationFiles,
+  pendingMigrations,
 } from "@/server/application/migration-runner";
 import { ACCESS_CONTRACT_VERSION } from "@/server/domain/access-contract";
 import { emptyDatabase, migrationManifest } from "./helpers/database";
@@ -29,6 +30,9 @@ describe("versioned migrations", () => {
       "20261015122000",
     ]);
     expect(files[0]?.sql).not.toContain("setup_report");
+    expect(files[0]?.sql).not.toMatch(
+      /grant\s+(usage\s+on\s+schema\s+auth|execute\s+on\s+function\s+auth\.)/i,
+    );
     expect(files[1]?.sql).toContain("setup_report");
     expect(() =>
       loadMigrationFiles("supabase/migrations", {
@@ -79,9 +83,11 @@ describe("versioned migrations", () => {
     ).rejects.toThrow(/permission denied/);
     await connection.exec("reset role");
     await assertTenantPrivileges(connection);
-    await connection.exec("revoke usage on schema auth from app_request");
+    await connection.exec(
+      "revoke execute on function app.auth_uid() from app_request",
+    );
     await expect(assertTenantPrivileges(connection)).rejects.toThrow(
-      /cannot execute auth.uid/,
+      /cannot execute app\.auth_uid/,
     );
   });
 
@@ -194,6 +200,158 @@ describe("versioned migrations", () => {
       businesses: "app.businesses",
       missing: null,
     });
+  });
+
+  it("rejects drifted history before pending SQL runs", async () => {
+    const { connection } = await emptyDatabase();
+    const manifest = migrationManifest();
+    const files = loadMigrationFiles("supabase/migrations", manifest);
+    const first = files[0]!;
+    await applyMigrations(connection, [first], manifest.lockKey);
+    await connection.query(
+      `update supabase_migrations.schema_migrations
+       set statements = array['select 1']::text[]
+       where version = $1`,
+      [first.version],
+    );
+    await expect(
+      applyMigrations(connection, files, manifest.lockKey),
+    ).rejects.toThrow(/does not match the reviewed file/);
+    expect(await versions(connection)).toEqual([first.version]);
+    const pendingReport = await connection.query(
+      "select to_regclass('app.setup_report') as report",
+    );
+    expect(pendingReport.rows[0]).toMatchObject({ report: null });
+
+    await connection.query(
+      `update supabase_migrations.schema_migrations
+       set statements = $2::text[], name = $3
+       where version = $1`,
+      [first.version, [first.sql], first.name],
+    );
+    await connection.query(
+      `insert into supabase_migrations.schema_migrations
+         (version, statements, name)
+       values ('20990101000000', array['select 1']::text[], 'unknown')`,
+    );
+    await expect(
+      applyMigrations(connection, files, manifest.lockKey),
+    ).rejects.toThrow(/not in the reviewed set/);
+    expect(await versions(connection).then((rows) => rows.sort())).toEqual(
+      ["20990101000000", first.version].sort(),
+    );
+    await connection.query(
+      `delete from supabase_migrations.schema_migrations
+       where version = '20990101000000'`,
+    );
+
+    await applyMigrations(connection, files.slice(0, 2), manifest.lockKey);
+    await connection.query(
+      `delete from supabase_migrations.schema_migrations where version = $1`,
+      [first.version],
+    );
+    await expect(
+      applyMigrations(connection, files, manifest.lockKey),
+    ).rejects.toThrow(new RegExp(`missing ${first.version}`));
+    expect(await versions(connection)).toEqual([files[1]!.version]);
+    const usage = await connection.query<{ app_usage: boolean }>(
+      `select has_schema_privilege('authenticated', 'app', 'USAGE') as app_usage`,
+    );
+    expect(usage.rows[0]?.app_usage).toBe(true);
+    expect(pendingMigrations(files, [])).toEqual(files);
+  });
+
+  it("applies as a login that cannot grant on schema auth", async () => {
+    const { connection } = await emptyDatabase();
+    await connection.exec(`
+      drop schema auth cascade;
+      create role auth_owner nologin nosuperuser nocreaterole;
+      create schema auth authorization auth_owner;
+      revoke all on schema auth from public;
+    `);
+    await connection.exec("set session authorization auth_owner");
+    await connection.exec(`
+      create function auth.uid()
+      returns uuid language sql stable as $$
+        select coalesce(
+          nullif(current_setting('request.jwt.claim.sub', true), ''),
+          (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub')
+        )::uuid
+      $$;
+      create function auth.jwt()
+      returns jsonb language sql stable as $$
+        select nullif(current_setting('request.jwt.claims', true), '')::jsonb
+      $$;
+      revoke all on function auth.uid() from public;
+      revoke all on function auth.jwt() from public;
+    `);
+    await connection.exec("set session authorization postgres");
+    await connection.exec(`
+      create role migration_login nologin nosuperuser createrole;
+      grant create on database postgres to migration_login;
+      grant usage on schema auth to migration_login;
+      grant execute on function auth.uid() to migration_login;
+      grant execute on function auth.jwt() to migration_login;
+    `);
+    const grantOption = await connection.query<{ allowed: boolean }>(
+      `select has_schema_privilege(
+         'migration_login', 'auth', 'USAGE WITH GRANT OPTION'
+       ) as allowed`,
+    );
+    expect(grantOption.rows[0]?.allowed).toBe(false);
+    await connection.exec("set session authorization migration_login");
+    const manifest = migrationManifest();
+    await applyMigrations(
+      connection,
+      loadMigrationFiles("supabase/migrations", manifest),
+      manifest.lockKey,
+    );
+    await connection.exec("set session authorization postgres");
+    const privileges = await connection.query<{
+      request_auth: boolean;
+      request_execute: boolean;
+    }>(`
+      select
+        has_schema_privilege('app_request', 'auth', 'USAGE') as request_auth,
+        has_function_privilege('app_request', 'auth.uid()', 'EXECUTE') as request_execute
+    `);
+    expect(privileges.rows[0]).toEqual({
+      request_auth: false,
+      request_execute: false,
+    });
+    await expect(
+      connection.transaction(async (tx) => {
+        await tx.exec("set local role app_request");
+        await tx.query("select auth.uid()");
+      }),
+    ).rejects.toThrow(/permission denied/);
+    await assertTenantPrivileges(connection);
+
+    const asOwner = (owner: string, name: string) =>
+      connection.transaction(async (tx) => {
+        await tx.query("select set_config('request.jwt.claims', $1, true)", [
+          JSON.stringify({ sub: owner, role: "authenticated" }),
+        ]);
+        await tx.query("select set_config('request.jwt.claim.sub', $1, true)", [
+          owner,
+        ]);
+        await tx.exec("set local role app_request");
+        await tx.query("select * from app.create_business($1, $2)", [
+          name,
+          `key-${owner}`,
+        ]);
+        return tx.query<{ display_name: string }>(
+          "select display_name from app.businesses",
+        );
+      });
+    const ownerA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
+    const ownerB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2";
+    expect((await asOwner(ownerA, "North")).rows).toEqual([
+      { display_name: "North" },
+    ]);
+    expect((await asOwner(ownerB, "South")).rows).toEqual([
+      { display_name: "South" },
+    ]);
   });
 
   it("does not ship the test auth shim as a hosted migration", () => {

@@ -5,17 +5,17 @@
     {
       "version": "20261015120000",
       "name": "tenant_security",
-      "sha256": "e88826439fb5d7bbd4dbe46f73eaeac79385965adc1edc365da05cdb7f26ecc9"
+      "sha256": "6c2b8d5fd737be6ae8e692544fde72ddc74c22d1392c1751982840a55e269eff"
     },
     {
       "version": "20261015121000",
       "name": "restrict_delegated_access",
-      "sha256": "2e0cdd612c61b2f7f57ae8a386830fd550e92629998f1884b18327c05a038bba"
+      "sha256": "1dac10609dd055ef2dacad846e6431a7d2ef67125d28761f9a0c484489fa14e7"
     },
     {
       "version": "20261015122000",
       "name": "review_access_fixes",
-      "sha256": "30270cce751a22fd4929968d6edcc4131086cac7fdb568c2f4d0138803678ea3"
+      "sha256": "4a038b61668e97332c1983d950f6464ff9b4af06bbb589539fd6e3c171346355"
     }
   ],
   "relations": [
