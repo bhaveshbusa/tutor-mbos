@@ -1,10 +1,14 @@
 /**
  * Applies the reviewed migration set to the development database.
- * Refuses a production URL and the app_runtime role. Does not print URLs
- * or passwords.
+ * Refuses a production URL and the app_runtime role. A missing URL is
+ * reported on its own. A present URL is inspected once, and a rejection
+ * prints only an allowlisted reason code plus setup guidance. The log
+ * never includes the URL, host, username, password, length, hash, parser
+ * error, or environment values.
  */
 import { readFileSync } from "node:fs";
-import { inspectMigrationDatabaseUrl } from "../src/server/config/access.ts";
+import { pathToFileURL } from "node:url";
+import * as access from "../src/server/config/access.ts";
 import {
   applyMigrations,
   assertTenantPrivileges,
@@ -13,35 +17,95 @@ import {
 } from "../src/server/application/migration-runner.ts";
 import { pgConnection } from "../src/server/application/pg-connection.ts";
 
-const databaseUrl = process.env.SUPABASE_MIGRATION_DATABASE_URL;
-const appPassword = process.env.APP_RUNTIME_PASSWORD;
+export const MIGRATION_URL_REJECTION_CODES = [
+  "invalid",
+  "binding_mismatch",
+  "app_runtime",
+  "privileged_user",
+  "transaction_pooler",
+] as const;
 
-if (!databaseUrl || !inspectMigrationDatabaseUrl(databaseUrl).ok) {
-  console.error(
-    "SUPABASE_MIGRATION_DATABASE_URL must be the development migration login. See docs/release.md.",
-  );
-  process.exit(1);
+export type MigrationUrlRejectionCode =
+  (typeof MIGRATION_URL_REJECTION_CODES)[number];
+
+const MISSING_MIGRATION_URL =
+  "SUPABASE_MIGRATION_DATABASE_URL is required and was not set. Set it in GitHub → Settings → Environments → development → Secrets. See docs/release.md.";
+
+const UNCLASSIFIED_MIGRATION_URL =
+  "SUPABASE_MIGRATION_DATABASE_URL was rejected before connection. See docs/release.md.";
+
+const MIGRATION_URL_GUIDANCE: Record<MigrationUrlRejectionCode, string> = {
+  invalid:
+    "The value must be a postgres URL for the development migration login. Use a direct connection or session pooler on port 5432, with username postgres or supabase_admin, on the development project only. See docs/release.md.",
+  binding_mismatch:
+    "The URL must identify the development project only, not the production project. Use a direct connection or session pooler on port 5432, with username postgres or supabase_admin. See docs/release.md.",
+  app_runtime:
+    "The migration login cannot be the request role. Use postgres or supabase_admin on the development project, on a direct connection or session pooler on port 5432. The request role belongs in TUTOR_MBOS_APP_DATABASE_URL. See docs/release.md.",
+  privileged_user:
+    "The migration login must be postgres or supabase_admin on the development project. Use a direct connection or session pooler on port 5432. See docs/release.md.",
+  transaction_pooler:
+    "Port 6543 is the transaction pooler and cannot hold the session migration lock. Use a direct connection or session pooler on port 5432, with username postgres or supabase_admin, on the development project only. See docs/release.md.",
+};
+
+function isRejectionCode(code: string): code is MigrationUrlRejectionCode {
+  return (MIGRATION_URL_REJECTION_CODES as readonly string[]).includes(code);
 }
-if (!appPassword) {
-  console.error("APP_RUNTIME_PASSWORD is required and was not set.");
-  process.exit(1);
+
+export function migrationUrlRejectionMessage(code: string): string {
+  if (!isRejectionCode(code)) return UNCLASSIFIED_MIGRATION_URL;
+  return `SUPABASE_MIGRATION_DATABASE_URL was rejected before connection: ${code}. ${MIGRATION_URL_GUIDANCE[code]}`;
 }
 
-const manifest = JSON.parse(
-  readFileSync("supabase/migrations/manifest.json", "utf8"),
-) as MigrationManifest;
-const files = loadMigrationFiles("supabase/migrations", manifest);
-const db = pgConnection(databaseUrl);
+/**
+ * Checks the migration URL before any connection. A missing value does not
+ * call the inspector. A present value is inspected exactly once.
+ */
+export function migrationConnectionDiagnostic(
+  databaseUrl: string | undefined,
+): { ok: true; databaseUrl: string } | { ok: false; message: string } {
+  if (!databaseUrl) {
+    return { ok: false, message: MISSING_MIGRATION_URL };
+  }
+  const inspection = access.inspectMigrationDatabaseUrl(databaseUrl);
+  if (!inspection.ok) {
+    return {
+      ok: false,
+      message: migrationUrlRejectionMessage(inspection.code),
+    };
+  }
+  return { ok: true, databaseUrl };
+}
 
-try {
-  const applied = await applyMigrations(db, files, manifest.lockKey);
-  await assertTenantPrivileges(db);
-  console.log(
-    applied.length === 0
-      ? "Migrations already applied."
-      : `Applied ${applied.join(", ")}.`,
+async function main(): Promise<void> {
+  const diagnostic = migrationConnectionDiagnostic(
+    process.env.SUPABASE_MIGRATION_DATABASE_URL,
   );
-  await db.exec(`
+  if (!diagnostic.ok) {
+    console.error(diagnostic.message);
+    process.exit(1);
+  }
+  const databaseUrl = diagnostic.databaseUrl;
+  const appPassword = process.env.APP_RUNTIME_PASSWORD;
+  if (!appPassword) {
+    console.error("APP_RUNTIME_PASSWORD is required and was not set.");
+    process.exit(1);
+  }
+
+  const manifest = JSON.parse(
+    readFileSync("supabase/migrations/manifest.json", "utf8"),
+  ) as MigrationManifest;
+  const files = loadMigrationFiles("supabase/migrations", manifest);
+  const db = pgConnection(databaseUrl);
+
+  try {
+    const applied = await applyMigrations(db, files, manifest.lockKey);
+    await assertTenantPrivileges(db);
+    console.log(
+      applied.length === 0
+        ? "Migrations already applied."
+        : `Applied ${applied.join(", ")}.`,
+    );
+    await db.exec(`
     do $$
     begin
       if not exists (select 1 from pg_roles where rolname = 'app_runtime') then
@@ -52,17 +116,25 @@ try {
     end
     $$;
   `);
-  await db.query("grant app_request to app_runtime");
-  const quoted = await db.query<{ statement: string }>(
-    "select format('alter role app_runtime password %L', $1) as statement",
-    [appPassword],
-  );
-  const statement = quoted.rows[0]?.statement;
-  if (!statement?.startsWith("alter role app_runtime password ")) {
-    throw new Error("Could not set the app runtime password.");
+    await db.query("grant app_request to app_runtime");
+    const quoted = await db.query<{ statement: string }>(
+      "select format('alter role app_runtime password %L', $1) as statement",
+      [appPassword],
+    );
+    const statement = quoted.rows[0]?.statement;
+    if (!statement?.startsWith("alter role app_runtime password ")) {
+      throw new Error("Could not set the app runtime password.");
+    }
+    await db.exec(statement);
+    console.log("app_runtime is ready for user-scoped requests.");
+  } finally {
+    await db.close();
   }
-  await db.exec(statement);
-  console.log("app_runtime is ready for user-scoped requests.");
-} finally {
-  await db.close();
+}
+
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
+  await main();
 }

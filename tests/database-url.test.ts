@@ -39,6 +39,16 @@ describe("database connection guards", () => {
     ).toEqual({ ok: true });
     expect(
       inspectMigrationDatabaseUrl(
+        `postgresql://supabase_admin.${devRef}:${password}@db.${devRef}.supabase.co:5432/postgres`,
+      ),
+    ).toEqual({ ok: true });
+    expect(
+      inspectMigrationDatabaseUrl(
+        `postgresql://postgres.${devRef}:${password}@aws-0-eu-west-2.pooler.supabase.com:5432/postgres`,
+      ),
+    ).toEqual({ ok: true });
+    expect(
+      inspectMigrationDatabaseUrl(
         `postgresql://postgres.${prodRef}:${password}@db.${prodRef}.supabase.co:5432/postgres`,
       ),
     ).toMatchObject({ ok: false, code: "binding_mismatch" });
@@ -47,6 +57,15 @@ describe("database connection guards", () => {
         `postgresql://app_runtime.${devRef}:${password}@db.${devRef}.supabase.co:5432/postgres`,
       ),
     ).toMatchObject({ ok: false, code: "app_runtime" });
+    expect(
+      inspectMigrationDatabaseUrl(
+        `postgresql://service_role.${devRef}:${password}@db.${devRef}.supabase.co:5432/postgres`,
+      ),
+    ).toMatchObject({ ok: false, code: "privileged_user" });
+    expect(inspectMigrationDatabaseUrl("not-a-postgres-url")).toMatchObject({
+      ok: false,
+      code: "invalid",
+    });
     expect(
       inspectMigrationDatabaseUrl(
         `postgresql://postgres.${devRef}:${password}@aws-0-eu-west-2.pooler.supabase.com:6543/postgres`,
