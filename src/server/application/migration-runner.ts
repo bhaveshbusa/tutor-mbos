@@ -113,8 +113,8 @@ class RolledBackPrivilegeProbe extends Error {
  * the membership.
  *
  * The grant target is a quoted identifier from `format('%I', current_user)`.
- * Using the current_user or session_user keyword as the GRANT role
- * specification crashes the backend on supabase/postgres 17.6.1.011
+ * Using the current_user, current_role, or session_user keyword as the GRANT
+ * role specification crashes the backend on supabase/postgres 17.6.1.011
  * (supautils 2.9.4). A named role does not.
  */
 export async function assertTenantPrivileges(db: SqlConnection): Promise<void> {

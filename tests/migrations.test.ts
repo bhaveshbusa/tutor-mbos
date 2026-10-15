@@ -130,7 +130,9 @@ describe("versioned migrations", () => {
     expect(source).toContain(
       "format('grant app_request to %I with set true, inherit false', current_user)",
     );
-    expect(source).not.toMatch(/\bto\s+(current_user|session_user)\b/i);
+    expect(source).not.toMatch(
+      /\bto\s+(current_user|current_role|session_user)\b/i,
+    );
   });
 
   it("keeps populated rows when the corrective migration is applied", async () => {
