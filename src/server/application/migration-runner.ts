@@ -111,6 +111,11 @@ class RolledBackPrivilegeProbe extends Error {
  * false). The probe grants `SET` to the current login and switches role in one
  * transaction, then rolls the grant back so the migration login does not keep
  * the membership.
+ *
+ * The grant target is a quoted identifier from `format('%I', current_user)`.
+ * Using the current_user or session_user keyword as the GRANT role
+ * specification crashes the backend on supabase/postgres 17.6.1.011
+ * (supautils 2.9.4). A named role does not.
  */
 export async function assertTenantPrivileges(db: SqlConnection): Promise<void> {
   const result = await db.query<{ app_usage: boolean }>(
@@ -123,7 +128,7 @@ export async function assertTenantPrivileges(db: SqlConnection): Promise<void> {
   try {
     await db.transaction(async (tx) => {
       await tx.exec(
-        "grant app_request to current_user with set true, inherit false",
+        "do $$ begin execute format('grant app_request to %I with set true, inherit false', current_user); end $$",
       );
       await tx.exec("set local role app_request");
       await tx.query("select auth.uid()");

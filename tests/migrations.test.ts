@@ -122,6 +122,17 @@ describe("versioned migrations", () => {
     ]);
   });
 
+  it("quotes the migration login instead of granting to a role keyword", () => {
+    const source = readFileSync(
+      "src/server/application/migration-runner.ts",
+      "utf8",
+    );
+    expect(source).toContain(
+      "format('grant app_request to %I with set true, inherit false', current_user)",
+    );
+    expect(source).not.toMatch(/\bto\s+(current_user|session_user)\b/i);
+  });
+
   it("keeps populated rows when the corrective migration is applied", async () => {
     const { connection } = await emptyDatabase();
     const manifest = migrationManifest();
