@@ -10,6 +10,7 @@ import {
   APP_DATABASE_URL_SECRET,
   MANAGEMENT_TOKEN_SECRET,
   PUBLISHABLE_KEY_NAME,
+  acceptanceCase,
   acceptanceTally,
   classifyAuthSettings,
   classifyExposedSchemas,
@@ -455,7 +456,9 @@ function input(
     fetchImpl,
     randomBytes: (size: number) => Buffer.alloc(size, 7),
     runId: "4242",
+    runAttempt: "1",
     runNonce: "07".repeat(16),
+    startedAt: "2026-10-15T20:00:00.000Z",
     probeDatabase: async () => ({
       runtimeReadDenied: true,
       ownVisible: true,
@@ -622,42 +625,123 @@ describe("hosted acceptance harness", () => {
       "SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY is absent. Expected secret scope: GitHub environment development",
     );
     const parsed = parse(text) as {
-      jobs: {
-        accept: {
+      concurrency?: { group?: string };
+      jobs: Record<
+        string,
+        {
+          needs?: string | string[];
+          if?: string;
+          timeout?: number;
+          "timeout-minutes"?: number;
+          environment?: string;
           steps: {
             name?: string;
             run?: string;
             if?: string;
+            uses?: string;
+            with?: Record<string, string>;
             env?: Record<string, string>;
+            "timeout-minutes"?: number;
+            "continue-on-error"?: boolean;
           }[];
-        };
-      };
+          env?: Record<string, string>;
+        }
+      >;
     };
-    const steps = parsed.jobs.accept.steps;
-    const preflight = steps.findIndex((step) =>
-      step.run?.includes("SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY"),
+    expect(Object.keys(parsed.jobs)).toEqual([
+      "preflight",
+      "accept",
+      "cleanup",
+    ]);
+    expect(parsed.concurrency?.group).toBe("development-delivery");
+    expect(text).not.toContain("GITHUB_ENV");
+    const preflight = parsed.jobs.preflight!;
+    const accept = parsed.jobs.accept!;
+    const cleanup = parsed.jobs.cleanup!;
+    expect(preflight.environment).toBe("development");
+    expect(accept.environment).toBe("development");
+    expect(cleanup.environment).toBe("development");
+    expect(accept.needs).toBe("preflight");
+    expect(cleanup.needs).toEqual(["preflight", "accept"]);
+    expect(cleanup.if).toContain("always()");
+    expect(cleanup.if).toContain("needs.preflight.result == 'success'");
+    expect(preflight["timeout-minutes"]).toBe(5);
+    expect(accept["timeout-minutes"]).toBe(15);
+    expect(cleanup["timeout-minutes"]).toBe(5);
+    for (const job of [preflight, accept, cleanup]) {
+      const checkout = job.steps.find((step) =>
+        step.uses?.startsWith("actions/checkout@"),
+      );
+      expect(checkout?.with?.ref).toBe("${{ github.sha }}");
+      expect(checkout?.with?.["persist-credentials"]).toBe(false);
+      const setup = job.steps.find(
+        (step) => step.uses === "./.github/actions/setup",
+      );
+      expect(setup?.with?.["pnpm-cache"]).toBe("false");
+    }
+    expect(preflight.steps.some((step) => step.run?.includes("vercel"))).toBe(
+      true,
     );
-    const pull = steps.findIndex((step) => step.run?.includes("vercel"));
-    const accept = steps.find((step) => step.run === "pnpm accept:development");
-    const cleanup = steps.find((step) =>
-      step.run?.includes("accept:development:cleanup"),
+    expect(accept.steps.some((step) => step.run?.includes("vercel"))).toBe(
+      false,
     );
-    expect(preflight).toBeGreaterThan(-1);
-    expect(pull).toBeGreaterThan(preflight);
-    expect(accept?.env).not.toHaveProperty(
+    expect(cleanup.steps.some((step) => step.run?.includes("vercel"))).toBe(
+      false,
+    );
+    const acceptRun = accept.steps.find(
+      (step) => step.run === "pnpm accept:development",
+    );
+    expect(acceptRun?.["timeout-minutes"]).toBe(12);
+    expect(acceptRun?.env).toEqual({
+      VERCEL_AUTOMATION_BYPASS_SECRET:
+        "${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}",
+      TUTOR_MBOS_APP_DATABASE_URL: "${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}",
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:
+        "${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}",
+    });
+    expect(accept.env?.ACCEPTANCE_RUN_NONCE).toBe(
+      "${{ needs.preflight.outputs.nonce }}",
+    );
+    expect(JSON.stringify(accept)).not.toContain(
       "SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY",
     );
-    expect(cleanup?.if).toBe("always()");
-    expect(cleanup?.env).toHaveProperty("SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY");
-    expect(cleanup?.env).not.toHaveProperty("TUTOR_MBOS_APP_DATABASE_URL");
-    expect(cleanup?.env).not.toHaveProperty(
+    expect(JSON.stringify(accept)).not.toContain(
       "SUPABASE_DEVELOPMENT_ACCESS_TOKEN",
     );
+    expect(JSON.stringify(accept)).not.toContain("VERCEL_TOKEN");
+    const upload = accept.steps.find((step) =>
+      step.uses?.startsWith("actions/upload-artifact@"),
+    );
+    expect(upload?.if).toBe("always()");
+    expect(upload?.["timeout-minutes"]).toBe(1);
+    expect(upload?.with?.["retention-days"]).toBe(1);
+    const cleanupRun = cleanup.steps.find((step) =>
+      step.run?.includes("accept:development:cleanup"),
+    );
+    expect(cleanupRun?.env).toEqual({
+      SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY:
+        "${{ secrets.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY }}",
+    });
+    expect(cleanup.env?.ACCEPTANCE_RUN_NONCE).toBe(
+      "${{ needs.preflight.outputs.nonce }}",
+    );
+    expect(JSON.stringify(cleanup)).not.toContain(
+      "TUTOR_MBOS_APP_DATABASE_URL",
+    );
+    expect(JSON.stringify(cleanup)).not.toContain(
+      "SUPABASE_DEVELOPMENT_ACCESS_TOKEN",
+    );
+    expect(JSON.stringify(cleanup)).not.toContain("VERCEL_TOKEN");
+    const download = cleanup.steps.find((step) =>
+      step.uses?.startsWith("actions/download-artifact@"),
+    );
+    expect(download?.["continue-on-error"]).toBe(true);
     const script = readFileSync("scripts/hosted-acceptance.ts", "utf8");
     expect(script).not.toContain("/auth/v1/admin");
     expect(script).not.toContain("auth.users");
     expect(script).not.toContain("SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY");
     expect(script).not.toContain("registration_client_uri");
+    expect(script).not.toContain(".vercel/.env.production.local");
     expect(script).not.toMatch(/method:\s*"PATCH"/);
     expect(script).not.toMatch(/method:\s*"DELETE"/);
   });
@@ -727,6 +811,119 @@ describe("hosted acceptance harness", () => {
       report.results.find((row) => row.id === "data_api.anon_businesses")
         ?.status,
     ).toBe("fail");
+  });
+
+  it("uses preflight cases and does not call the Management API", async () => {
+    const doubled = developmentDouble();
+    const report = await runHostedAcceptance(
+      input(doubled.fetchImpl, {
+        managementToken: null,
+        preflightCases: [
+          "auth.oauth_server_enabled",
+          "auth.dynamic_registration",
+          "auth.authorization_path",
+          "auth.site_url",
+          "auth.redirect_allow_list",
+          "auth.secure_password_change",
+          "auth.exposed_schemas",
+        ].map((id) => acceptanceCase(id, "pass", "preflight")),
+      }),
+    );
+    expect(report.results.filter((row) => row.status === "fail")).toEqual([]);
+    expect(doubled.urls.some((url) => url.includes("api.supabase.com"))).toBe(
+      false,
+    );
+  });
+
+  it("probes both synthetic tenants", async () => {
+    const doubled = developmentDouble();
+    const seen: string[] = [];
+    await runHostedAcceptance(
+      input(doubled.fetchImpl, {
+        probeDatabase: async (_url, probe) => {
+          seen.push(probe.userId);
+          return {
+            runtimeReadDenied: true,
+            ownVisible: true,
+            otherVisible: false,
+            deleted: true,
+            aborted: false,
+            abortReason: null,
+          };
+        },
+      }),
+    );
+    expect(new Set(seen).size).toBe(2);
+  });
+
+  it("records orphan rows when a tenant probe aborts", async () => {
+    const doubled = developmentDouble();
+    const report = await runHostedAcceptance(
+      input(doubled.fetchImpl, {
+        probeDatabase: async () => ({
+          runtimeReadDenied: true,
+          ownVisible: true,
+          otherVisible: true,
+          deleted: false,
+          aborted: true,
+          abortReason: "visibility",
+        }),
+      }),
+    );
+    expect(
+      report.results.find((row) => row.id === "direct.cleanup")?.detail,
+    ).toBe("aborted_unexpected_visibility");
+    expect(
+      report.results.find((row) => row.id === "direct.orphan_rows")?.status,
+    ).toBe("gap");
+    expect(
+      report.results.find((row) => row.id === "direct.audit_and_grants")
+        ?.status,
+    ).toBe("gap");
+    expect(
+      report.results.find((row) => row.id === "cleanup.hard_kill")?.status,
+    ).toBe("gap");
+  });
+
+  it("records a lost signup response and does not continue to consent", async () => {
+    const doubled = developmentDouble();
+    const fetchImpl: typeof fetch = async (url, init) => {
+      const target = typeof url === "string" ? url : url.toString();
+      if (target.includes("/auth/v1/signup")) {
+        await new Promise((_, reject) => {
+          const signal = init?.signal;
+          const fail = () => {
+            const error = new Error("aborted");
+            error.name = "AbortError";
+            reject(error);
+          };
+          if (!signal) {
+            fail();
+            return;
+          }
+          if (signal.aborted) fail();
+          else signal.addEventListener("abort", fail, { once: true });
+        });
+      }
+      return doubled.fetchImpl(url, init);
+    };
+    const report = await runHostedAcceptance(
+      input(fetchImpl, { requestTimeoutMs: 30 }),
+    );
+    expect(
+      report.results.find((row) => row.id === "signup.tenant_a")?.detail,
+    ).toBe("signup.response_lost");
+    expect(
+      report.results.find((row) => row.id === "signup.response_lost")?.status,
+    ).toBe("gap");
+    expect(
+      doubled.urls.some((url) => url.includes("/api/oauth/decision")),
+    ).toBe(false);
+    expect(
+      report.results.some(
+        (row) => row.id === "generic_client.consent" && row.status === "pass",
+      ),
+    ).toBe(false);
   });
 });
 
@@ -821,10 +1018,17 @@ describe("direct tenant probe", () => {
     expect(probe.ownVisible).toBe(true);
     expect(probe.otherVisible).toBe(false);
     expect(probe.deleted).toBe(true);
+    const probeB = await probeDirectTenantAccess(connection, {
+      userId: userB,
+      ownBusinessId: createdB.business.id,
+      otherBusinessId: createdA.business.id,
+      clientIds: [],
+    });
+    expect(probeB.ownVisible).toBe(true);
+    expect(probeB.otherVisible).toBe(false);
+    expect(probeB.deleted).toBe(true);
     await connection.exec("reset session authorization");
-    expect((await store.readBusiness(actor(userB)))?.id).toBe(
-      createdB.business.id,
-    );
+    expect(await store.readBusiness(actor(userB))).toBeNull();
     expect(await store.readBusiness(actor(userA))).toBeNull();
     await db.close();
   });

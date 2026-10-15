@@ -5,31 +5,34 @@
  * executed from a coding workspace.
  */
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { parseDotenv } from "./assert-deploy-target.ts";
 import { resolveProtectionBypass } from "./smoke-health.ts";
 import {
-  CLEANUP_CLIENT_NAMES,
+  CLEANUP_CLIENT_LABELS,
+  expectedClientName,
   reviewCleanupManifest,
-  type CleanupClientName,
+  writeManifestAtomic,
+  type CleanupClientLabel,
   type CleanupIdentity,
   type CleanupManifest,
 } from "../src/server/application/acceptance-cleanup.ts";
 import {
   APP_DATABASE_URL_SECRET,
   EXPECTED_AUTHORIZATION_PATH,
+  MANAGEMENT_CASE_IDS,
   MANAGEMENT_TOKEN_SECRET,
   PUBLISHABLE_KEY_NAME,
   REAL_CLIENT_GAPS,
   acceptanceCase,
   blockedCases,
   classifyAuthSettings,
-  classifyDirectProbe,
+  classifyDirectProbes,
   classifyExposedSchemas,
   acceptanceTally,
   classifyIssuedAudience,
   dataApiDenied,
+  decodePreflightCases,
   formatAcceptanceReport,
   jwtAudience,
   openApiExposesApp,
@@ -121,7 +124,11 @@ export interface HostedAcceptanceInput {
   fetchImpl?: typeof fetch;
   randomBytes?: (size: number) => Buffer;
   runId: string;
+  runAttempt: string;
   runNonce: string;
+  startedAt: string;
+  preflightCases?: AcceptanceCase[] | null;
+  requestTimeoutMs?: number;
   writeManifest?: (body: string) => void;
   probeDatabase?: (
     url: string,
@@ -131,7 +138,7 @@ export interface HostedAcceptanceInput {
 }
 
 interface RegisteredClient {
-  name: CleanupClientName;
+  label: CleanupClientLabel;
   clientId: string;
   clientSecret: string | null;
 }
@@ -150,6 +157,7 @@ interface Tenant {
   refreshToken: string | null;
   businessId: string | null;
   delegatedToken: string | null;
+  responseLost: boolean;
   jar: Map<string, string>;
 }
 
@@ -253,6 +261,7 @@ export async function runHostedAcceptance(
       refreshToken: null,
       businessId: null,
       delegatedToken: null,
+      responseLost: false,
       jar: new Map<string, string>(),
     }),
   );
@@ -276,16 +285,30 @@ export async function runHostedAcceptance(
     if (onSite && input.bypass) {
       headers.set("x-vercel-protection-bypass", input.bypass);
     }
-    const response = await fetchImpl(url, {
-      ...init,
-      headers,
-      redirect: "manual",
-    });
-    return {
-      status: response.status,
-      headers: response.headers,
-      text: await response.text(),
-    };
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      input.requestTimeoutMs ?? 15_000,
+    );
+    timer.unref?.();
+    try {
+      const response = await fetchImpl(url, {
+        ...init,
+        headers,
+        redirect: "manual",
+        signal: controller.signal,
+      });
+      return {
+        status: response.status,
+        headers: response.headers,
+        text: await response.text(),
+      };
+    } catch (error) {
+      if (controller.signal.aborted) throw new RequestTimeoutError();
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
   };
 
   const json = (reply: Reply): unknown => {
@@ -338,7 +361,9 @@ export async function runHostedAcceptance(
       healthBody.supabaseProjectRef === target.ref &&
       deployedCommit === input.commit;
     const nonceReady = /^[a-f0-9]{32}$/.test(nonce);
-    openingOk = healthPass && nonceReady;
+    const attemptReady = /^[0-9]+$/.test(input.runAttempt);
+    const startedReady = Number.isFinite(Date.parse(input.startedAt));
+    openingOk = healthPass && nonceReady && attemptReady && startedReady;
     results.push(
       acceptanceCase(
         "health",
@@ -347,7 +372,11 @@ export async function runHostedAcceptance(
           ? "development_commit_match"
           : !nonceReady
             ? "run_nonce_absent"
-            : `http_${health.status} commit=${deployedCommit === input.commit ? "match" : "mismatch"}`,
+            : !attemptReady
+              ? "run_attempt_absent"
+              : !startedReady
+                ? "started_at_absent"
+                : `http_${health.status} commit=${deployedCommit === input.commit ? "match" : "mismatch"}`,
       ),
     );
 
@@ -470,6 +499,10 @@ export async function runHostedAcceptance(
   }
 
   async function runManagement(): Promise<void> {
+    if (input.preflightCases) {
+      results.push(...input.preflightCases);
+      return;
+    }
     if (!input.managementToken) {
       results.push(
         ...blockedCases(
@@ -608,14 +641,38 @@ export async function runHostedAcceptance(
     }
 
     for (const tenant of tenants) {
-      const created = await request(`${target.supabaseUrl}/auth/v1/signup`, {
-        method: "POST",
-        headers: authHeaders(),
-        body: JSON.stringify({
-          email: tenant.email,
-          password: tenant.password,
-        }),
-      });
+      let created: Reply;
+      try {
+        created = await request(`${target.supabaseUrl}/auth/v1/signup`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({
+            email: tenant.email,
+            password: tenant.password,
+          }),
+        });
+      } catch (error) {
+        if (!(error instanceof RequestTimeoutError)) throw error;
+        tenant.responseLost = true;
+        publishManifest();
+        results.push(
+          acceptanceCase(
+            `signup.${tenant.label.replace("tenant-", "tenant_")}`,
+            "fail",
+            "signup.response_lost",
+          ),
+        );
+        if (!results.some((row) => row.id === "signup.response_lost")) {
+          results.push(
+            acceptanceCase(
+              "signup.response_lost",
+              "gap",
+              "The signup request ended without a response, so no user id was recorded. Cleanup looks up the exact tos3 address derived from the trusted preflight nonce, deletes only one match inside the run window, and still fails rather than reporting a pass.",
+            ),
+          );
+        }
+        continue;
+      }
       const body = json(created) as {
         access_token?: unknown;
         refresh_token?: unknown;
@@ -648,9 +705,10 @@ export async function runHostedAcceptance(
       );
     }
 
-    if (tenants.some((tenant) => !tenant.accessToken)) {
-      const reason =
-        settings?.mailer_autoconfirm === false
+    if (tenants.some((tenant) => tenant.responseLost || !tenant.accessToken)) {
+      const reason = tenants.some((tenant) => tenant.responseLost)
+        ? "signup.response_lost"
+        : settings?.mailer_autoconfirm === false
           ? "mailer_autoconfirm_false"
           : "signup_session_absent";
       results.push(...blockedCases(SESSION_IDS, reason));
@@ -675,7 +733,7 @@ export async function runHostedAcceptance(
     }
     registration = await register(
       metadata.registration_endpoint as string,
-      "tutor-mbos-generic-acceptance",
+      "acceptance",
     );
     if (!registration) {
       results.push(...blockedCases(GENERIC_IDS, "dynamic_registration"));
@@ -745,7 +803,7 @@ export async function runHostedAcceptance(
     );
     denialRegistration = await register(
       metadata.registration_endpoint as string,
-      "tutor-mbos-generic-denial",
+      "denial",
     );
     const denied = denialRegistration
       ? await consent(
@@ -765,7 +823,7 @@ export async function runHostedAcceptance(
     );
     restrictedRegistration = await register(
       metadata.registration_endpoint as string,
-      "tutor-mbos-generic-restricted",
+      "restricted",
     );
     if (!restrictedRegistration) {
       results.push(...blockedCases(RESTRICTED_IDS, "dynamic_registration"));
@@ -1033,13 +1091,13 @@ export async function runHostedAcceptance(
 
   async function register(
     endpoint: string,
-    name: string,
+    label: CleanupClientLabel,
   ): Promise<RegisteredClient | null> {
     const reply = await request(endpoint, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({
-        client_name: name,
+        client_name: expectedClientName(label, nonce),
         redirect_uris: [GENERIC_REDIRECT],
         grant_types: ["authorization_code", "refresh_token"],
         response_types: ["code"],
@@ -1053,12 +1111,12 @@ export async function runHostedAcceptance(
     if (
       reply.status >= 300 ||
       typeof body?.client_id !== "string" ||
-      !CLEANUP_CLIENT_NAMES.includes(name as CleanupClientName)
+      !CLEANUP_CLIENT_LABELS.includes(label)
     ) {
       return null;
     }
     const client: RegisteredClient = {
-      name: name as CleanupClientName,
+      label,
       clientId: body.client_id,
       clientSecret:
         typeof body.client_secret === "string" ? body.client_secret : null,
@@ -1571,25 +1629,40 @@ export async function runHostedAcceptance(
       results.push(...blockedCases(ids, `app_database_url=${inspected.code}`));
       return;
     }
-    if (!tenantA.userId || !tenantA.businessId || !tenantB.businessId) {
+    if (
+      !tenantA.userId ||
+      !tenantA.businessId ||
+      !tenantB.userId ||
+      !tenantB.businessId
+    ) {
       results.push(...blockedCases(ids, "synthetic_business_absent"));
+      if (tenantA.userId || tenantB.userId) {
+        results.push(orphanRowsGap());
+      }
       return;
     }
     try {
-      const probeInput = {
-        userId: tenantA.userId,
-        ownBusinessId: tenantA.businessId,
-        otherBusinessId: tenantB.businessId,
-        clientIds: registered.map((client) => client.clientId),
-      };
-      const probe = input.probeDatabase
-        ? await input.probeDatabase(input.appDatabaseUrl, probeInput)
-        : await probeWithPg(probeInput);
-      results.push(...classifyDirectProbe(probe));
+      const probes: DirectProbe[] = [];
+      for (const tenant of tenants) {
+        const other = tenant.label === "tenant-a" ? tenantB : tenantA;
+        const probeInput = {
+          userId: tenant.userId ?? "",
+          ownBusinessId: tenant.businessId ?? "",
+          otherBusinessId: other.businessId ?? "",
+          clientIds: registered.map((client) => client.clientId),
+        };
+        probes.push(
+          input.probeDatabase
+            ? await input.probeDatabase(input.appDatabaseUrl, probeInput)
+            : await probeWithPg(probeInput),
+        );
+      }
+      results.push(...classifyDirectProbes(probes));
     } catch (error) {
       results.push(
         ...blockedCases(ids, error instanceof Error ? error.name : "Error"),
       );
+      results.push(orphanRowsGap());
     }
   }
 
@@ -1630,7 +1703,9 @@ export async function runHostedAcceptance(
       projectRef: target.ref,
       commit: input.commit,
       runId: input.runId,
+      runAttempt: input.runAttempt,
       runNonce: nonce,
+      startedAt: input.startedAt,
     };
     const manifest: CleanupManifest = {
       version: 1,
@@ -1638,12 +1713,14 @@ export async function runHostedAcceptance(
       projectRef: target.ref,
       commit: input.commit,
       runId: input.runId,
-      runNonce: nonce,
-      users: tenants.flatMap((tenant) =>
-        tenant.userId ? [{ label: tenant.label, id: tenant.userId }] : [],
-      ),
+      runAttempt: input.runAttempt,
+      users: tenants.flatMap((tenant) => {
+        if (tenant.userId) return [{ label: tenant.label, id: tenant.userId }];
+        if (tenant.responseLost) return [{ label: tenant.label }];
+        return [];
+      }),
       clients: registered.map((client) => ({
-        name: client.name,
+        label: client.label,
         id: client.clientId,
       })),
     };
@@ -1759,7 +1836,32 @@ const EVIDENCE_GAPS: readonly AcceptanceCase[] = [
     "gap",
     "Rendered HTML checks fetch /login, /business, and /oauth/consent. No browser drives those forms. Cookie HTTP API calls are not rendered UI acceptance.",
   ),
+  acceptanceCase(
+    "cleanup.hard_kill",
+    "gap",
+    "If this job is cancelled or killed before the manifest upload, cleanup downloads no artifact. That is not a pass. Cleanup looks up the two emails and three client names derived from the trusted preflight nonce, requires one exact match inside the run window, and deletes only those. Ambiguous matches are left in place and the cleanup result stays fail.",
+  ),
+  acceptanceCase(
+    "direct.audit_and_grants",
+    "gap",
+    "app.client_grants has no DELETE policy, so a scoped update can only set business_id null. app.access_audit has no DELETE policy. Auth user deletion does not remove either table. This workflow will not send unqualified SQL. A reviewed follow-up deletes those rows by primary key as a role this business job does not have.",
+  ),
 ];
+
+function orphanRowsGap(): AcceptanceCase {
+  return acceptanceCase(
+    "direct.orphan_rows",
+    "gap",
+    "Auth user deletion does not cascade into app.businesses, app.business_creation_keys, or app.oauth_consents. Scoped cleanup did not finish, so those rows may remain. This workflow will not send unqualified SQL or an elevated business request. A reviewed follow-up deletes the remaining rows by primary key as a role this business job does not have.",
+  );
+}
+
+class RequestTimeoutError extends Error {
+  constructor() {
+    super("request_timeout");
+    this.name = "RequestTimeoutError";
+  }
+}
 
 function secretName(name: string): string {
   return `secret_absent:${name}`;
@@ -1830,10 +1932,6 @@ async function main(): Promise<number> {
     console.error(`::error::${guard}`);
     return 2;
   }
-  const envFile = ".vercel/.env.production.local";
-  const pulled = existsSync(envFile)
-    ? parseDotenv(readFileSync(envFile, "utf8"))
-    : {};
   const runNonce = process.env.ACCEPTANCE_RUN_NONCE ?? "";
   if (!/^[a-f0-9]{32}$/.test(runNonce)) {
     console.error(
@@ -1846,22 +1944,39 @@ async function main(): Promise<number> {
     console.error("::error::GITHUB_RUN_ID is absent.");
     return 2;
   }
-  const material = resolveAcceptanceMaterial(process.env, pulled);
+  const runAttempt = process.env.GITHUB_RUN_ATTEMPT ?? "";
+  if (!/^[0-9]+$/.test(runAttempt)) {
+    console.error("::error::GITHUB_RUN_ATTEMPT is absent.");
+    return 2;
+  }
+  const startedAt = process.env.ACCEPTANCE_STARTED_AT ?? "";
+  if (!Number.isFinite(Date.parse(startedAt))) {
+    console.error("::error::ACCEPTANCE_STARTED_AT is absent.");
+    return 2;
+  }
+  const material = resolveAcceptanceMaterial(process.env, {});
   mask(material.publishableKey);
-  mask(material.managementToken);
   mask(material.appDatabaseUrl);
   const bypass = await resolveProtectionBypass(process.env);
   mask(bypass.value);
   console.log(`Deployment protection bypass: ${bypass.source}.`);
+  const preflightCases =
+    decodePreflightCases(process.env.ACCEPTANCE_PREFLIGHT_CASES ?? "") ??
+    blockedCases(MANAGEMENT_CASE_IDS, "preflight_cases_absent");
   const report = await runHostedAcceptance({
     commit: process.env.GITHUB_SHA ?? "",
     runId,
+    runAttempt,
     runNonce,
-    ...material,
+    startedAt,
+    publishableKey: material.publishableKey,
+    managementToken: null,
+    appDatabaseUrl: material.appDatabaseUrl,
+    preflightCases,
     bypass: bypass.value ?? null,
     schema: reviewedSchema(),
     writeManifest: (body) => {
-      writeFileSync(MANIFEST_PATH, body);
+      writeManifestAtomic(MANIFEST_PATH, body);
     },
   });
   console.log(formatAcceptanceReport(report));

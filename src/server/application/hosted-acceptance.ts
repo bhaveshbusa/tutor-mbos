@@ -117,6 +117,59 @@ export function acceptanceTally(results: readonly AcceptanceCase[]): {
   return { result, passed, failed, gaps, exitCode: failed > 0 ? 1 : 0 };
 }
 
+export const MANAGEMENT_CASE_IDS = [
+  "auth.oauth_server_enabled",
+  "auth.dynamic_registration",
+  "auth.authorization_path",
+  "auth.site_url",
+  "auth.redirect_allow_list",
+  "auth.secure_password_change",
+  "auth.exposed_schemas",
+] as const;
+
+/** Job-output encoding for preflight cases. The business job does not call the Management API. */
+export function encodePreflightCases(cases: readonly AcceptanceCase[]): string {
+  return Buffer.from(JSON.stringify(cases), "utf8").toString("base64");
+}
+
+export function decodePreflightCases(encoded: string): AcceptanceCase[] | null {
+  try {
+    const parsed = JSON.parse(
+      Buffer.from(encoded, "base64").toString("utf8"),
+    ) as unknown;
+    if (!Array.isArray(parsed)) return null;
+    const cases: AcceptanceCase[] = [];
+    for (const entry of parsed) {
+      if (typeof entry !== "object" || entry === null) return null;
+      const row = entry as Record<string, unknown>;
+      if (
+        typeof row.id !== "string" ||
+        !MANAGEMENT_CASE_IDS.includes(
+          row.id as (typeof MANAGEMENT_CASE_IDS)[number],
+        ) ||
+        (row.status !== "pass" &&
+          row.status !== "fail" &&
+          row.status !== "gap") ||
+        typeof row.detail !== "string"
+      ) {
+        return null;
+      }
+      cases.push({
+        id: row.id,
+        status: row.status,
+        detail: sanitizeDetail(row.detail),
+      });
+    }
+    const ids = new Set(cases.map((row) => row.id));
+    if (ids.size !== cases.length || ids.size !== MANAGEMENT_CASE_IDS.length) {
+      return null;
+    }
+    return cases;
+  } catch {
+    return null;
+  }
+}
+
 export function formatAcceptanceReport(report: AcceptanceReport): string {
   const tally = acceptanceTally(report.results);
   const lines = [
@@ -489,33 +542,66 @@ async function deleteOwnedRows(
 }
 
 export function classifyDirectProbe(probe: DirectProbe): AcceptanceCase[] {
-  return [
+  return classifyDirectProbes([probe]);
+}
+
+/**
+ * Both synthetic tenants. Cleanup passes only when each probe removed
+ * only its own business. An abort leaves app rows in place: Auth user
+ * deletion has no foreign key into app, and this path does not send
+ * unqualified SQL.
+ */
+export function classifyDirectProbes(
+  probes: readonly DirectProbe[],
+): AcceptanceCase[] {
+  const runtime =
+    probes.length > 0 && probes.every((probe) => probe.runtimeReadDenied);
+  const otherVisible = probes.some((probe) => probe.otherVisible);
+  const ownOnly =
+    probes.length > 0 &&
+    probes.every((probe) => probe.ownVisible && !probe.otherVisible);
+  const deleted = probes.length > 0 && probes.every((probe) => probe.deleted);
+  const countAbort = probes.some((probe) => probe.abortReason === "count");
+  const visibilityAbort = probes.some(
+    (probe) => probe.abortReason === "visibility",
+  );
+  const cases = [
     acceptanceCase(
       "direct.runtime_cannot_read",
-      probe.runtimeReadDenied ? "pass" : "fail",
-      probe.runtimeReadDenied ? "permission_denied" : "rows_visible",
+      runtime ? "pass" : "fail",
+      runtime ? "permission_denied" : "rows_visible",
     ),
     acceptanceCase(
       "direct.tenant_isolation",
-      probe.ownVisible && !probe.otherVisible ? "pass" : "fail",
-      probe.otherVisible
+      ownOnly && !otherVisible ? "pass" : "fail",
+      otherVisible
         ? "other_tenant_visible"
-        : probe.ownVisible
+        : ownOnly
           ? "own_tenant_only"
           : "own_tenant_absent",
     ),
     acceptanceCase(
       "direct.cleanup",
-      probe.deleted ? "pass" : "fail",
-      probe.deleted
+      deleted ? "pass" : "fail",
+      deleted
         ? "own_rows_removed"
-        : probe.abortReason === "count"
+        : countAbort
           ? "aborted_row_count"
-          : probe.abortReason === "visibility"
+          : visibilityAbort
             ? "aborted_unexpected_visibility"
             : "own_rows_remain",
     ),
   ];
+  if (probes.some((probe) => probe.aborted || !probe.deleted)) {
+    cases.push(
+      acceptanceCase(
+        "direct.orphan_rows",
+        "gap",
+        "Auth user deletion does not cascade into app.businesses, app.business_creation_keys, or app.oauth_consents. Scoped cleanup aborted, so those rows may remain for one or both synthetic owners. This workflow will not send unqualified SQL or an elevated business request. A reviewed follow-up deletes the remaining rows by primary key as a role this business job does not have.",
+      ),
+    );
+  }
+  return cases;
 }
 
 export function blockedCases(
