@@ -25,6 +25,7 @@ describe("versioned migrations", () => {
     expect(files.map((file) => file.version)).toEqual([
       "20261015120000",
       "20261015121000",
+      "20261015122000",
     ]);
     expect(files[0]?.sql).not.toContain("setup_report");
     expect(files[1]?.sql).toContain("setup_report");
@@ -53,7 +54,11 @@ describe("versioned migrations", () => {
     };
     const first = await applyMigrations(wrapped, files, manifest.lockKey);
     const second = await applyMigrations(wrapped, files, manifest.lockKey);
-    expect(first).toEqual(["20261015120000", "20261015121000"]);
+    expect(first).toEqual([
+      "20261015120000",
+      "20261015121000",
+      "20261015122000",
+    ]);
     expect(second).toEqual([]);
     expect(await versions(connection)).toEqual(first);
     expect(queries.some((query) => query.includes("pg_advisory_lock"))).toBe(
@@ -67,6 +72,11 @@ describe("versioned migrations", () => {
        order by 1`,
     );
     expect(relations.rows.map((row) => row.name)).toEqual(manifest.relations);
+    await connection.exec("set role authenticated");
+    await expect(
+      connection.query("select * from app.businesses"),
+    ).rejects.toThrow(/permission denied/);
+    await connection.exec("reset role");
   });
 
   it("keeps populated rows when the corrective migration is applied", async () => {
@@ -103,6 +113,7 @@ describe("versioned migrations", () => {
     expect(await versions(connection)).toEqual([
       "20261015120000",
       "20261015121000",
+      "20261015122000",
     ]);
   });
 
@@ -111,7 +122,7 @@ describe("versioned migrations", () => {
     const manifest = migrationManifest();
     const files = loadMigrationFiles("supabase/migrations", manifest);
     const broken = {
-      version: "20261015122000",
+      version: "20261015123000",
       name: "broken",
       sha256: hashSql("select * from app.missing_relation"),
       sql: "select * from app.missing_relation;",

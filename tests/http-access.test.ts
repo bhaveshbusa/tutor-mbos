@@ -181,6 +181,9 @@ describe("HTTP API access", () => {
         async decide() {
           return { redirectUrl: "https://api-client.example/callback?code=1" };
         },
+        async revokeGrant() {
+          return { ok: true };
+        },
       },
     );
     expect(consent.status).toBe(303);
@@ -264,6 +267,9 @@ describe("HTTP API access", () => {
         async decide() {
           return { redirectUrl: "https://chatgpt.example/callback?code=1" };
         },
+        async revokeGrant() {
+          return { ok: true };
+        },
       },
     );
     expect(response.headers.get("location")).toBe(
@@ -301,9 +307,178 @@ describe("HTTP API access", () => {
         async decide() {
           return { redirectUrl: "javascript:alert(1)" };
         },
+        async revokeGrant() {
+          return { ok: true };
+        },
       },
     );
     expect(evilRedirect.status).toBe(502);
+  });
+
+  it("revokes a prior grant when consent is denied", async () => {
+    const { handlers, mint, deps } = await world();
+    const owner = await mint(TENANT_A.userId);
+    const gateway = {
+      async details() {
+        return {
+          clientId: API_CLIENT,
+          clientName: "API client",
+          redirectUri: "https://api-client.example/callback",
+          scopes: ["openid"],
+        };
+      },
+      async decide() {
+        return { redirectUrl: "https://api-client.example/callback?code=1" };
+      },
+      async revokeGrant() {
+        return { ok: true as const };
+      },
+    };
+    await handleConsentDecision(
+      ui("https://example.test/api/oauth/decision", owner, {
+        method: "POST",
+        body: new URLSearchParams({
+          authorization_id: "authz-approve",
+          decision: "approve",
+          permissions: "business.read",
+        }),
+      }),
+      deps,
+      gateway,
+    );
+    const token = await mint(TENANT_A.userId, { client_id: API_CLIENT });
+    expect(
+      (
+        await handlers.getBusiness(
+          new Request("https://example.test/api/v1/business", {
+            headers: { authorization: `Bearer ${token}` },
+          }),
+        )
+      ).status,
+    ).toBe(200);
+    const denied = await handleConsentDecision(
+      ui("https://example.test/api/oauth/decision", owner, {
+        method: "POST",
+        body: new URLSearchParams({
+          authorization_id: "authz-deny",
+          decision: "deny",
+        }),
+      }),
+      deps,
+      gateway,
+    );
+    expect(denied.status).toBe(303);
+    expect(
+      (
+        await handlers.getBusiness(
+          new Request("https://example.test/api/v1/business", {
+            headers: { authorization: `Bearer ${token}` },
+          }),
+        )
+      ).status,
+    ).toBe(403);
+  });
+
+  it("reconnects only when one live grant matches the already-consented redirect", async () => {
+    const { mint, deps, store } = await world();
+    const owner = await mint(TENANT_A.userId);
+    await store.recordConsent(
+      { path: "ui-session", userId: TENANT_A.userId, clientId: null },
+      {
+        oauthClientId: API_CLIENT,
+        permissions: ["business.read"],
+        scopes: ["openid"],
+        authorizationId: "earlier",
+        decision: "approved",
+      },
+    );
+    const response = await handleConsentDecision(
+      ui("https://example.test/api/oauth/decision", owner, {
+        method: "POST",
+        body: new URLSearchParams({
+          authorization_id: "authz-again",
+          decision: "approve",
+        }),
+      }),
+      deps,
+      {
+        async details() {
+          return {
+            redirectUrl: `https://api-client.example/callback?code=1&client_id=${API_CLIENT}`,
+          };
+        },
+        async decide() {
+          return { redirectUrl: "https://api-client.example/callback?code=1" };
+        },
+        async revokeGrant() {
+          return { ok: true };
+        },
+      },
+    );
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toContain("client_id=");
+    await store.revokeGrant(
+      { path: "ui-session", userId: TENANT_A.userId, clientId: null },
+      API_CLIENT,
+    );
+    const again = await handleConsentDecision(
+      ui("https://example.test/api/oauth/decision", owner, {
+        method: "POST",
+        body: new URLSearchParams({
+          authorization_id: "authz-revoked",
+          decision: "approve",
+        }),
+      }),
+      deps,
+      {
+        async details() {
+          return {
+            redirectUrl: `https://api-client.example/callback?code=2&client_id=${API_CLIENT}`,
+          };
+        },
+        async decide() {
+          return { redirectUrl: "https://api-client.example/callback?code=2" };
+        },
+        async revokeGrant() {
+          return { ok: true };
+        },
+      },
+    );
+    expect(again.status).toBe(409);
+  });
+
+  it("does not revoke the app grant when the authentication server refuses", async () => {
+    const { handlers, mint, deps } = await world();
+    const owner = await mint(TENANT_A.userId);
+    await deps.store!.recordConsent(
+      { path: "ui-session", userId: TENANT_A.userId, clientId: null },
+      {
+        oauthClientId: API_CLIENT,
+        permissions: ["business.read"],
+        scopes: ["openid"],
+        authorizationId: "keep",
+        decision: "approved",
+      },
+    );
+    deps.revokeAuthGrant = async () => "failed";
+    const revoked = await handlers.revoke(
+      ui("https://example.test/api/v1/grants/revoke", owner, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ clientId: API_CLIENT }),
+      }),
+    );
+    expect(revoked.status).toBe(502);
+    const token = await mint(TENANT_A.userId, { client_id: API_CLIENT });
+    expect(
+      (
+        await handlers.getBusiness(
+          new Request("https://example.test/api/v1/business", {
+            headers: { authorization: `Bearer ${token}` },
+          }),
+        )
+      ).status,
+    ).toBe(200);
   });
 });
 

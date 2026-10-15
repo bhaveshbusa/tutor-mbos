@@ -47,5 +47,10 @@ describe("database connection guards", () => {
         `postgresql://app_runtime.${devRef}:${password}@db.${devRef}.supabase.co:5432/postgres`,
       ),
     ).toMatchObject({ ok: false, code: "app_runtime" });
+    expect(
+      inspectMigrationDatabaseUrl(
+        `postgresql://postgres.${devRef}:${password}@aws-0-eu-west-2.pooler.supabase.com:6543/postgres`,
+      ),
+    ).toMatchObject({ ok: false, code: "transaction_pooler" });
   });
 });

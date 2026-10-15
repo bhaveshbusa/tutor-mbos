@@ -2,14 +2,33 @@ import { describe, expect, it } from "vitest";
 import {
   handleCallback,
   handleLogin,
+  handlePasswordUpdate,
   handleRecovery,
+  handleRecoveryCallback,
 } from "@/adapters/http/browser-auth";
 import {
+  authorizationConsentUrl,
   authorizationDetailsUrl,
+  authorizationRequest,
   safeClientRedirect,
 } from "@/adapters/http/consent";
-import { allowedAppRedirects } from "@/server/config/access";
+import { recoveryRedirect } from "@/server/config/access";
 import { DEV_ORIGIN } from "./helpers/tokens";
+
+const auth = {
+  async signIn() {
+    return "ok" as const;
+  },
+  async recover() {
+    return "ok" as const;
+  },
+  async exchange() {
+    return "ok" as const;
+  },
+  async updatePassword() {
+    return "ok" as const;
+  },
+};
 
 describe("browser authentication", () => {
   it("uses the allowlisted recovery redirect and rejects an open redirect", async () => {
@@ -34,11 +53,14 @@ describe("browser authentication", () => {
         async exchange() {
           return "invalid";
         },
+        async updatePassword() {
+          return "invalid";
+        },
       },
       DEV_ORIGIN,
     );
     expect(response.status).toBe(303);
-    expect(seen).toBe(allowedAppRedirects(DEV_ORIGIN)[0]);
+    expect(seen).toBe(recoveryRedirect(DEV_ORIGIN));
     expect(seen).not.toContain("evil.example");
   });
 
@@ -62,6 +84,9 @@ describe("browser authentication", () => {
         async exchange() {
           return "ok";
         },
+        async updatePassword() {
+          return "ok";
+        },
       },
       DEV_ORIGIN,
     );
@@ -80,10 +105,63 @@ describe("browser authentication", () => {
         async exchange() {
           return "ok";
         },
+        async updatePassword() {
+          return "ok";
+        },
       },
       DEV_ORIGIN,
     );
     expect(callback.headers.get("location")).toBe(`${DEV_ORIGIN}/business`);
+    const recovery = await handleCallback(
+      new Request("https://example.test/auth/callback?code=abc&type=recovery"),
+      auth,
+      DEV_ORIGIN,
+    );
+    expect(recovery.headers.get("location")).toBe(
+      `${DEV_ORIGIN}/auth/update-password`,
+    );
+  });
+
+  it("sends recovery through a password update and posts consent to /consent", async () => {
+    const landed = await handleRecoveryCallback(
+      new Request(`${DEV_ORIGIN}/auth/recovery?code=abc`),
+      auth,
+      DEV_ORIGIN,
+    );
+    expect(landed.headers.get("location")).toBe(
+      `${DEV_ORIGIN}/auth/update-password`,
+    );
+    const updated = await handlePasswordUpdate(
+      new Request(`${DEV_ORIGIN}/api/auth/password`, {
+        method: "POST",
+        headers: { origin: DEV_ORIGIN },
+        body: new URLSearchParams({ password: "new-password" }),
+      }),
+      auth,
+      DEV_ORIGIN,
+    );
+    expect(updated.status).toBe(303);
+    expect(updated.headers.get("location")).toBe(`${DEV_ORIGIN}/business`);
+    const short = await handlePasswordUpdate(
+      new Request(`${DEV_ORIGIN}/api/auth/password`, {
+        method: "POST",
+        headers: { origin: DEV_ORIGIN },
+        body: new URLSearchParams({ password: "short" }),
+      }),
+      auth,
+      DEV_ORIGIN,
+    );
+    expect(short.status).toBe(400);
+    const supabase = "https://idvzjqrkgnihvxoswuxu.supabase.co";
+    expect(authorizationConsentUrl(supabase, "authz/1")).toBe(
+      `${authorizationDetailsUrl(supabase, "authz/1")}/consent`,
+    );
+    expect(authorizationRequest(supabase, "authz/1", "deny")).toEqual({
+      url: authorizationConsentUrl(supabase, "authz/1"),
+      method: "POST",
+      body: { action: "deny" },
+    });
+    expect(authorizationRequest(supabase, "authz/1", null).method).toBe("GET");
   });
 
   it("builds the Supabase consent URL without the admin API and rejects unsafe redirects", () => {

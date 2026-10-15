@@ -13,7 +13,7 @@ Supabase Auth issues sessions and OAuth 2.1 access tokens (authorization code wi
 | UI session | Supabase auth cookie | Asymmetric signature, issuer, audience, expiry, `role=authenticated`, no `client_id`, then Auth `GET /user` confirms the subject |
 | Delegated OAuth | `Authorization: Bearer` | Same signature checks, `client_id` required, then Auth `GET /user`, then the server grant |
 
-A bearer token is never upgraded by a cookie. A token that has `client_id` is never an owner session. Audience must be `authenticated` or this deployment's MCP resource URL, and every audience value must be on that list. Accepted algorithms are ES256 and RS256. HS256 and `none` are rejected. Clock skew is 5 seconds.
+A bearer token is never upgraded by a cookie. A token that has `client_id` is never an owner session. Audience must be `authenticated` or this deployment's MCP resource URL, and every audience value must be on that list. Supabase currently issues OAuth access tokens with audience `authenticated`. Accepting that audience on `/api/mcp` is a known deviation from RFC 8707 resource indicators. Delegated MCP calls still require `client_id` and a live grant. A hosted check must record whether issued tokens include the MCP resource audience; once they do, a later contract version requires that audience for MCP. An unknown signing key id refetches JWKS once, then waits 10 seconds before another miss refetch. Accepted algorithms are ES256 and RS256. HS256 and `none` are rejected. Clock skew is 5 seconds.
 
 ## Permissions
 
@@ -23,7 +23,7 @@ The UI session has all three permissions because it is the account owner. There 
 
 ## Tenancy
 
-One business per owner. Creation is idempotent: a later call returns the existing business and does not rename it or attach the account to a business id from the request. Similar names are distinct rows. Row level security, forced even for the table owner, ties every row to `auth.uid()`. Delegated reads also require a live grant. The `app` schema is not exposed to the Data API (`supabase/config.toml` publishes only `public`). `anon` has no access. A JWT whose role claim is not `authenticated` sees no rows.
+One business per owner. Creation is idempotent: a later call returns the existing business and does not rename it or attach the account to a business id from the request. Similar names are distinct rows. Row level security, forced even for the table owner, ties every row to `auth.uid()`. Delegated reads also require a live grant. The `app` schema is not exposed to the Data API (`supabase/config.toml` publishes only `public`). Hosted project settings must be checked separately, because they do not read `config.toml`. `anon` and the `authenticated` API role have no privileges on `app`. A JWT whose role claim is not `authenticated` sees no rows. Requests use `app_request` only.
 
 ## Clients
 
@@ -38,7 +38,7 @@ Consent is an explicit form. The stored client id comes from Supabase's authoriz
 
 ## Revocation and recovery
 
-Grant revocation is a UI-session action and takes effect on the next request, even if the access token has not expired. Auth-server session revocation fails `GET /user` on the next request. Account recovery uses Supabase email recovery to the allowlisted `/auth/callback` only. This app does not accept a caller-supplied recovery redirect.
+Grant revocation is a UI-session action. It first deletes the Supabase OAuth grant (`DELETE /auth/v1/user/oauth/grants?client_id=`) and then marks `app.client_grants` revoked. If the authentication server refuses, the app grant stays. A later denial of that client also revokes the app grant. Revocation takes effect on the next request, even if the access token has not expired. Auth-server session revocation fails `GET /user` on the next request. Account recovery uses Supabase email recovery to the allowlisted `/auth/recovery` only, then `/auth/update-password` sets the new password. This app does not accept a caller-supplied recovery redirect. A UI session whose access token is inside the refresh window writes the rotated cookies back on the response.
 
 ## Out of scope for this contract version
 

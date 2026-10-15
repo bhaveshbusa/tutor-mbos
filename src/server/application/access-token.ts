@@ -165,6 +165,53 @@ export async function verifyAccessToken(
   };
 }
 
+export const JWKS_MISS_REFETCH_INTERVAL_MS = 10_000;
+
+/**
+ * Verifies a token against the cached JWKS. An unknown key id refetches once,
+ * and further misses wait for the interval so a bad kid cannot stampede JWKS.
+ */
+export async function verifyAccessTokenRefreshingKeys(
+  token: string,
+  options: {
+    loadKeys: (force: boolean) => Promise<readonly JsonWebKey[]>;
+    issuer: string;
+    audiences: readonly string[];
+    now: Date;
+    clockSkewSeconds?: number;
+    state?: { lastMissRefetchAt: number };
+  },
+): Promise<VerifyResult> {
+  const state = options.state ?? { lastMissRefetchAt: 0 };
+  const verifyWith = (keys: readonly JsonWebKey[]) =>
+    verifyAccessToken(token, {
+      jwks: keys,
+      issuer: options.issuer,
+      audiences: options.audiences,
+      now: options.now,
+      clockSkewSeconds: options.clockSkewSeconds,
+    });
+  let result: VerifyResult;
+  try {
+    result = await verifyWith(await options.loadKeys(false));
+  } catch {
+    return { ok: false, code: "jwks_unavailable" };
+  }
+  if (result.ok || result.code !== "unknown_key") return result;
+  if (
+    options.now.getTime() - state.lastMissRefetchAt <
+    JWKS_MISS_REFETCH_INTERVAL_MS
+  ) {
+    return result;
+  }
+  state.lastMissRefetchAt = options.now.getTime();
+  try {
+    return await verifyWith(await options.loadKeys(true));
+  } catch {
+    return { ok: false, code: "jwks_unavailable" };
+  }
+}
+
 function audienceAllowed(aud: unknown, allowed: readonly string[]): boolean {
   const values = Array.isArray(aud) ? aud : [aud];
   if (values.length === 0) return false;

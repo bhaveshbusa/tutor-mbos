@@ -25,6 +25,11 @@ export interface AccessDeps {
   store: AccessStore | null;
   /** First-party session token from the Supabase auth cookie. Not a request claim. */
   sessionToken: (request: Request) => Promise<string | null> | string | null;
+  /** Deletes the Supabase OAuth grant before the app grant is revoked. */
+  revokeAuthGrant?: (
+    sessionToken: string,
+    clientId: string,
+  ) => Promise<"ok" | "failed">;
 }
 
 function bearer(request: Request): string | null {
@@ -164,7 +169,9 @@ function failure(result: { status: number; code: string }): Response {
       ? "Forbidden"
       : result.status === 400
         ? "Bad request"
-        : "Unavailable";
+        : result.status === 502
+          ? "Authorization server error"
+          : "Unavailable";
   return problemResponse(result.status, title, result.code);
 }
 
@@ -251,6 +258,13 @@ export function createAccessHandlers(deps: AccessDeps) {
         deps.store!,
         decision.context,
         clientId,
+        deps.revokeAuthGrant
+          ? async () => {
+              const session = await deps.sessionToken(request);
+              if (!session) return false;
+              return (await deps.revokeAuthGrant!(session, clientId)) === "ok";
+            }
+          : undefined,
       );
       if (!result.ok) return failure(result);
       return jsonResponse(200, {

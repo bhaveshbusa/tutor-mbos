@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { verifyAccessToken } from "@/server/application/access-token";
+import {
+  verifyAccessToken,
+  verifyAccessTokenRefreshingKeys,
+} from "@/server/application/access-token";
 import { acceptedAudiences, resourceUrl } from "@/server/config/access";
 import {
   DEV_ORIGIN,
@@ -120,5 +123,35 @@ describe("delegated and session token verification", () => {
       expect(result, entry.name).toEqual({ ok: false, code: entry.code });
     }
     expect(audiences).toContain(resourceUrl(DEV_ORIGIN));
+  });
+
+  it("refetches JWKS once when the key id is unknown", async () => {
+    const { keys, jwt } = await token(sessionClaims(TENANT_A.userId));
+    const loads: boolean[] = [];
+    const state = { lastMissRefetchAt: 0 };
+    const options = {
+      issuer: ISSUER,
+      audiences,
+      now: NOW,
+      state,
+      loadKeys: async (force: boolean) => {
+        loads.push(force);
+        return force ? [keys.jwk] : [];
+      },
+    };
+    const refreshed = await verifyAccessTokenRefreshingKeys(jwt, options);
+    expect(refreshed.ok).toBe(true);
+    expect(loads).toEqual([false, true]);
+    loads.length = 0;
+    const stale = await verifyAccessTokenRefreshingKeys(
+      await signToken(keys.privateKey, sessionClaims(TENANT_A.userId), {
+        alg: "ES256",
+        kid: "missing",
+        typ: "JWT",
+      }),
+      options,
+    );
+    expect(stale).toEqual({ ok: false, code: "unknown_key" });
+    expect(loads).toEqual([false]);
   });
 });

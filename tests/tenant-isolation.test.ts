@@ -103,7 +103,7 @@ describe("tenant isolation", () => {
       await tx.query("select set_config('request.jwt.claim.sub', $1, true)", [
         TENANT_A.userId,
       ]);
-      await tx.exec("set local role authenticated");
+      await tx.exec("set local role app_request");
       return tx.query(
         "select count(*)::int as n from app.businesses where owner_user_id = $1 or id = $2",
         [TENANT_B.userId, createdB.business.id],
@@ -122,13 +122,19 @@ describe("tenant isolation", () => {
         await tx.query("select set_config('request.jwt.claim.sub', $1, true)", [
           TENANT_A.userId,
         ]);
-        await tx.exec("set local role authenticated");
+        await tx.exec("set local role app_request");
         await tx.query(
           "insert into app.businesses (owner_user_id, display_name) values ($1, 'stolen')",
           [TENANT_B.userId],
         );
       }),
     ).rejects.toThrow(/row-level security/);
+    await expect(
+      connection.transaction(async (tx) => {
+        await tx.exec("set local role authenticated");
+        await tx.query("select * from app.businesses");
+      }),
+    ).rejects.toThrow(/permission denied/);
 
     await expect(
       store.createBusiness(delegated(TENANT_B.userId, GENERIC_MCP_CLIENT), {
@@ -205,6 +211,9 @@ describe("tenant isolation", () => {
       },
       async revokeGrant() {
         return false;
+      },
+      async listLiveGrantClientIds() {
+        return [];
       },
     };
     const context = {

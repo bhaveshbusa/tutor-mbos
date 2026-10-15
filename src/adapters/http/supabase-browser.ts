@@ -5,6 +5,7 @@ import {
   looksLikeSecret,
   type EnvSource,
 } from "@/server/config/environments";
+import { serializeAuthCookie, applySetCookies } from "./auth-cookies";
 import type { BrowserAuth } from "./browser-auth";
 import { problemResponse } from "./problem";
 
@@ -43,7 +44,7 @@ export async function withBrowserAuth(
         setAll: (cookies) => {
           for (const cookie of cookies) {
             setCookies.push(
-              serializeSetCookie(
+              serializeAuthCookie(
                 cookie.name,
                 cookie.value,
                 cookie.options ?? {},
@@ -84,33 +85,15 @@ export async function withBrowserAuth(
         return "unavailable";
       }
     },
+    async updatePassword(password) {
+      try {
+        const { error } = await supabase.auth.updateUser({ password });
+        return error ? "invalid" : "ok";
+      } catch {
+        return "unavailable";
+      }
+    },
   };
   const response = await run(auth, siteOrigin);
-  if (setCookies.length === 0) return response;
-  const headers = new Headers(response.headers);
-  for (const cookie of setCookies) headers.append("set-cookie", cookie);
-  return new Response(response.body, { status: response.status, headers });
-}
-
-function serializeSetCookie(
-  name: string,
-  value: string,
-  options: {
-    path?: string;
-    maxAge?: number;
-    httpOnly?: boolean;
-    secure?: boolean;
-    sameSite?: boolean | "none" | "strict" | "lax";
-  },
-): string {
-  const parts = [
-    `${name}=${value}`,
-    `Path=${options.path ?? "/"}`,
-    "HttpOnly",
-    "Secure",
-    "SameSite=Lax",
-  ];
-  if (typeof options.maxAge === "number")
-    parts.push(`Max-Age=${options.maxAge}`);
-  return parts.join("; ");
+  return applySetCookies(response, setCookies);
 }

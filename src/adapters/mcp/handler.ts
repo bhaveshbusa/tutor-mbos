@@ -2,6 +2,7 @@ import { createAccessHandlers, type AccessDeps } from "@/adapters/http/access";
 import {
   ACCESS_CONTRACT_VERSION,
   CLIENT_PROFILES,
+  negotiateMcpProtocol,
 } from "@/server/domain/access-contract";
 import { SETUP_REPORT } from "@/server/query/setup-report";
 import { problemResponse } from "@/adapters/http/problem";
@@ -10,7 +11,11 @@ interface RpcRequest {
   jsonrpc?: string;
   id?: unknown;
   method?: string;
-  params?: { name?: string; arguments?: Record<string, unknown> };
+  params?: {
+    name?: string;
+    arguments?: Record<string, unknown>;
+    protocolVersion?: string;
+  };
 }
 
 const TOOLS = [
@@ -95,7 +100,7 @@ export function createMcpHandler(deps: AccessDeps) {
 
     if (message.method === "initialize") {
       return rpc(message.id, {
-        protocolVersion: "2025-03-26",
+        protocolVersion: negotiateMcpProtocol(message.params?.protocolVersion),
         capabilities: { tools: {} },
         serverInfo: { name: "tutor-mbos", version: ACCESS_CONTRACT_VERSION },
       });

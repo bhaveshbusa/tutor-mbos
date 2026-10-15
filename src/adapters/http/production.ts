@@ -13,9 +13,11 @@ import {
   type EnvSource,
 } from "@/server/config/environments";
 import {
-  verifyAccessToken,
+  verifyAccessTokenRefreshingKeys,
   type JsonWebKey,
 } from "@/server/application/access-token";
+import { applySetCookies, serializeAuthCookie } from "./auth-cookies";
+import { oauthGrantRevokeUrl } from "./consent";
 import { createPgAccessStore } from "@/server/application/access-store";
 import { pgConnection } from "@/server/application/pg-connection";
 import type { AccessDeps } from "./access";
@@ -28,17 +30,20 @@ interface CachedJwks {
 }
 
 let jwksCache: CachedJwks | null = null;
+const jwksMissState = { lastMissRefetchAt: 0 };
 
 export function resetJwksCache(): void {
   jwksCache = null;
+  jwksMissState.lastMissRefetchAt = 0;
 }
 
 async function loadJwks(
   url: string,
   fetchImpl: typeof fetch,
+  force = false,
 ): Promise<JsonWebKey[]> {
   const now = Date.now();
-  if (jwksCache && jwksCache.url === url && jwksCache.expiresAt > now)
+  if (!force && jwksCache && jwksCache.url === url && jwksCache.expiresAt > now)
     return jwksCache.keys;
   const response = await fetchImpl(url, {
     headers: { accept: "application/json" },
@@ -87,6 +92,7 @@ export async function withAccess(
   }
   const siteOrigin = siteOriginFor(runtime.config.environment);
   const connection = databaseUrl ? pgConnection(databaseUrl) : null;
+  const refreshedCookies: string[] = [];
   const deps: AccessDeps = {
     siteOrigin,
     resourceMetadataUrl: protectedResourceMetadataUrl(siteOrigin),
@@ -113,44 +119,84 @@ export async function withAccess(
       },
     },
     async verify(token) {
+      return verifyAccessTokenRefreshingKeys(token, {
+        issuer: authIssuer(runtime.config.supabaseUrl),
+        audiences: acceptedAudiences(siteOrigin),
+        now: new Date(),
+        state: jwksMissState,
+        loadKeys: (force) =>
+          loadJwks(jwksUrl(runtime.config.supabaseUrl), fetchImpl, force),
+      });
+    },
+    revokeAuthGrant: async (sessionToken, clientId) => {
       try {
-        const keys = await loadJwks(
-          jwksUrl(runtime.config.supabaseUrl),
-          fetchImpl,
+        const response = await fetchImpl(
+          oauthGrantRevokeUrl(runtime.config.supabaseUrl, clientId),
+          {
+            method: "DELETE",
+            headers: {
+              authorization: `Bearer ${sessionToken}`,
+              apikey: publishableKey,
+            },
+          },
         );
-        return verifyAccessToken(token, {
-          jwks: keys,
-          issuer: authIssuer(runtime.config.supabaseUrl),
-          audiences: acceptedAudiences(siteOrigin),
-          now: new Date(),
-        });
+        return response.ok ? "ok" : "failed";
       } catch {
-        return { ok: false, code: "jwks_unavailable" };
+        return "failed";
       }
     },
-    sessionToken: (incoming) =>
-      sessionAccessToken(incoming, runtime.config.supabaseUrl, publishableKey),
+    sessionToken: async (incoming) => {
+      const session = await readUiSession(
+        incoming,
+        runtime.config.supabaseUrl,
+        publishableKey,
+        fetchImpl,
+      );
+      refreshedCookies.push(...session.setCookies);
+      return session.accessToken;
+    },
   };
   try {
-    return await run(deps);
+    return applySetCookies(await run(deps), refreshedCookies);
   } finally {
     await connection?.close();
   }
 }
 
-async function sessionAccessToken(
+export async function readUiSession(
   request: Request,
   supabaseUrl: string,
   publishableKey: string,
-): Promise<string | null> {
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ accessToken: string | null; setCookies: string[] }> {
+  const setCookies: string[] = [];
   const supabase = createServerClient(supabaseUrl, publishableKey, {
-    cookieOptions: { httpOnly: true, secure: true, sameSite: "lax", path: "/" },
+    cookieOptions: {
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+      path: "/",
+    },
+    global: { fetch: fetchImpl },
     cookies: {
       getAll: () => parseCookieHeader(request.headers.get("cookie") ?? ""),
-      setAll: () => undefined,
+      setAll: (cookies) => {
+        for (const cookie of cookies) {
+          setCookies.push(
+            serializeAuthCookie(
+              cookie.name,
+              cookie.value,
+              cookie.options ?? {},
+            ),
+          );
+        }
+      },
     },
   });
   const { data } = await supabase.auth.getSession();
   const token = data.session?.access_token;
-  return typeof token === "string" && token.length > 0 ? token : null;
+  return {
+    accessToken: typeof token === "string" && token.length > 0 ? token : null,
+    setCookies,
+  };
 }

@@ -19,7 +19,11 @@ const PRIVILEGED_DB_USERS = new Set([
 ]);
 
 export type DatabaseUrlIssue =
-  "invalid" | "privileged_user" | "binding_mismatch" | "not_app_runtime";
+  | "invalid"
+  | "privileged_user"
+  | "binding_mismatch"
+  | "not_app_runtime"
+  | "transaction_pooler";
 
 export function authIssuer(supabaseUrl: string): string {
   return `${supabaseUrl}/auth/v1`;
@@ -37,17 +41,35 @@ export function protectedResourceMetadataUrl(siteOrigin: string): string {
   return `${siteOrigin}/.well-known/oauth-protected-resource`;
 }
 
+/**
+ * Supabase OAuth access tokens currently use the audience `authenticated`.
+ * The MCP resource URL is also accepted when a token is resource-bound.
+ * Accepting `authenticated` on `/api/mcp` is a known deviation from RFC 8707
+ * until hosted tokens include this deployment's resource audience. A later
+ * contract version must require that audience for MCP once a hosted token
+ * sample shows it. Delegated calls still require `client_id` and a live grant.
+ */
 export function acceptedAudiences(siteOrigin: string): readonly string[] {
   return ["authenticated", resourceUrl(siteOrigin)];
 }
 
 /** Where this app may send the browser after its own sign-in or recovery. */
 export function allowedAppRedirects(siteOrigin: string): readonly string[] {
-  return [`${siteOrigin}/auth/callback`];
+  return [`${siteOrigin}/auth/callback`, `${siteOrigin}/auth/recovery`];
+}
+
+export function recoveryRedirect(siteOrigin: string): string {
+  return `${siteOrigin}/auth/recovery`;
 }
 
 export function allowedBrowserNextPaths(): readonly string[] {
-  return ["/", "/onboarding", "/business", "/oauth/consent"];
+  return [
+    "/",
+    "/onboarding",
+    "/business",
+    "/oauth/consent",
+    "/auth/update-password",
+  ];
 }
 
 export function isAllowedBrowserNext(value: string): boolean {
@@ -65,6 +87,7 @@ export function isAllowedBrowserNext(value: string): boolean {
 interface ParsedDatabaseUrl {
   username: string;
   hostname: string;
+  port: string;
   password: string;
   href: string;
 }
@@ -84,6 +107,7 @@ function parseDatabaseUrl(value: string): ParsedDatabaseUrl | null {
   return {
     username,
     hostname: parsed.hostname,
+    port: parsed.port,
     password: parsed.password,
     href: parsed.href,
   };
@@ -150,6 +174,7 @@ export function inspectMigrationDatabaseUrl(
   if (bareUser !== "postgres" && bareUser !== "supabase_admin") {
     return { ok: false, code: "privileged_user" };
   }
+  if (parsed.port === "6543") return { ok: false, code: "transaction_pooler" };
   return { ok: true };
 }
 

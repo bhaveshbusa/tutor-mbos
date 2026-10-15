@@ -20,7 +20,7 @@ export interface AccessContext {
   requestedTenantId: string | null;
 }
 
-type Failure = { ok: false; status: 400 | 403 | 503; code: string };
+type Failure = { ok: false; status: 400 | 403 | 502 | 503; code: string };
 
 function permissions(context: AccessContext) {
   return permissionsFor({
@@ -144,12 +144,22 @@ export async function revokeClient(
   store: AccessStore,
   context: AccessContext,
   clientId: string,
+  revokeAuthGrant?: () => Promise<boolean>,
 ): Promise<{ ok: true; revoked: boolean } | Failure> {
   if (context.actor.path !== "ui-session" || context.actor.clientId !== null) {
     return { ok: false, status: 403, code: "forbidden" };
   }
   if (!/^[0-9a-f-]{36}$/i.test(clientId)) {
     return { ok: false, status: 400, code: "invalid_client" };
+  }
+  if (revokeAuthGrant) {
+    try {
+      if (!(await revokeAuthGrant())) {
+        return { ok: false, status: 502, code: "auth_revoke_failed" };
+      }
+    } catch {
+      return { ok: false, status: 502, code: "auth_revoke_failed" };
+    }
   }
   try {
     return {

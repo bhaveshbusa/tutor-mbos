@@ -98,6 +98,18 @@ describe("MCP clients", () => {
       "resource_metadata=",
     );
     expect(await anonymous.text()).not.toContain("create_business");
+    const token = await mint(TENANT_A.userId, CHATGPT_CLIENT);
+    const negotiated = await handle(
+      rpc("initialize", token, { protocolVersion: "2025-03-26" }),
+    );
+    const negotiatedBody = await negotiated.json();
+    expect(negotiatedBody).toMatchObject({
+      result: { protocolVersion: "2025-03-26" },
+    });
+    const latest = await handle(
+      rpc("initialize", token, { protocolVersion: "1999-01-01" }),
+    );
+    expect((await latest.json()).result.protocolVersion).toBe("2025-06-18");
 
     await store.recordConsent(
       { path: "ui-session", userId: TENANT_A.userId, clientId: null },

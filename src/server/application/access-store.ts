@@ -54,6 +54,7 @@ export interface AccessStore {
   ): Promise<GrantRecord | null>;
   recordConsent(actor: VerifiedActor, input: ConsentInput): Promise<void>;
   revokeGrant(actor: VerifiedActor, clientId: string): Promise<boolean>;
+  listLiveGrantClientIds(actor: VerifiedActor): Promise<string[]>;
 }
 
 function claimsFor(actor: VerifiedActor): string {
@@ -219,6 +220,17 @@ export function createPgAccessStore(db: SqlConnection): AccessStore {
         ),
       );
       return result.rows[0]?.revoke_client_grant === true;
+    },
+    async listLiveGrantClientIds(actor) {
+      const result = await withActor(db, actor, (tx) =>
+        tx.query<{ oauth_client_id: string }>(
+          `select oauth_client_id
+           from app.client_grants
+           where revoked_at is null
+           order by oauth_client_id`,
+        ),
+      );
+      return result.rows.map((row) => row.oauth_client_id);
     },
   };
 }
