@@ -2,6 +2,7 @@
 # for any source upload: never send private files, credentials or local state.
 .env
 .env.*
+!.env.example
 .vercel/
 private/
 data/

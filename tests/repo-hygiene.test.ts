@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   scanContent,
@@ -47,6 +48,18 @@ describe("repository hygiene paths", () => {
     "src/server/domain/README.md",
   ])("allows %s", (file) => {
     expect(scanPath(file, "repository")).toEqual([]);
+  });
+
+  it("keeps .env.example uploadable for prebuilt Vercel deploys", () => {
+    // Next traces .env.example into the prebuilt output. Excluding it via
+    // `.env.*` without a negation causes deploy ENOENT (see deploy run
+    // 38658381609). Mirror .gitignore: ignore .env.* then un-ignore the example.
+    const ignore = readFileSync(".vercelignore", "utf8");
+    expect(ignore).toMatch(/^\.env\.\*$/m);
+    expect(ignore).toMatch(/^!\.env\.example$/m);
+    expect(ignore.indexOf(".env.*")).toBeLessThan(
+      ignore.indexOf("!.env.example"),
+    );
   });
 });
 
