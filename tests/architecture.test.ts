@@ -154,6 +154,15 @@ describe("source layering", () => {
     ).toEqual([]);
   });
 
+  it("gives database tests more than Vitest's five second default", () => {
+    const timeout = readFileSync("vitest.config.ts", "utf8").match(
+      /testTimeout:\s*(\d[\d_]*)/,
+    );
+    expect(Number(timeout?.[1]?.replaceAll("_", ""))).toBeGreaterThanOrEqual(
+      15_000,
+    );
+  });
+
   it("parses static, type-only, re-export and dynamic imports", () => {
     expect(
       importSpecifiers(

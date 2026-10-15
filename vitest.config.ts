@@ -9,5 +9,8 @@ export default defineConfig({
     environment: "node",
     include: ["tests/**/*.test.ts"],
     restoreMocks: true,
+    // PGlite startup on GitHub runners has exceeded Vitest's 5000ms default
+    // and stopped development delivery before migrations.
+    testTimeout: 20_000,
   },
 });
