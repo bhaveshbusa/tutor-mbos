@@ -1,0 +1,45 @@
+name: Migrate development
+
+# Manual only. Applies the reviewed migration files to tutor-mbos-dev after
+# they are on main. It does not deploy the application and cannot target
+# production. Pull requests do not run it.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: migrate-development
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    name: Apply migrations to tutor-mbos-dev
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: development
+    steps:
+      - name: Require main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Development migrations run from main only."
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Require migration credentials
+        env:
+          SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
+          APP_RUNTIME_PASSWORD: ${{ secrets.APP_RUNTIME_PASSWORD }}
+        run: |
+          if [ -z "$SUPABASE_MIGRATION_DATABASE_URL" ] || [ -z "$APP_RUNTIME_PASSWORD" ]; then
+            echo "::error::Set SUPABASE_MIGRATION_DATABASE_URL and APP_RUNTIME_PASSWORD on the GitHub development environment. See docs/release.md."
+            exit 1
+          fi
+      - name: Apply versioned migrations
+        env:
+          SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
+          APP_RUNTIME_PASSWORD: ${{ secrets.APP_RUNTIME_PASSWORD }}
+        run: pnpm migrate:development

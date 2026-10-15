@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import * as mcpRoute from "@/app/api/mcp/route";
 
-describe("/api/mcp before authentication exists", () => {
+describe("/api/mcp without deployment auth configuration", () => {
   it.each(["GET", "POST", "DELETE"] as const)(
-    "%s fails closed with 503 and exposes no MCP capabilities",
+    "%s fails closed and exposes no MCP capabilities",
     async (method) => {
-      const response = mcpRoute[method]();
+      const response = await mcpRoute[method](
+        new Request("https://example.test/api/mcp", { method }),
+      );
       expect(response.status).toBe(503);
       expect(response.headers.get("content-type")).toBe(
         "application/problem+json",
@@ -14,7 +16,7 @@ describe("/api/mcp before authentication exists", () => {
       const body = await response.text();
       expect(JSON.parse(body)).toMatchObject({
         status: 503,
-        title: "MCP service not available",
+        title: "Authentication unavailable",
       });
       expect(body).not.toMatch(/"(tools|resources|prompts|result|jsonrpc)"/);
     },

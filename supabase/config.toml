@@ -1,0 +1,15 @@
+# Supabase local/development configuration for the OAuth server.
+# Production enablement waits for a signed-off release. Do not put secrets here.
+
+project_id = "tutor-mbos"
+
+[api]
+enabled = true
+schemas = ["public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[auth.oauth_server]
+enabled = true
+authorization_url_path = "/oauth/consent"
+allow_dynamic_registration = true

@@ -2,7 +2,7 @@
 
 This document covers TOS-2: repository layout, checks, environment configuration and the development/production delivery workflows. All commands run in cloud agent workspaces or GitHub Actions. Nothing here requires the owner's machine.
 
-**Authentication is not implemented.** `/api/v1/health` is the only working API route. `/api/mcp` fails closed with `503` for every request. TOS-3 delivers Supabase-managed authentication, tenant schema and RLS.
+`/api/v1/health` stays public. Business, report and MCP routes require the access contract in `docs/contracts/access-v1.md`. Without Supabase Auth configuration those routes fail closed. MCP no longer answers anonymously.
 
 ## Layout
 
@@ -47,7 +47,8 @@ Set these on each **Vercel project** under *Settings → Environment Variables*,
 | --- | --- | --- | --- |
 | `TUTOR_MBOS_ENV` | `development` | `production` | Required |
 | `NEXT_PUBLIC_SUPABASE_URL` | `https://idvzjqrkgnihvxoswuxu.supabase.co` | `https://vblwjqfpcmegbugmufif.supabase.co` | Required; must match `TUTOR_MBOS_ENV` |
-| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | `sb_publishable_<dev placeholder>` | `sb_publishable_<prod placeholder>` | Optional until TOS-3; publishable key from Supabase *Project Settings → API Keys* |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | `sb_publishable_<dev placeholder>` | `sb_publishable_<prod placeholder>` | Publishable key from Supabase *Project Settings → API Keys*. Required for sign-in and token checks. |
+| `TUTOR_MBOS_APP_DATABASE_URL` | `postgresql://app_runtime.<dev ref>:<password>@<pooler>:6543/postgres` | set only at a signed-off release | Server-only. Username must be `app_runtime` for that project. Not a service-role or migration URL. |
 
 Rules enforced by `src/server/config/environments.ts` and the deployment workflows:
 

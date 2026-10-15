@@ -18,3 +18,21 @@ Public repository: no personal data, real fixtures, secret-bearing logs, tokens,
 Cloud CI gates include tests, typecheck, build, security/isolation, migrations and cross-client acceptance. Skipped security gates are not passes. Record exact source/schema/environment evidence. Promote tested candidates through development/staging before production.
 
 User approves the plan and chooses final sign-off testing. Do not require manual SQL, routine test execution, Excel reconciliation or per-ticket implementation approvals. Account authorization and project creation are the only unavoidable setup handoffs. Do not deploy the initial production release before final sign-off.
+
+## Continuing delivery and migrations
+
+This policy applies to every production release, including all future features, fixes, dependency updates and database changes. The user must explicitly sign off the specific candidate and its migration set. Plan approval and a finished initial release do not authorize later production releases. The user chooses sign-off testing; routine tests and deployment stay automated.
+
+Database changes use versioned migrations, fresh-install and populated-upgrade tests, separate environment credentials, serialized execution, target and drift checks, and recorded recovery evidence. Apply the same reviewed files to development before production. Never edit an applied migration; add a corrective migration. Application rollback does not reverse database changes. Destructive changes need a reviewed recovery plan and verified backup coverage. An emergency fix does not skip these gates unless the user explicitly authorizes that exception.
+
+Details and the development migration workflow are in `docs/release.md`. Coding agents must not deploy production or enable production releases.
+
+<!-- BEGIN:nextjs-agent-rules -->
+
+# This is NOT the Next.js you know
+
+This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` (resolved from this file's directory; in monorepos the `next` package may not be visible from the repo root) before writing any code. Heed deprecation notices.
+
+This block is written and re-added by `next dev` — verify at `node_modules/next/dist/server/lib/generate-agent-files.js`. Removing it from a diff only re-creates the uncommitted change; committing it with your work keeps the tree clean.
+
+<!-- END:nextjs-agent-rules -->

@@ -1,3 +1,4 @@
+import { ACCESS_CONTRACT_VERSION } from "@/server/domain/access-contract";
 import {
   loadRuntimeConfig,
   type ConfigIssue,
@@ -14,8 +15,9 @@ export interface BuildInfo {
 interface StatusBase {
   service: typeof SERVICE_NAME;
   commit: string | null;
-  /** Authentication is delivered by TOS-3; no business surface is served yet. */
-  authentication: "not_implemented";
+  /** Business routes require a verified Supabase session or delegated token. */
+  authentication: "enforced";
+  accessContract: typeof ACCESS_CONTRACT_VERSION;
 }
 
 export type ServiceStatus =
@@ -34,7 +36,8 @@ export function getServiceStatus(
   const base: StatusBase = {
     service: SERVICE_NAME,
     commit: /^[0-9a-f]{40}$/.test(build.commit) ? build.commit : null,
-    authentication: "not_implemented",
+    authentication: "enforced",
+    accessContract: ACCESS_CONTRACT_VERSION,
   };
   const result = loadRuntimeConfig(env);
   if (!result.ok) {
