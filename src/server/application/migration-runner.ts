@@ -94,10 +94,23 @@ export async function applyMigrations(
   }
 }
 
+/** Forces the privilege probe to roll back its temporary role grant. */
+class RolledBackPrivilegeProbe extends Error {
+  constructor() {
+    super("rolled back privilege probe");
+  }
+}
+
 /**
  * Hosted development apply checks these privileges after the migration set.
  * authenticated must not use schema app. app_request must still execute
  * auth.uid(), which stays granted by Supabase Auth rather than this app.
+ *
+ * A hosted `postgres` login can administer `app_request` without being allowed
+ * to `SET ROLE` to it (Postgres 16+ records that membership with set_option
+ * false). The probe grants `SET` to the current login and switches role in one
+ * transaction, then rolls the grant back so the migration login does not keep
+ * the membership.
  */
 export async function assertTenantPrivileges(db: SqlConnection): Promise<void> {
   const result = await db.query<{ app_usage: boolean }>(
@@ -109,10 +122,16 @@ export async function assertTenantPrivileges(db: SqlConnection): Promise<void> {
   }
   try {
     await db.transaction(async (tx) => {
+      await tx.exec(
+        "grant app_request to current_user with set true, inherit false",
+      );
       await tx.exec("set local role app_request");
       await tx.query("select auth.uid()");
+      throw new RolledBackPrivilegeProbe();
     });
-  } catch {
-    throw new Error("app_request cannot execute auth.uid()");
+  } catch (error) {
+    if (error instanceof RolledBackPrivilegeProbe) return;
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`app_request cannot execute auth.uid(): ${message}`);
   }
 }

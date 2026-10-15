@@ -85,6 +85,43 @@ describe("versioned migrations", () => {
     );
   });
 
+  it("runs the auth.uid check for a login that cannot set role app_request", async () => {
+    const { connection } = await emptyDatabase();
+    const manifest = migrationManifest();
+    await applyMigrations(
+      connection,
+      loadMigrationFiles("supabase/migrations", manifest),
+      manifest.lockKey,
+    );
+    await connection.exec(`
+      create role migration_login nosuperuser createrole;
+      grant app_request to migration_login with admin true, inherit false, set false;
+    `);
+    await connection.exec("set session authorization migration_login");
+    await expect(
+      connection.transaction(async (tx) => {
+        await tx.exec("set local role app_request");
+      }),
+    ).rejects.toThrow(/permission denied to set role "app_request"/);
+    await assertTenantPrivileges(connection);
+    await connection.exec("reset session authorization");
+    const membership = await connection.query<{
+      admin_option: boolean;
+      inherit_option: boolean;
+      set_option: boolean;
+    }>(`
+      select m.admin_option, m.inherit_option, m.set_option
+      from pg_auth_members m
+      join pg_roles granted on granted.oid = m.roleid
+      join pg_roles member on member.oid = m.member
+      where granted.rolname = 'app_request'
+        and member.rolname = 'migration_login'
+    `);
+    expect(membership.rows).toEqual([
+      { admin_option: true, inherit_option: false, set_option: false },
+    ]);
+  });
+
   it("keeps populated rows when the corrective migration is applied", async () => {
     const { connection } = await emptyDatabase();
     const manifest = migrationManifest();
