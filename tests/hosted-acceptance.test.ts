@@ -67,6 +67,11 @@ interface DoubleOptions {
 
 function developmentDouble(options: DoubleOptions = {}) {
   const urls: string[] = [];
+  const calls: {
+    origin: string;
+    bypass: string;
+    redirect: RequestRedirect | undefined;
+  }[] = [];
   const users = new Map<
     string,
     { id: string; access: string; refresh: string }
@@ -121,6 +126,12 @@ function developmentDouble(options: DoubleOptions = {}) {
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = new URL(typeof input === "string" ? input : input.toString());
     urls.push(`${init?.method ?? "GET"} ${url.pathname}`);
+    calls.push({
+      origin: url.origin,
+      bypass:
+        new Headers(init?.headers).get("x-vercel-protection-bypass") ?? "",
+      redirect: init?.redirect,
+    });
     const header = (name: string) => new Headers(init?.headers).get(name) ?? "";
     const bodyText = typeof init?.body === "string" ? init.body : "";
     const form = () => new URLSearchParams(bodyText);
@@ -438,9 +449,10 @@ function developmentDouble(options: DoubleOptions = {}) {
     return json(404, { missing: url.pathname });
   };
 
-  return { fetchImpl, urls };
+  return { fetchImpl, urls, calls };
 }
 
+const SYNTHETIC_BYPASS = "synthetic-bypass";
 const password = "pw";
 const appDatabaseUrl = `postgresql://app_runtime.${ENVIRONMENT_BINDINGS.development.supabaseProjectRef}:${password}@aws-0-eu-west-2.pooler.supabase.com:5432/postgres`;
 
@@ -460,6 +472,7 @@ function input(
     runAttempt: "1",
     runNonce: "07".repeat(16),
     startedAt: "2026-10-15T20:00:00.000Z",
+    bypass: SYNTHETIC_BYPASS,
     probeDatabase: async () => ({
       runtimeReadDenied: true,
       ownVisible: true,
@@ -533,6 +546,19 @@ describe("hosted acceptance harness", () => {
       false,
     );
     const text = formatAcceptanceReport(report);
+    const siteCalls = doubled.calls.filter((call) => call.origin === site);
+    const otherCalls = doubled.calls.filter((call) => call.origin !== site);
+    expect(siteCalls.length).toBeGreaterThan(0);
+    expect(otherCalls.length).toBeGreaterThan(0);
+    expect(siteCalls.every((call) => call.bypass === SYNTHETIC_BYPASS)).toBe(
+      true,
+    );
+    expect(otherCalls.every((call) => call.bypass === "")).toBe(true);
+    expect(doubled.calls.every((call) => call.redirect === "manual")).toBe(
+      true,
+    );
+    expect(text).not.toContain(SYNTHETIC_BYPASS);
+    expect(JSON.stringify(report)).not.toContain(SYNTHETIC_BYPASS);
     expect(text).toContain("generic_client_is_not_chatgpt=true");
     expect(text).toContain("schema_source=reviewed_manifest");
     expect(text).not.toContain(jwtSecret);
@@ -877,6 +903,14 @@ describe("hosted acceptance harness", () => {
       false,
     );
     const script = readFileSync("scripts/hosted-acceptance.ts", "utf8");
+    expect(script).toContain("bypass: bypass.value ?? null");
+    expect(script).toContain("if (!input.bypass)");
+    expect(script).toContain("new URL(url).origin === target.site");
+    expect(script).not.toContain("url.startsWith(target.site)");
+    expect(script).toContain("protection_bypass_absent");
+    expect(script).toContain(
+      "VERCEL_AUTOMATION_BYPASS_SECRET is absent. Copy the project's existing Protection Bypass for Automation value to GitHub → Settings → Environments → development → Secrets.",
+    );
     expect(script).toContain("mask(runNonce)");
     expect(script).toContain("probeDirectTenants");
     expect(script).toContain(
@@ -962,6 +996,121 @@ describe("hosted acceptance harness", () => {
       doubled.urls.some((url) => url.includes("/api/oauth/decision")),
     ).toBe(false);
     expect(probed).toBe(false);
+  });
+
+  it("does not request the site when the automation bypass is absent", async () => {
+    let called = false;
+    const bodies: string[] = [];
+    const report = await runHostedAcceptance(
+      input(
+        async () => {
+          called = true;
+          throw new Error("protected site must not be called");
+        },
+        {
+          bypass: null,
+          writeManifest: (body) => {
+            bodies.push(body);
+          },
+        },
+      ),
+    );
+    expect(called).toBe(false);
+    expect(report.deployedCommit).toBe("");
+    expect(report.results.find((row) => row.id === "health")?.detail).toBe(
+      "protection_bypass_absent",
+    );
+    expect(
+      report.results.find((row) => row.id === "signup.tenant_a")?.detail,
+    ).toBe("not_executed");
+    expect(
+      report.results.find((row) => row.id === "cleanup.manifest")?.detail,
+    ).toBe("no_hosted_users");
+    expect(bodies).toHaveLength(2);
+    expect(JSON.parse(bodies[0]!).users).toEqual([]);
+  });
+
+  it.each([undefined, ""])(
+    "does not request the site when the bypass is %j",
+    async (bypass) => {
+      let called = false;
+      const report = await runHostedAcceptance(
+        input(
+          async () => {
+            called = true;
+            throw new Error("protected site must not be called");
+          },
+          { bypass },
+        ),
+      );
+      expect(called).toBe(false);
+      expect(report.results.find((row) => row.id === "health")?.detail).toBe(
+        "protection_bypass_absent",
+      );
+      expect(
+        report.results.find((row) => row.id === "signup.tenant_a")?.detail,
+      ).toBe("not_executed");
+    },
+  );
+
+  it("records a protection page with no health commit as commit absent", async () => {
+    const seen: string[] = [];
+    const report = await runHostedAcceptance(
+      input(
+        async (_url, init) => {
+          seen.push(
+            new Headers(init?.headers).get("x-vercel-protection-bypass") ?? "",
+          );
+          return new Response("<html>Authentication Required</html>", {
+            status: 401,
+            headers: { "content-type": "text/html" },
+          });
+        },
+        { bypass: "synthetic-bypass" },
+      ),
+    );
+    expect(seen).toEqual(["synthetic-bypass"]);
+    expect(report.deployedCommit).toBe("");
+    expect(report.results.find((row) => row.id === "health")?.detail).toBe(
+      "http_401 commit=absent",
+    );
+    expect(
+      report.results.find((row) => row.id === "signup.tenant_a")?.detail,
+    ).toBe("not_executed");
+    expect(formatAcceptanceReport(report)).toContain("deployed_commit=absent");
+  });
+
+  it("records a different health commit as a mismatch after the bypass is sent", async () => {
+    const other = "b".repeat(40);
+    const seen: string[] = [];
+    const report = await runHostedAcceptance(
+      input(async (_url, init) => {
+        seen.push(
+          new Headers(init?.headers).get("x-vercel-protection-bypass") ?? "",
+        );
+        return new Response(
+          JSON.stringify({
+            status: "ok",
+            environment: "development",
+            supabaseProjectRef:
+              ENVIRONMENT_BINDINGS.development.supabaseProjectRef,
+            commit: other,
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      }),
+    );
+    expect(seen).toEqual([SYNTHETIC_BYPASS]);
+    expect(report.deployedCommit).toBe(other);
+    expect(report.results.find((row) => row.id === "health")?.detail).toBe(
+      "http_200 commit=mismatch",
+    );
+    expect(
+      report.results.find((row) => row.id === "signup.tenant_a")?.detail,
+    ).toBe("not_executed");
   });
 
   it("fails when the closing health commit differs from the source", async () => {
