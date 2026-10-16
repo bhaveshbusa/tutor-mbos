@@ -34,11 +34,14 @@ function message(
   return { id, to, from, createdAt };
 }
 
-function verifyUrl(): string {
+function verifyUrl(type: "signup" | "recovery" = "signup"): string {
   const url = new URL("/auth/v1/verify", supabase);
   url.searchParams.set("token", token);
-  url.searchParams.set("type", "signup");
-  url.searchParams.set("redirect_to", `${site}/auth/callback`);
+  url.searchParams.set("type", type);
+  url.searchParams.set(
+    "redirect_to",
+    type === "signup" ? `${site}/auth/callback` : `${site}/auth/recovery`,
+  );
   return url.toString();
 }
 
@@ -136,6 +139,28 @@ describe("receiving mail selection", () => {
         purpose: "confirmation",
       }),
     ).toBeNull();
+  });
+
+  it("accepts one verify link when text and HTML repeat it, including amp entities", () => {
+    const link = verifyUrl();
+    const encoded = link.replaceAll("&", "&amp;");
+    const numeric = link.replaceAll("&", "&#38;");
+    const input = {
+      supabaseOrigin: supabase,
+      siteOrigin: site,
+      purpose: "confirmation" as const,
+    };
+    const selected = selectVerifyLink(
+      `${link}\n<p>${bodySecret}</p><a href="${encoded}">Confirm</a>`,
+      input,
+    );
+    expect(selected?.href).toBe(new URL(link).href);
+    expect(
+      selectVerifyLink(`<a href="${numeric}">Confirm</a>`, input)?.href,
+    ).toBe(new URL(link).href);
+    const other = new URL(link);
+    other.searchParams.set("token", "another-valid-token");
+    expect(selectVerifyLink(`${link}\n${other.toString()}`, input)).toBeNull();
   });
 
   it("fetches only the matched body and does not return the token or body", async () => {
@@ -256,5 +281,80 @@ describe("receiving mail selection", () => {
     });
     expect(mismatch.status).toBe("sender_domain_mismatch");
     expect(mismatch.actions).toEqual([]);
+  });
+
+  it("excludes the confirmation message when matching the later recovery mail", async () => {
+    const confirmationId = "11111111-1111-4111-8111-111111111111";
+    const recoveryId = "44444444-4444-4444-8444-444444444444";
+    const recoveryStarted = "2026-10-16T18:02:00.000Z";
+    const listed = {
+      has_more: false,
+      data: [
+        {
+          id: recoveryId,
+          to: [recipient],
+          from: `Auth <noreply@${ACCEPTANCE_SENDING_DOMAIN}>`,
+          created_at: "2026-10-16T18:02:05.000Z",
+        },
+        {
+          id: confirmationId,
+          to: [recipient],
+          from: `Auth <noreply@${ACCEPTANCE_SENDING_DOMAIN}>`,
+          created_at: "2026-10-16T18:01:00.000Z",
+        },
+      ],
+    };
+    const paths: string[] = [];
+    const fetchImpl: typeof fetch = async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      paths.push(url.pathname);
+      if (url.pathname === "/emails/receiving") return Response.json(listed);
+      if (url.pathname === `/emails/receiving/${recoveryId}`) {
+        return Response.json({
+          to: [recipient],
+          from: `Auth <noreply@${ACCEPTANCE_SENDING_DOMAIN}>`,
+          created_at: "2026-10-16T18:02:05.000Z",
+          text: verifyUrl("recovery"),
+          html: `<a href="${verifyUrl("recovery").replaceAll("&", "&amp;")}">Reset</a>`,
+        });
+      }
+      if (url.origin === new URL(supabase).origin) {
+        return new Response(null, {
+          status: 303,
+          headers: { location: `${site}/auth/recovery?code=${code}` },
+        });
+      }
+      return new Response("no", { status: 500 });
+    };
+    const shared = {
+      fetchImpl,
+      apiKey: "re_test_key",
+      recipients: [{ label: "tenant-a" as const, email: recipient }],
+      purpose: "recovery" as const,
+      startedAt: recoveryStarted,
+      nowMs: Date.parse("2026-10-16T18:03:00.000Z"),
+      supabaseOrigin: supabase,
+      siteOrigin: site,
+      attempts: 1,
+    };
+    const ambiguous = await collectReceivedActions(shared);
+    expect(ambiguous.status).toBe("ambiguous");
+    expect(paths).toEqual(["/emails/receiving"]);
+    paths.length = 0;
+    const matched = await collectReceivedActions({
+      ...shared,
+      excludeMessageIds: [confirmationId],
+    });
+    expect(matched.status).toBe("ready");
+    expect(matched.messageIds).toEqual([recoveryId]);
+    expect(matched.actions).toEqual([
+      { label: "tenant-a", path: "/auth/recovery", code },
+    ]);
+    expect(paths).toEqual([
+      "/emails/receiving",
+      `/emails/receiving/${recoveryId}`,
+      "/auth/v1/verify",
+    ]);
+    expect(JSON.stringify(matched)).not.toContain(token);
   });
 });

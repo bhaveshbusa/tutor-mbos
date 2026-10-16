@@ -1,7 +1,9 @@
 /**
  * Same-runner handoff between acceptance steps. The mail steps do not
- * read the session file. Job outputs are not used for verifiers, codes,
- * or tokens.
+ * read the session file. Sharing a runner is not filesystem isolation:
+ * any step in the job can read this directory. The receiving key stays
+ * out of the other steps' environments, and that does not narrow it.
+ * Job outputs are not used for verifiers, codes, or tokens.
  */
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -17,6 +19,8 @@ import type {
 import type { AcceptanceCase } from "./hosted-acceptance.ts";
 
 const CODE = /^[A-Za-z0-9_-]{8,512}$/;
+const MESSAGE_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SESSION_LIMIT = 128_000;
 const MAIL_LIMIT = 8_192;
 
@@ -254,6 +258,9 @@ export function writeMailResult(dir: string, mail: MailReadResult): void {
     path: action.path,
     code: action.code,
   }));
+  const messageIds = (mail.messageIds ?? []).filter((id) =>
+    MESSAGE_ID.test(id),
+  );
   writePrivate(
     mailPath(dir, mail.purpose),
     JSON.stringify({
@@ -261,6 +268,7 @@ export function writeMailResult(dir: string, mail: MailReadResult): void {
       purpose: mail.purpose,
       status: mail.status,
       ...(mail.httpStatus === undefined ? {} : { httpStatus: mail.httpStatus }),
+      ...(messageIds.length > 0 ? { messageIds } : {}),
       actions,
     }),
   );
@@ -305,13 +313,27 @@ export function readMailResult(
     typeof row.httpStatus === "number" && Number.isInteger(row.httpStatus)
       ? row.httpStatus
       : undefined;
+  const messageIds = messageIdsOf(row.messageIds);
+  if (!messageIds) return null;
   return {
     version: 1,
     purpose,
     status: row.status as MailReadResult["status"],
     ...(httpStatus === undefined ? {} : { httpStatus }),
+    ...(messageIds.length > 0 ? { messageIds } : {}),
     actions,
   };
+}
+
+function messageIdsOf(value: unknown): string[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 2) return null;
+  const ids: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string" || !MESSAGE_ID.test(entry)) return null;
+    ids.push(entry);
+  }
+  return ids;
 }
 
 export function writeRecoveryWindow(dir: string, startedAt: string): void {

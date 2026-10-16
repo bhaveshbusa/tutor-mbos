@@ -645,12 +645,12 @@ export async function runHostedAcceptance(
       return;
     }
     if (stage === "recovery_requested") {
-      await completeRecovery(tenantA);
+      const sessionCurrent = await completeRecovery(tenantA);
       const sessionsBlocked = results.some(
         (row) =>
           row.id === "login.tenant_a" && row.detail.startsWith("blocked:"),
       );
-      if (!sessionsBlocked) await finishAcceptedWork();
+      if (sessionCurrent && !sessionsBlocked) await finishAcceptedWork();
       await runManagement();
       await runDirectDatabase();
       await closingHealth();
@@ -1019,8 +1019,9 @@ export async function runHostedAcceptance(
     }
   }
 
-  async function completeRecovery(tenant: Tenant): Promise<void> {
-    if (!mailRequired || phase === "continue" || phase === "signup") return;
+  async function completeRecovery(tenant: Tenant): Promise<boolean> {
+    if (!mailRequired || phase === "continue" || phase === "signup")
+      return true;
     const mail = stateDir ? readMailResult(stateDir, "recovery") : null;
     const action =
       mail?.status === "ready"
@@ -1036,7 +1037,11 @@ export async function runHostedAcceptance(
           : mailFailureDetail("recovery");
       results.push(acceptanceCase("recovery.email_callback", "fail", detail));
       results.push(acceptanceCase("recovery.completion", "fail", detail));
-      return;
+      results.push(
+        acceptanceCase("recovery.previous_refresh_rejected", "fail", detail),
+      );
+      results.push(acceptanceCase("recovery.session_replaced", "fail", detail));
+      return true;
     }
     const reply = await request(
       `${target.site}/auth/recovery?code=${encodeURIComponent(action.code)}`,
@@ -1065,8 +1070,25 @@ export async function runHostedAcceptance(
       results.push(
         acceptanceCase("recovery.completion", "fail", "callback_rejected"),
       );
-      return;
+      results.push(
+        acceptanceCase(
+          "recovery.previous_refresh_rejected",
+          "fail",
+          "callback_rejected",
+        ),
+      );
+      results.push(
+        acceptanceCase(
+          "recovery.session_replaced",
+          "fail",
+          "callback_rejected",
+        ),
+      );
+      return true;
     }
+    const previousRefresh = tenant.refreshToken;
+    const nextPassword = syntheticPassword(rng(24));
+    tenant.password = nextPassword;
     const updated = await request(`${target.site}/api/auth/password`, {
       method: "POST",
       headers: {
@@ -1077,7 +1099,7 @@ export async function runHostedAcceptance(
           .join("; "),
       },
       body: new URLSearchParams({
-        password: syntheticPassword(rng(24)),
+        password: nextPassword,
       }).toString(),
     });
     const updatedLocation = updated.headers.get("location") ?? "";
@@ -1090,6 +1112,92 @@ export async function runHostedAcceptance(
         pass ? "password_updated" : `http_${updated.status}`,
       ),
     );
+    if (!pass) {
+      results.push(
+        acceptanceCase(
+          "recovery.previous_refresh_rejected",
+          "fail",
+          "not_executed",
+        ),
+      );
+      results.push(
+        acceptanceCase("recovery.session_replaced", "fail", "not_executed"),
+      );
+      return true;
+    }
+    const revoked = await previousRefreshRejected(previousRefresh);
+    results.push(
+      acceptanceCase(
+        "recovery.previous_refresh_rejected",
+        revoked ? "pass" : "fail",
+        revoked
+          ? "revoked"
+          : previousRefresh
+            ? "refresh_still_accepted"
+            : "refresh_absent",
+      ),
+    );
+    const replaced = await replaceRevokedSession(tenant, previousRefresh);
+    results.push(
+      acceptanceCase(
+        "recovery.session_replaced",
+        replaced ? "pass" : "fail",
+        replaced ? "password_session" : "login_rejected",
+      ),
+    );
+    return replaced;
+  }
+
+  async function previousRefreshRejected(
+    refreshToken: string | null,
+  ): Promise<boolean> {
+    if (!refreshToken) return false;
+    const reply = await request(
+      `${target.supabaseUrl}/auth/v1/token?grant_type=refresh_token`,
+      {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      },
+    );
+    return reply.status === 400 || reply.status === 401 || reply.status === 403;
+  }
+
+  async function replaceRevokedSession(
+    tenant: Tenant,
+    previousRefresh: string | null,
+  ): Promise<boolean> {
+    tenant.jar.clear();
+    tenant.accessToken = null;
+    tenant.refreshToken = null;
+    const reply = await request(`${target.site}/api/auth/login`, {
+      method: "POST",
+      headers: {
+        origin: target.site,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        email: tenant.email,
+        password: tenant.password,
+        next: "/business",
+      }).toString(),
+    });
+    rememberCookies(tenant, reply.headers);
+    const tokens = readSessionTokens(
+      authStorageKey(target.supabaseUrl),
+      tenant.jar,
+    );
+    const location = reply.headers.get("location") ?? "";
+    const pass =
+      reply.status === 303 &&
+      location.startsWith(`${target.site}/business`) &&
+      tokens !== null &&
+      tokens.refreshToken !== previousRefresh &&
+      tenant.jar.size > 0;
+    if (!pass || !tokens) return false;
+    tenant.accessToken = tokens.accessToken;
+    tenant.refreshToken = tokens.refreshToken;
+    return true;
   }
 
   async function sessionGate(): Promise<void> {
@@ -1119,8 +1227,7 @@ export async function runHostedAcceptance(
       pause("recovery_requested");
       return;
     }
-    await completeRecovery(tenantA);
-    await finishAcceptedWork();
+    if (await completeRecovery(tenantA)) await finishAcceptedWork();
   }
 
   async function finishAcceptedWork(): Promise<void> {
@@ -2238,6 +2345,16 @@ const EVIDENCE_GAPS: readonly AcceptanceCase[] = [
     "recovery.completion",
     "gap",
     "Recovery completion follows the email callback. Secretless runs do not read mail or call the admin API.",
+  ),
+  acceptanceCase(
+    "recovery.previous_refresh_rejected",
+    "gap",
+    "Secretless runs do not update the password, so they do not observe GoTrue revoking the earlier refresh token.",
+  ),
+  acceptanceCase(
+    "recovery.session_replaced",
+    "gap",
+    "Secretless runs do not sign in again after recovery. The protected workflow replaces the revoked tenant session before the later checks.",
   ),
   acceptanceCase(
     "ui.browser_interaction",

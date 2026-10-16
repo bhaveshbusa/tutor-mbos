@@ -3,7 +3,8 @@
  * This process receives only the Resend key. It does not receive the
  * admin key, the Management API token, the app database URL, the
  * publishable key, or the Vercel token, and it does not open the
- * acceptance session file.
+ * acceptance session file. The accept steps share one runner, so the
+ * filesystem is not an isolation boundary.
  */
 import { pathToFileURL } from "node:url";
 import {
@@ -12,6 +13,7 @@ import {
 } from "../src/server/application/acceptance-cleanup.ts";
 import {
   acceptanceStateDir,
+  readMailResult,
   readRecoveryWindow,
   writeMailResult,
 } from "../src/server/application/acceptance-checkpoint.ts";
@@ -63,10 +65,15 @@ async function main(): Promise<number> {
     console.error("::error::RUNNER_TEMP is absent.");
     return 2;
   }
+  const stateDir = acceptanceStateDir(root);
   const startedAt =
     purpose === "recovery"
-      ? (readRecoveryWindow(acceptanceStateDir(root)) ?? "")
+      ? (readRecoveryWindow(stateDir) ?? "")
       : (process.env.ACCEPTANCE_STARTED_AT ?? "");
+  const excludeMessageIds =
+    purpose === "recovery"
+      ? (readMailResult(stateDir, "confirmation")?.messageIds ?? [])
+      : [];
   const apiKey = process.env.RESEND_DEVELOPMENT_RECEIVING_API_KEY ?? "";
   mask(apiKey);
   const ref = ENVIRONMENT_BINDINGS.development.supabaseProjectRef;
@@ -81,6 +88,7 @@ async function main(): Promise<number> {
     nowMs: Date.now(),
     supabaseOrigin: supabaseUrlFor(ref),
     siteOrigin: siteOriginFor("development"),
+    excludeMessageIds,
     recipients: (purpose === "confirmation"
       ? CLEANUP_USER_LABELS
       : (["tenant-a"] as const)

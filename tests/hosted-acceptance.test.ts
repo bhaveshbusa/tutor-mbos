@@ -649,17 +649,55 @@ describe("hosted acceptance harness", () => {
     try {
       const doubled = developmentDouble({ autoconfirm: false });
       const storageKey = authStorageKey(supabaseUrl);
-      const seen: { authorization: string; url: string; cookie: string }[] = [];
+      const seen: {
+        authorization: string;
+        url: string;
+        cookie: string;
+        refresh: string;
+      }[] = [];
       const fetchImpl: typeof fetch = async (resource, init) => {
         const url =
           typeof resource === "string" ? resource : resource.toString();
         const headers = new Headers(init?.headers);
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        let refresh = "";
+        if (bodyText.startsWith("{")) {
+          refresh = String(
+            (JSON.parse(bodyText) as { refresh_token?: unknown })
+              .refresh_token ?? "",
+          );
+        }
         seen.push({
           authorization: headers.get("authorization") ?? "",
           url,
           cookie: headers.get("cookie") ?? "",
+          refresh,
         });
         const parsed = new URL(url);
+        if (
+          parsed.pathname === "/auth/v1/token" &&
+          refresh === "refresh-confirmed"
+        ) {
+          return Response.json({ error: "invalid_grant" }, { status: 400 });
+        }
+        if (parsed.pathname === "/api/auth/login") {
+          const response = await doubled.fetchImpl(resource, init);
+          const next = new Headers(response.headers);
+          const payload = Buffer.from(
+            JSON.stringify({
+              access_token: "access-replaced",
+              refresh_token: "refresh-replaced",
+            }),
+          ).toString("base64url");
+          next.append(
+            "set-cookie",
+            `${storageKey}=base64-${payload}; Path=/; HttpOnly`,
+          );
+          return new Response(response.body, {
+            status: response.status,
+            headers: next,
+          });
+        }
         if (parsed.pathname === "/auth/callback") {
           const payload = Buffer.from(
             JSON.stringify({
@@ -777,9 +815,47 @@ describe("hosted acceptance harness", () => {
       );
       expect(recoveryCall?.cookie).toContain("sb-recovery=");
       expect(recoveryCall?.authorization).toBe("");
+      expect(
+        finished.results.find(
+          (row) => row.id === "recovery.previous_refresh_rejected",
+        ),
+      ).toMatchObject({ status: "pass", detail: "revoked" });
+      expect(
+        finished.results.find((row) => row.id === "recovery.session_replaced")
+          ?.status,
+      ).toBe("pass");
+      expect(
+        finished.results.find((row) => row.id === "refresh.platform")?.status,
+      ).toBe("pass");
+      expect(
+        finished.results.find((row) => row.id === "ui.tenant_a_page")?.status,
+      ).toBe("pass");
+      expect(
+        finished.results.find((row) => row.id === "ui.tenant_b_page")?.status,
+      ).toBe("pass");
+      const refreshes = seen
+        .filter((call) => call.url.includes("/auth/v1/token"))
+        .map((call) => call.refresh);
+      expect(refreshes[0]).toBe("refresh-confirmed");
+      expect(refreshes).toContain("refresh-replaced");
+      const passwordAt = seen.findIndex((call) =>
+        call.url.includes("/api/auth/password"),
+      );
+      const rejectedAt = seen.findIndex(
+        (call) => call.refresh === "refresh-confirmed",
+      );
+      const replacedLoginAt = seen.findIndex(
+        (call, index) =>
+          index > passwordAt && call.url.includes("/api/auth/login"),
+      );
+      expect(passwordAt).toBeGreaterThan(-1);
+      expect(rejectedAt).toBeGreaterThan(passwordAt);
+      expect(replacedLoginAt).toBeGreaterThan(rejectedAt);
       const text = formatAcceptanceReport(finished);
       expect(text).not.toContain("confirm-code-tenant-a");
       expect(text).not.toContain("recovery-code-tenant-a");
+      expect(text).not.toContain("refresh-confirmed");
+      expect(text).not.toContain("refresh-replaced");
       expect(text).not.toContain(verifier);
       expect(text).not.toContain("@weeveo.resend.app");
       expect(seen.some((call) => call.url.includes("api.resend.com"))).toBe(
@@ -1359,6 +1435,7 @@ describe("hosted acceptance harness", () => {
     );
     expect(mailModule).toContain("https://api.resend.com");
     expect(mailScript).not.toContain("session.json");
+    expect(mailScript).toContain('readMailResult(stateDir, "confirmation")');
     expect(mailScript).not.toContain("TUTOR_MBOS_APP_DATABASE_URL");
     expect(mailScript).not.toContain("SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY");
     expect(script).not.toContain("auth.users");

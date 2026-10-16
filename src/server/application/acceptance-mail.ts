@@ -24,11 +24,13 @@ export const RECEIVING_API_KEY_SECRET = "RESEND_DEVELOPMENT_RECEIVING_API_KEY";
  * That permission is account-wide: it can read every received message
  * on the team. `sending_access` cannot read receiving, and domain
  * restriction exists only for `sending_access`. Matching a recipient
- * here does not narrow the key. The secret name is design-only until
- * that scope and the isolated mail steps are reviewed.
+ * here does not narrow the key, and neither does the mail-step
+ * environment. Account-wide access is acceptable only because the
+ * Resend team is synthetic-only. The secret name is design-only until
+ * that scope and the isolated mail steps are reviewed. Do not create it.
  */
 export const RECEIVING_KEY_CAPABILITY =
-  "Resend full_access, account-wide. sending_access cannot call GET /emails/receiving. Domain restriction applies only to sending_access. No recipient or receiving-domain scope exists.";
+  "Resend full_access, account-wide, synthetic-only team. sending_access cannot call GET /emails/receiving. Domain restriction applies only to sending_access. Recipient filtering and the mail-step environment do not narrow the key. No recipient or receiving-domain scope exists.";
 
 export const RECEIVING_LIST_LIMIT = 20;
 export const RECEIVING_LIST_PAGE_CAP = 5;
@@ -36,6 +38,8 @@ export const RECEIVING_LIST_PAGE_CAP = 5;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CODE = /^[A-Za-z0-9_-]{8,512}$/;
 const URL_TEXT = /https:\/\/[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]+/g;
+/** Ampersand entities only. Other entities can change the host or scheme. */
+const AMPERSAND_ENTITY = /&(?:amp|#0*38|#x0*26);/gi;
 
 export type MailPurpose = "confirmation" | "recovery";
 
@@ -64,6 +68,8 @@ export interface MailReadResult {
   purpose: MailPurpose;
   status: MailReadStatus;
   httpStatus?: number;
+  /** Receiving ids already selected for this purpose. Recovery excludes them. */
+  messageIds?: readonly string[];
   actions: MailAction[];
 }
 
@@ -91,6 +97,8 @@ interface CollectInput {
   sleep?: (ms: number) => Promise<void>;
   attempts?: number;
   delayMs?: number;
+  /** Confirmation ids already consumed. They are not a second recovery match. */
+  excludeMessageIds?: readonly string[];
 }
 
 export function emailAddress(value: string): string | null {
@@ -154,9 +162,12 @@ export function matchListedRecipient(
   recipient: string,
   startedAt: string,
   nowMs: number,
+  excludeIds: readonly string[] = [],
 ): RecipientMatch {
+  const excluded = new Set(excludeIds);
   const inWindow = messages.filter(
     (message) =>
+      !excluded.has(message.id) &&
       exactRecipient(message.to, recipient) &&
       inReceivingWindow(message.createdAt, startedAt, nowMs),
   );
@@ -183,12 +194,16 @@ function allowedPath(purpose: MailPurpose): MailAction["path"] {
   return purpose === "confirmation" ? "/auth/callback" : "/auth/recovery";
 }
 
+function decodeAmpersandEntities(value: string): string {
+  return value.replace(AMPERSAND_ENTITY, "&");
+}
+
 export function selectVerifyLink(
   content: string,
   input: { supabaseOrigin: string; siteOrigin: string; purpose: MailPurpose },
 ): URL | null {
-  const found = content.match(URL_TEXT) ?? [];
-  const accepted: URL[] = [];
+  const found = decodeAmpersandEntities(content).match(URL_TEXT) ?? [];
+  const accepted = new Map<string, URL>();
   for (const raw of found) {
     const trimmed = raw.replace(/[),.;]+$/g, "");
     let url: URL;
@@ -198,10 +213,10 @@ export function selectVerifyLink(
       continue;
     }
     if (!verifyLinkAllowed(url, input)) continue;
-    accepted.push(url);
+    accepted.set(url.href, url);
   }
-  if (accepted.length !== 1) return null;
-  return accepted[0] ?? null;
+  if (accepted.size !== 1) return null;
+  return [...accepted.values()][0] ?? null;
 }
 
 function verifyLinkAllowed(
@@ -263,12 +278,14 @@ function result(
   status: MailReadStatus,
   actions: MailAction[] = [],
   httpStatus?: number,
+  messageIds: string[] = [],
 ): MailReadResult {
   return {
     version: 1,
     purpose,
     status,
     ...(httpStatus === undefined ? {} : { httpStatus }),
+    ...(messageIds.length > 0 ? { messageIds } : {}),
     actions,
   };
 }
@@ -379,6 +396,7 @@ async function listMatches(
   recipients: readonly MailRecipient[],
   startedAt: string,
   nowMs: number,
+  excludeIds: readonly string[],
 ): Promise<
   | { kind: "matches"; ids: { label: CleanupUserLabel; id: string }[] }
   | { kind: MailReadStatus; httpStatus?: number }
@@ -401,7 +419,13 @@ async function listMatches(
     if (!messages) return { kind: "receiving_http", httpStatus: reply.status };
     collected.push(...messages);
     const decisions = recipients.map((recipient) =>
-      matchListedRecipient(collected, recipient.email, startedAt, nowMs),
+      matchListedRecipient(
+        collected,
+        recipient.email,
+        startedAt,
+        nowMs,
+        excludeIds,
+      ),
     );
     if (decisions.some((decision) => decision.kind === "ambiguous")) {
       return { kind: "ambiguous" };
@@ -480,29 +504,41 @@ export async function collectReceivedActions(
       input.recipients,
       input.startedAt,
       input.nowMs,
+      input.excludeMessageIds ?? [],
     );
     if (listed.kind !== "matches") {
       last = result(purpose, listed.kind, [], listed.httpStatus);
       if (listed.kind === "not_received") continue;
       return last;
     }
+    const messageIds = listed.ids.map((match) => match.id);
     const actions: MailAction[] = [];
     for (const match of listed.ids) {
       const recipient = input.recipients.find(
         (row) => row.label === match.label,
       );
-      if (!recipient) return result(purpose, "body_mismatch");
+      if (!recipient) {
+        return result(purpose, "body_mismatch", [], undefined, messageIds);
+      }
       const url = new URL(
         `/emails/receiving/${match.id}`,
         RECEIVING_API_ORIGIN,
       );
       const reply = await resendGet(input.fetchImpl, input.apiKey, url);
-      if (reply === "unreachable")
-        return result(purpose, "receiving_unreachable");
-      if (reply === "redirected")
-        return result(purpose, "receiving_http", [], 302);
+      if (reply === "unreachable") {
+        return result(
+          purpose,
+          "receiving_unreachable",
+          [],
+          undefined,
+          messageIds,
+        );
+      }
+      if (reply === "redirected") {
+        return result(purpose, "receiving_http", [], 302, messageIds);
+      }
       if (reply.status !== 200) {
-        return result(purpose, "receiving_http", [], reply.status);
+        return result(purpose, "receiving_http", [], reply.status, messageIds);
       }
       const content = bodyStillMatches(
         reply.body,
@@ -510,23 +546,28 @@ export async function collectReceivedActions(
         input.startedAt,
         input.nowMs,
       );
-      if (!content) return result(purpose, "body_mismatch");
+      if (!content) {
+        return result(purpose, "body_mismatch", [], undefined, messageIds);
+      }
       const link = selectVerifyLink(`${content.text}\n${content.html}`, {
         supabaseOrigin: input.supabaseOrigin,
         siteOrigin: input.siteOrigin,
         purpose,
       });
-      if (!link) return result(purpose, "link_rejected");
+      if (!link) {
+        return result(purpose, "link_rejected", [], undefined, messageIds);
+      }
       const followed = await followVerify(input.fetchImpl, link, {
         supabaseOrigin: input.supabaseOrigin,
         siteOrigin: input.siteOrigin,
         purpose,
       });
-      if (followed === "verify_rejected")
-        return result(purpose, "verify_rejected");
+      if (followed === "verify_rejected") {
+        return result(purpose, "verify_rejected", [], undefined, messageIds);
+      }
       actions.push({ ...followed, label: match.label });
     }
-    return result(purpose, "ready", actions);
+    return result(purpose, "ready", actions, undefined, messageIds);
   }
   return last;
 }
