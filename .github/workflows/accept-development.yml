@@ -139,7 +139,6 @@ jobs:
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           SUPABASE_DEVELOPMENT_ACCESS_TOKEN: ${{ secrets.SUPABASE_DEVELOPMENT_ACCESS_TOKEN }}
-          TUTOR_MBOS_APP_DATABASE_URL: ${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}
         run: |
           if [ -z "$VERCEL_TOKEN" ]; then
             echo "::error::VERCEL_TOKEN is absent. Expected secret scope: GitHub environment development (Settings → Environments → development → Secrets)."
@@ -151,11 +150,12 @@ jobs:
           else
             echo "SUPABASE_DEVELOPMENT_ACCESS_TOKEN is present. Expected secret scope: GitHub environment development."
           fi
-          if [ -z "$TUTOR_MBOS_APP_DATABASE_URL" ]; then
-            echo "::error::TUTOR_MBOS_APP_DATABASE_URL is absent. Expected secret scope: GitHub environment development (Settings → Environments → development → Secrets). Purpose: development app_runtime connection for direct tenant reads and scoped business-row cleanup. Not the migration URL."
-          else
-            echo "TUTOR_MBOS_APP_DATABASE_URL is present. Expected secret scope: GitHub environment development."
-          fi
+      - name: Require business acceptance secrets
+        env:
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
+          TUTOR_MBOS_APP_DATABASE_URL: ${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}
+        run: node scripts/assert-business-acceptance-secrets.mjs
       - name: Check admin capability and mint run identity
         id: identity
         env:

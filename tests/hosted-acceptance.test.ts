@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
@@ -648,9 +649,22 @@ describe("hosted acceptance harness", () => {
     expect(text).toContain(
       "SUPABASE_DEVELOPMENT_ACCESS_TOKEN is absent. Expected secret scope: GitHub environment development",
     );
-    expect(text).toContain(
-      "TUTOR_MBOS_APP_DATABASE_URL is absent. Expected secret scope: GitHub environment development",
+    const businessSecrets = readFileSync(
+      "scripts/assert-business-acceptance-secrets.mjs",
+      "utf8",
     );
+    expect(businessSecrets).toContain("TUTOR_MBOS_APP_DATABASE_URL");
+    expect(businessSecrets).toContain(
+      "Expected secret scope: GitHub environment development (Settings → Environments → development → Secrets). Purpose: development app_runtime connection for direct tenant reads and scoped business-row cleanup. Not the migration URL.",
+    );
+    expect(businessSecrets).toContain("VERCEL_AUTOMATION_BYPASS_SECRET");
+    expect(businessSecrets).toContain("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY");
+    expect(businessSecrets).toContain(
+      "The business job sends it as x-vercel-protection-bypass and does not receive VERCEL_TOKEN.",
+    );
+    expect(businessSecrets).not.toContain("GITHUB_OUTPUT");
+    expect(businessSecrets).not.toContain(".trim(");
+    expect(businessSecrets).not.toContain("console.log(process.env");
     expect(text).toContain(
       "github.event_name == 'workflow_dispatch' && 'development-delivery'",
     );
@@ -668,6 +682,7 @@ describe("hosted acceptance harness", () => {
       "SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY is absent. Expected secret scope: GitHub environment development",
     );
     const parsed = parse(text) as {
+      env?: Record<string, string>;
       permissions?: Record<string, string>;
       concurrency?: { group?: string };
       jobs: Record<
@@ -813,6 +828,83 @@ describe("hosted acceptance harness", () => {
     );
     expect(identityAt).toBeGreaterThan(-1);
     expect(pullAt).toBeGreaterThan(identityAt);
+    const presence = preflight.steps.find((step) =>
+      step.run?.includes("assert-business-acceptance-secrets.mjs"),
+    );
+    expect(presence?.run).toBe(
+      "node scripts/assert-business-acceptance-secrets.mjs",
+    );
+    expect(presence?.run).not.toContain("${{");
+    expect(presence?.id).toBeUndefined();
+    expect(presence?.["continue-on-error"] ?? false).toBe(false);
+    expect(presence?.env).toEqual({
+      VERCEL_AUTOMATION_BYPASS_SECRET:
+        "${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}",
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:
+        "${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}",
+      TUTOR_MBOS_APP_DATABASE_URL: "${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}",
+    });
+    expect(preflight.steps.indexOf(presence!)).toBeLessThan(identityAt);
+    const inheritedNames = [
+      "VERCEL_AUTOMATION_BYPASS_SECRET",
+      "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
+      "TUTOR_MBOS_APP_DATABASE_URL",
+      "VERCEL_TOKEN",
+    ];
+    for (const name of inheritedNames) {
+      expect(parsed.env ?? {}).not.toHaveProperty(name);
+      expect(preflight.env ?? {}).not.toHaveProperty(name);
+      expect(accept.env ?? {}).not.toHaveProperty(name);
+    }
+    expect(preflight.env).toEqual({
+      DEPLOY_ENVIRONMENT: "development",
+      TUTOR_MBOS_ACCEPTANCE: "development",
+      VERCEL_ORG_ID: "team_2QehRm248FPmHJTzKS0rvS6b",
+      VERCEL_PROJECT_ID: "prj_ysIJHdIKYk2MQwvOKermUvIMuGVa",
+      VERCEL_CLI_VERSION: "63.1.2",
+      VERCEL_TELEMETRY_DISABLED: "1",
+    });
+    expect(accept.env).toEqual({
+      TUTOR_MBOS_ACCEPTANCE: "development",
+      ACCEPTANCE_RUN_NONCE: "${{ needs.preflight.outputs.nonce }}",
+      ACCEPTANCE_STARTED_AT: "${{ needs.preflight.outputs.started_at }}",
+      ACCEPTANCE_PREFLIGHT_CASES: "${{ needs.preflight.outputs.cases }}",
+    });
+    const businessSecretNames = [
+      "VERCEL_AUTOMATION_BYPASS_SECRET",
+      "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
+      "TUTOR_MBOS_APP_DATABASE_URL",
+    ];
+    for (const step of preflight.steps) {
+      if (step === presence) continue;
+      for (const name of businessSecretNames) {
+        expect(step.env ?? {}).not.toHaveProperty(name);
+      }
+    }
+    expect(preflight.steps[identityAt]?.env).toEqual({
+      SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY:
+        "${{ secrets.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY }}",
+      SUPABASE_DEVELOPMENT_ACCESS_TOKEN:
+        "${{ secrets.SUPABASE_DEVELOPMENT_ACCESS_TOKEN }}",
+    });
+    const pull = preflight.steps[pullAt]!;
+    expect(pull.env).toEqual({
+      VERCEL_TOKEN: "${{ secrets.VERCEL_TOKEN }}",
+    });
+    expect(JSON.stringify(preflight.outputs)).not.toContain(
+      "VERCEL_AUTOMATION_BYPASS_SECRET",
+    );
+    expect(JSON.stringify(preflight.outputs)).not.toContain(
+      "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
+    );
+    expect(JSON.stringify(preflight.outputs)).not.toContain(
+      "TUTOR_MBOS_APP_DATABASE_URL",
+    );
+    expect(Object.keys(preflight.outputs ?? {}).sort()).toEqual([
+      "cases",
+      "nonce",
+      "started_at",
+    ]);
     expect(preflight.steps[identityAt]?.id).toBe("identity");
     expect(preflight.outputs?.nonce).toBe(
       "${{ steps.identity.outputs.nonce }}",
@@ -861,6 +953,17 @@ describe("hosted acceptance harness", () => {
       NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:
         "${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}",
     });
+    for (const step of accept.steps) {
+      if (step === acceptRun) continue;
+      for (const name of [
+        "VERCEL_AUTOMATION_BYPASS_SECRET",
+        "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
+        "TUTOR_MBOS_APP_DATABASE_URL",
+        "VERCEL_TOKEN",
+      ]) {
+        expect(step.env ?? {}).not.toHaveProperty(name);
+      }
+    }
     expect(accept.env?.ACCEPTANCE_RUN_NONCE).toBe(
       "${{ needs.preflight.outputs.nonce }}",
     );
@@ -936,6 +1039,82 @@ describe("hosted acceptance harness", () => {
     expect(script).not.toContain(".vercel/.env.production.local");
     expect(script).not.toMatch(/method:\s*"PATCH"/);
     expect(script).not.toMatch(/method:\s*"DELETE"/);
+  });
+
+  it("reports every missing business secret name and prints no value", () => {
+    const script = "scripts/assert-business-acceptance-secrets.mjs";
+    const run = (env: Record<string, string>) =>
+      spawnSync(process.execPath, [script], {
+        env: {
+          PATH: process.env.PATH ?? "",
+          NODE_ENV: "test",
+          ...env,
+        } as unknown as NodeJS.ProcessEnv,
+        encoding: "utf8",
+      });
+    const bypass = "synthetic-bypass-value";
+    const publishable = "synthetic-publishable-value";
+    const database = "synthetic-database-value";
+    const absent = run({});
+    expect(absent.status).toBe(1);
+    const absentText = `${absent.stdout}${absent.stderr}`;
+    expect(absentText).toContain("VERCEL_AUTOMATION_BYPASS_SECRET is absent.");
+    expect(absentText).toContain(
+      "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY is absent.",
+    );
+    expect(absentText).toContain("TUTOR_MBOS_APP_DATABASE_URL is absent.");
+    expect(absentText).toContain(
+      "stops before the admin capability check until each absent business secret above is present",
+    );
+    const one = run({
+      VERCEL_AUTOMATION_BYPASS_SECRET: bypass,
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: publishable,
+      TUTOR_MBOS_APP_DATABASE_URL: "",
+    });
+    expect(one.status).toBe(1);
+    const oneText = `${one.stdout}${one.stderr}`;
+    expect(oneText).toContain(
+      "VERCEL_AUTOMATION_BYPASS_SECRET is present. Expected secret scope: GitHub environment development.",
+    );
+    expect(oneText).toContain(
+      "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY is present. Expected secret scope: GitHub environment development.",
+    );
+    expect(oneText).toContain("TUTOR_MBOS_APP_DATABASE_URL is absent.");
+    expect(oneText).not.toContain("VERCEL_AUTOMATION_BYPASS_SECRET is absent.");
+    expect(oneText).not.toContain(bypass);
+    expect(oneText).not.toContain(publishable);
+    const ready = run({
+      VERCEL_AUTOMATION_BYPASS_SECRET: bypass,
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: publishable,
+      TUTOR_MBOS_APP_DATABASE_URL: database,
+    });
+    expect(ready.status).toBe(0);
+    const readyText = `${ready.stdout}${ready.stderr}`;
+    expect(readyText).toContain("VERCEL_AUTOMATION_BYPASS_SECRET is present.");
+    expect(readyText).toContain(
+      "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY is present.",
+    );
+    expect(readyText).toContain("TUTOR_MBOS_APP_DATABASE_URL is present.");
+    expect(readyText).not.toContain(bypass);
+    expect(readyText).not.toContain(publishable);
+    expect(readyText).not.toContain(database);
+    expect(ready.stderr).toBe("");
+    const whitespace = " \n\t ";
+    const untrimmed = run({
+      VERCEL_AUTOMATION_BYPASS_SECRET: whitespace,
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: whitespace,
+      TUTOR_MBOS_APP_DATABASE_URL: whitespace,
+    });
+    expect(untrimmed.status).toBe(0);
+    const untrimmedText = `${untrimmed.stdout}${untrimmed.stderr}`;
+    expect(untrimmedText).toContain(
+      "VERCEL_AUTOMATION_BYPASS_SECRET is present.",
+    );
+    expect(untrimmedText).toContain(
+      "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY is present.",
+    );
+    expect(untrimmedText).toContain("TUTOR_MBOS_APP_DATABASE_URL is present.");
+    expect(untrimmedText).not.toContain("is absent");
   });
 
   it("exports a bounded manifest when the business run fails before signup", async () => {
