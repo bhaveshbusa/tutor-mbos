@@ -1028,6 +1028,37 @@ describe("acceptance comment authorization", () => {
           acceptance: acceptance([
             emptyManifestFailure({
               jobs: [
+                job(AUTHORIZE_JOB_NAME, "completed", "success"),
+                job(ACCEPT_JOB_NAME, "completed", "failure"),
+              ],
+            }),
+          ]),
+        },
+      ),
+    ).toEqual({ ok: false, reason: "duplicate_request" });
+    expect(
+      review(
+        { runId: "200" },
+        {
+          acceptance: acceptance([
+            emptyManifestFailure({
+              jobs: [
+                job(AUTHORIZE_JOB_NAME, "completed", "success"),
+                job(ACCEPT_JOB_NAME, "completed", "failure"),
+                job(CLEANUP_JOB_NAME, "completed", "success", [], true),
+              ],
+            }),
+          ]),
+        },
+      ),
+    ).toEqual({ ok: false, reason: "duplicate_request" });
+    expect(
+      review(
+        { runId: "200" },
+        {
+          acceptance: acceptance([
+            emptyManifestFailure({
+              jobs: [
                 job(AUTHORIZE_JOB_NAME, "completed", "skipped"),
                 job(AUTHORIZE_JOB_NAME, "completed", "success"),
                 job(ACCEPT_JOB_NAME, "completed", "failure"),

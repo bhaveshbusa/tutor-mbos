@@ -119,6 +119,25 @@ export async function runAcceptanceCleanup(input: {
     users.deleted === loaded.manifest.users.length &&
     clients.deleted === loaded.manifest.clients.length &&
     failures.length === 0;
+  if (
+    pass &&
+    loaded.manifest.users.length === 0 &&
+    loaded.manifest.clients.length === 0
+  ) {
+    const recovered = await recoverByNonce(context);
+    const absent =
+      recovered.usersDeleted === 0 &&
+      recovered.clientsDeleted === 0 &&
+      recovered.notes.length === 0;
+    if (!absent) {
+      return {
+        status: "fail",
+        usersDeleted: recovered.usersDeleted,
+        clientsDeleted: recovered.clientsDeleted,
+        detail: joinDetail("empty_manifest_not_absent", recovered),
+      };
+    }
+  }
   return {
     status: pass ? "pass" : "fail",
     usersDeleted: users.deleted,
@@ -464,7 +483,10 @@ async function adminRequest(
   }
 }
 
-/** True only when cleanup verified a manifest with no users and no clients. */
+/**
+ * True only after an empty manifest's nonce lookups all returned not_found.
+ * Zero deletions without those lookups are not proof.
+ */
 export function emptyHostedResources(result: CleanupExecution): boolean {
   return (
     result.status === "pass" &&

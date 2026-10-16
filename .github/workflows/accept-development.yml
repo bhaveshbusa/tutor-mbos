@@ -12,8 +12,9 @@ name: Accept development
 # and do not enter that queue. A recover-development comment from that actor
 # on attempt 1 uses the same delivery queue. A later accept-development
 # comment is allowed only when every earlier authorized comment run failed
-# in the business job and cleanup proved the manifest listed no Auth users
-# and no OAuth clients. Recover stays denied once that job has started.
+# in the business job and cleanup proved both synthetic emails and the three
+# client names are absent for that nonce. An empty manifest is not proof.
+# Recover stays denied once that job has started.
 # Neither cancels the other. A comment run is
 # authorized only on attempt 1. workflow_dispatch is the manual path and is
 # not rejected for a later attempt. Coding CI stays secretless.

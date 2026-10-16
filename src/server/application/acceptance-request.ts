@@ -314,9 +314,10 @@ function dispatchAccepted(
 
 /**
  * A finished comment run may be followed by a new accept command when the
- * business job failed and cleanup proved the manifest listed no Auth users
- * and no OAuth clients. A recorded user or client stays ineligible after
- * deletion. Recover is unchanged and stays denied once accept has started.
+ * business job failed and cleanup proved both synthetic emails and the three
+ * client names are absent for that nonce. An empty manifest is not that
+ * proof. A recorded user or client stays ineligible after deletion. Recover
+ * is unchanged and stays denied once accept has started.
  */
 function finishedWithoutHostedResources(run: AcceptanceRunSnapshot): boolean {
   if (!run.jobsComplete) return false;

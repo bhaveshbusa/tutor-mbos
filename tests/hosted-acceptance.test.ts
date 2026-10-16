@@ -1176,6 +1176,45 @@ describe("hosted acceptance harness", () => {
     expect(untrimmedText).not.toContain("is absent");
   });
 
+  it("publishes an empty manifest when signup throws after the user is committed", async () => {
+    const doubled = developmentDouble();
+    const bodies: string[] = [];
+    const fetchImpl: typeof fetch = async (requestInput, init) => {
+      const url = new URL(
+        typeof requestInput === "string"
+          ? requestInput
+          : requestInput.toString(),
+      );
+      if (url.pathname === "/auth/v1/signup") {
+        await doubled.fetchImpl(requestInput, init);
+        throw new TypeError("fetch failed");
+      }
+      return doubled.fetchImpl(requestInput, init);
+    };
+    const report = await runHostedAcceptance(
+      input(fetchImpl, {
+        writeManifest: (body) => {
+          bodies.push(body);
+        },
+      }),
+    );
+    expect(
+      report.results.find((row) => row.id === "runner.exception")?.detail,
+    ).toBe("TypeError");
+    expect(
+      report.results.find((row) => row.id === "cleanup.manifest")?.detail,
+    ).toBe("no_hosted_users");
+    const last = bodies.at(-1);
+    expect(last).toBeDefined();
+    const parsed = JSON.parse(last ?? "{}") as {
+      users: unknown[];
+      clients: unknown[];
+    };
+    expect(parsed.users).toEqual([]);
+    expect(parsed.clients).toEqual([]);
+    expect(last).not.toContain("@example.com");
+  });
+
   it("exports a bounded manifest when the business run fails before signup", async () => {
     const bodies: string[] = [];
     const doubled = developmentDouble({ healthStatus: 503 });
