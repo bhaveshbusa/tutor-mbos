@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -6,7 +5,6 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
-  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,14 +16,17 @@ import {
   adminRequestHeaders,
   expectedCleanupEmail,
   expectedClientName,
+  MANIFEST_MAX_BYTES,
+  MANIFEST_OUTPUT_NAME,
   reviewCleanupManifest,
   writeManifestAtomic,
+  writeManifestOutput,
   type CleanupIdentity,
   type CleanupManifest,
 } from "@/server/application/acceptance-cleanup";
 import {
   formatCleanupExecution,
-  readCleanupManifestFile,
+  readCleanupManifestText,
   runAcceptanceCleanup,
   withManifestReadDetail,
 } from "../scripts/hosted-acceptance-cleanup.ts";
@@ -432,6 +433,49 @@ describe("auth admin cleanup execution", () => {
       ),
     ).toBe(true);
   });
+
+  it("accepts a regular manifest job output and deletes only the verified ids", async () => {
+    const doubled = adminDouble();
+    const read = readCleanupManifestText(JSON.stringify(manifest()));
+    expect(read).toEqual({ ok: true, text: JSON.stringify(manifest()) });
+    const result = await run(read.ok ? read.text : null, doubled);
+    expect(result.status).toBe("pass");
+    expect(result.detail).toBe("verified_run_resources_removed");
+    expect(formatCleanupExecution(result)).not.toContain(secretKey);
+  });
+
+  it("fails closed when the job output is absent", async () => {
+    expect(readCleanupManifestText(undefined)).toEqual({
+      ok: false,
+      reason: "manifest_absent",
+    });
+    expect(readCleanupManifestText("")).toEqual({
+      ok: false,
+      reason: "manifest_absent",
+    });
+    const doubled = adminDouble();
+    const missing = await run(null, doubled);
+    expect(missing.status).toBe("fail");
+    expect(missing.detail.startsWith("manifest_absent")).toBe(true);
+    expect(doubled.calls.some((call) => call.startsWith("DELETE"))).toBe(false);
+  });
+
+  it("rejects a foreign run identity from the job output and does not delete that id", async () => {
+    const doubled = adminDouble();
+    const text = JSON.stringify(
+      manifest({
+        runId: "9999",
+        users: [{ label: "tenant-a", id: victim }],
+      }),
+    );
+    const read = readCleanupManifestText(text);
+    expect(read.ok).toBe(true);
+    const result = await run(read.ok ? read.text : null, doubled);
+    expect(result.status).toBe("fail");
+    expect(result.detail.startsWith("manifest_run")).toBe(true);
+    expect(doubled.calls.some((call) => call.includes(victim))).toBe(false);
+    expect(doubled.calls.some((call) => call.startsWith("DELETE"))).toBe(false);
+  });
 });
 
 describe("admin capability preflight", () => {
@@ -513,69 +557,143 @@ describe("admin capability preflight", () => {
   });
 });
 
-describe("cleanup manifest file boundary", () => {
-  const filename = "acceptance-cleanup-manifest.json";
-  const plantedSentinel = "PLANTED_PACKAGE_SCRIPT";
+function parseGithubOutput(content: string): Map<string, string> {
+  const lines = content.split("\n");
+  const values = new Map<string, string>();
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    const marker = /^(.*?)<<(.*)$/.exec(line);
+    if (!marker) {
+      const eq = line.indexOf("=");
+      if (eq > 0) values.set(line.slice(0, eq), line.slice(eq + 1));
+      continue;
+    }
+    const name = marker[1] ?? "";
+    const delimiter = marker[2] ?? "";
+    const collected: string[] = [];
+    index += 1;
+    while (index < lines.length && lines[index] !== delimiter) {
+      collected.push(lines[index] ?? "");
+      index += 1;
+    }
+    values.set(name, collected.join("\n"));
+  }
+  return values;
+}
+
+describe("cleanup manifest job output", () => {
+  const trustedPackage =
+    '{"name":"trusted","scripts":{"accept:development:cleanup":"tsx scripts/hosted-acceptance-cleanup.ts"}}\n';
+  const trustedScript = "export const trusted = true;\n";
   const dummyKey = "sb_secret_ci";
 
-  function layout(): { root: string; checkout: string; data: string } {
-    const root = mkdtempSync(join(tmpdir(), "acceptance-manifest-"));
+  function trustedCheckout(): { root: string; checkout: string } {
+    const root = mkdtempSync(join(tmpdir(), "acceptance-output-"));
     const checkout = join(root, "checkout");
-    const data = join(root, "acceptance-cleanup-data");
     mkdirSync(join(checkout, "scripts"), { recursive: true });
-    mkdirSync(data, { recursive: true });
-    writeFileSync(join(checkout, "package.json"), '{"name":"trusted"}\n');
+    writeFileSync(join(checkout, "package.json"), trustedPackage);
     writeFileSync(
       join(checkout, "scripts", "hosted-acceptance-cleanup.ts"),
-      "export const trusted = true;\n",
+      trustedScript,
     );
-    return { root, checkout, data };
+    return { root, checkout };
   }
 
-  function plantedScript(marker: string): string {
-    return [
-      plantedSentinel,
-      "import { writeFileSync } from 'node:fs';",
-      `writeFileSync(${JSON.stringify(marker)}, process.env.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY ?? "");`,
-    ].join("\n");
-  }
+  it("serializes one manifest output without a shell, including newlines", () => {
+    const dir = mkdtempSync(join(tmpdir(), "acceptance-output-file-"));
+    const output = join(dir, "github-output");
+    writeFileSync(output, "");
+    const body = `${JSON.stringify(manifest())}\nother=injected\n$(id)\n`;
+    try {
+      writeManifestOutput(body, output);
+      const parsed = parseGithubOutput(readFileSync(output, "utf8"));
+      expect([...parsed.keys()]).toEqual([MANIFEST_OUTPUT_NAME]);
+      expect(parsed.get(MANIFEST_OUTPUT_NAME)).toBe(body);
+      expect(readFileSync(output, "utf8")).toContain(
+        `${MANIFEST_OUTPUT_NAME}<<`,
+      );
+      expect(readFileSync(output, "utf8")).not.toContain("::add-mask::");
+      expect(body).not.toContain("@example.com");
+      expect(body).not.toContain(nonce);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
-  it("rejects a directory artifact and leaves the trusted checkout unexecuted", async () => {
-    const { root, checkout, data } = layout();
+  it("refuses to skip the output file inside Actions", () => {
+    const previous = process.env.GITHUB_ACTIONS;
+    process.env.GITHUB_ACTIONS = "true";
+    try {
+      expect(() => writeManifestOutput("{}", undefined)).toThrow(
+        /manifest_output_absent/,
+      );
+    } finally {
+      if (previous === undefined) delete process.env.GITHUB_ACTIONS;
+      else process.env.GITHUB_ACTIONS = previous;
+    }
+  });
+
+  it("does not write an oversized manifest output", () => {
+    const dir = mkdtempSync(join(tmpdir(), "acceptance-output-size-"));
+    const output = join(dir, "github-output");
+    writeFileSync(output, "");
+    try {
+      expect(() => writeManifestOutput("x".repeat(4097), output)).toThrow(
+        /manifest_oversize/,
+      );
+      expect(readFileSync(output, "utf8")).toBe("");
+      expect(MANIFEST_MAX_BYTES).toBe(4096);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an oversized job output before parsing or returning it", async () => {
+    const body = `OVERSIZE-SENTINEL${"x".repeat(MANIFEST_MAX_BYTES)}`;
+    const read = readCleanupManifestText(body);
+    expect(read).toEqual({ ok: false, reason: "manifest_oversize" });
+    expect(JSON.stringify(read)).not.toContain("OVERSIZE-SENTINEL");
+    const doubled = {
+      calls: [] as string[],
+    };
+    const execution = await runAcceptanceCleanup({
+      manifestText: null,
+      adminKey: dummyKey,
+      identity,
+      supabaseUrl: "https://example.test",
+      fetchImpl: async (input, init) => {
+        const url = typeof input === "string" ? input : input.toString();
+        doubled.calls.push(`${init?.method ?? "GET"} ${url}`);
+        return Response.json({ users: [], clients: [] });
+      },
+      nowMs,
+    });
+    const reported = withManifestReadDetail(read, execution);
+    const text = formatCleanupExecution(reported);
+    expect(reported.status).toBe("fail");
+    expect(text).toContain("manifest_oversize");
+    expect(text).not.toContain("OVERSIZE-SENTINEL");
+    expect(text).not.toContain(dummyKey);
+  });
+
+  it("does not execute a multiline injection payload or change the trusted checkout", async () => {
+    const { root, checkout } = trustedCheckout();
     const marker = join(root, "planted-ran");
     const previous = process.env.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY;
     process.env.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY = dummyKey;
+    const payload = [
+      '{"version":1',
+      "package.json",
+      `require("fs").writeFileSync(${JSON.stringify(marker)}, process.env.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY)`,
+      "$(node -e 'process.exit(1)')",
+      "manifest<<EOF",
+      "rm -rf .",
+    ].join("\n");
     try {
-      writeFileSync(
-        join(data, "package.json"),
-        `{"name":"${plantedSentinel}"}\n`,
-      );
-      mkdirSync(join(data, "scripts"), { recursive: true });
-      writeFileSync(
-        join(data, "scripts", "hosted-acceptance-cleanup.ts"),
-        plantedScript(marker),
-      );
-      mkdirSync(join(data, filename));
-      writeFileSync(
-        join(data, filename, "package.json"),
-        plantedScript(marker),
-      );
-      const read = readCleanupManifestFile(join(data, filename), {
-        workspace: checkout,
-      });
-      expect(read).toEqual({ ok: false, reason: "manifest_directory" });
-      expect(JSON.stringify(read)).not.toContain(plantedSentinel);
-      expect(readFileSync(join(checkout, "package.json"), "utf8")).toBe(
-        '{"name":"trusted"}\n',
-      );
-      expect(
-        readFileSync(
-          join(checkout, "scripts", "hosted-acceptance-cleanup.ts"),
-          "utf8",
-        ),
-      ).toBe("export const trusted = true;\n");
+      const read = readCleanupManifestText(payload);
+      expect(read.ok).toBe(true);
       const execution = await runAcceptanceCleanup({
-        manifestText: null,
+        manifestText: read.ok ? read.text : null,
         adminKey: dummyKey,
         identity,
         supabaseUrl: "https://example.test",
@@ -585,127 +703,25 @@ describe("cleanup manifest file boundary", () => {
       const reported = withManifestReadDetail(read, execution);
       const text = formatCleanupExecution(reported);
       expect(reported.status).toBe("fail");
-      expect(text).toContain("manifest_directory");
+      expect(reported.detail.startsWith("manifest_invalid")).toBe(true);
       expect(text).not.toContain(dummyKey);
-      expect(text).not.toContain(plantedSentinel);
+      expect(text).not.toContain("package.json");
       expect(existsSync(marker)).toBe(false);
+      expect(readFileSync(join(checkout, "package.json"), "utf8")).toBe(
+        trustedPackage,
+      );
+      expect(
+        readFileSync(
+          join(checkout, "scripts", "hosted-acceptance-cleanup.ts"),
+          "utf8",
+        ),
+      ).toBe(trustedScript);
     } finally {
       if (previous === undefined) {
         delete process.env.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY;
       } else {
         process.env.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY = previous;
       }
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("rejects a symlink manifest without returning the target body", () => {
-    const { root, checkout, data } = layout();
-    try {
-      const target = join(root, "secret-target.json");
-      const body = "SYMLINK-TARGET-BODY";
-      writeFileSync(target, body);
-      symlinkSync(target, join(data, filename));
-      const read = readCleanupManifestFile(join(data, filename), {
-        workspace: checkout,
-      });
-      expect(read).toEqual({ ok: false, reason: "manifest_symlink" });
-      expect(JSON.stringify(read)).not.toContain(body);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("rejects a symlink parent without following it into the checkout", () => {
-    const { root, checkout } = layout();
-    try {
-      const body = "SYMLINK-PARENT-BODY";
-      writeFileSync(join(checkout, filename), body);
-      const linked = join(root, "linked-checkout");
-      symlinkSync(checkout, linked);
-      const read = readCleanupManifestFile(join(linked, filename), {
-        workspace: checkout,
-      });
-      expect(read).toEqual({ ok: false, reason: "manifest_symlink" });
-      expect(JSON.stringify(read)).not.toContain(body);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("rejects an oversized manifest before returning its bytes", () => {
-    const { root, checkout, data } = layout();
-    try {
-      const body = `OVERSIZE-SENTINEL${"x".repeat(4096)}`;
-      writeFileSync(join(data, filename), body);
-      const read = readCleanupManifestFile(join(data, filename), {
-        workspace: checkout,
-      });
-      expect(read).toEqual({ ok: false, reason: "manifest_oversize" });
-      expect(JSON.stringify(read)).not.toContain("OVERSIZE-SENTINEL");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("rejects a fifo without opening it for execution", () => {
-    const { root, checkout, data } = layout();
-    try {
-      execFileSync("mkfifo", [join(data, filename)]);
-      const read = readCleanupManifestFile(join(data, filename), {
-        workspace: checkout,
-      });
-      expect(read).toEqual({ ok: false, reason: "manifest_not_regular" });
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("reads one regular manifest and ignores other artifact files", () => {
-    const { root, checkout, data } = layout();
-    const marker = join(root, "planted-ran");
-    try {
-      const body = '{"version":1}\n';
-      writeFileSync(join(data, filename), body);
-      writeFileSync(join(data, "package.json"), plantedScript(marker));
-      mkdirSync(join(data, "scripts"), { recursive: true });
-      writeFileSync(
-        join(data, "scripts", "hosted-acceptance-cleanup.ts"),
-        plantedScript(marker),
-      );
-      const read = readCleanupManifestFile(join(data, filename), {
-        workspace: checkout,
-      });
-      expect(read).toEqual({ ok: true, text: body });
-      expect(read.ok ? read.text : "").not.toContain(plantedSentinel);
-      expect(existsSync(marker)).toBe(false);
-      expect(readFileSync(join(checkout, "package.json"), "utf8")).toBe(
-        '{"name":"trusted"}\n',
-      );
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("rejects a regular manifest stored inside the checkout", () => {
-    const { root, checkout } = layout();
-    try {
-      const body = "CHECKOUT-MANIFEST-BODY";
-      writeFileSync(join(checkout, filename), body);
-      const read = readCleanupManifestFile(join(checkout, filename), {
-        workspace: checkout,
-      });
-      expect(read).toEqual({ ok: false, reason: "manifest_inside_checkout" });
-      expect(JSON.stringify(read)).not.toContain(body);
-      expect(
-        readCleanupManifestFile(filename, { workspace: checkout }),
-      ).toEqual({ ok: false, reason: "manifest_path" });
-      expect(
-        readCleanupManifestFile(join(root, "package.json"), {
-          workspace: checkout,
-        }),
-      ).toEqual({ ok: false, reason: "manifest_path" });
-    } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });

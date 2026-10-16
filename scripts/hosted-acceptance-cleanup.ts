@@ -4,36 +4,20 @@
  * the lockfile, and receives the admin key plus the run identity minted
  * by the preflight job. It does not receive the app database URL, the
  * Management API token, or the business job's workspace. The manifest is
- * untrusted data. The workflow extracts it under runner.temp, outside
- * this checkout. This process opens only that one manifest file. It does
- * not import, resolve, or execute anything else from the extract. Ids are
- * deleted only after GET confirms the email or client name derived from
- * the trusted nonce, the redirect, and a created_at inside this run's
- * window.
+ * untrusted data passed as one job output. This process reads that
+ * string from the environment. It does not download an archive, and it
+ * does not import, resolve, or execute anything from the business job.
+ * Ids are deleted only after GET confirms the email or client name
+ * derived from the trusted nonce, the redirect, and a created_at inside
+ * this run's window.
  */
-import {
-  closeSync,
-  constants,
-  fstatSync,
-  lstatSync,
-  openSync,
-  readSync,
-  realpathSync,
-} from "node:fs";
-import {
-  basename,
-  dirname,
-  isAbsolute,
-  relative,
-  resolve,
-  sep,
-} from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   AUTH_ADMIN_KEY_SECRET,
   CLEANUP_CLIENT_LABELS,
   CLEANUP_REDIRECT_URI,
   CLEANUP_USER_LABELS,
+  MANIFEST_MAX_BYTES,
   adminRequestHeaders,
   createdAtInRunWindow,
   expectedCleanupEmail,
@@ -51,19 +35,9 @@ import {
   supabaseUrlFor,
 } from "../src/server/config/environments.ts";
 
-const MANIFEST_FILE_NAME = "acceptance-cleanup-manifest.json";
-const MANIFEST_MAX_BYTES = 4096;
 const REQUEST_TIMEOUT_MS = 15_000;
 
-export type CleanupManifestReadReason =
-  | "manifest_absent"
-  | "manifest_symlink"
-  | "manifest_directory"
-  | "manifest_not_regular"
-  | "manifest_oversize"
-  | "manifest_inside_checkout"
-  | "manifest_path"
-  | "manifest_unreadable";
+export type CleanupManifestReadReason = "manifest_absent" | "manifest_oversize";
 
 export type CleanupManifestRead =
   { ok: true; text: string } | { ok: false; reason: CleanupManifestReadReason };
@@ -154,123 +128,21 @@ export async function runAcceptanceCleanup(input: {
   };
 }
 
-function containedBy(root: string, candidate: string): boolean {
-  const fromRoot = relative(resolve(root), resolve(candidate));
-  return (
-    fromRoot === "" ||
-    (fromRoot !== ".." &&
-      !fromRoot.startsWith(`..${sep}`) &&
-      !isAbsolute(fromRoot))
-  );
-}
-
-function errorCode(error: unknown): string | null {
-  if (error && typeof error === "object" && "code" in error) {
-    const code = error.code;
-    return typeof code === "string" ? code : null;
-  }
-  return null;
-}
-
 /**
- * Open one explicit manifest path from the untrusted extract. The final
- * component is opened with O_NOFOLLOW and checked with fstat on that
- * descriptor before any byte is read. Symlinks, directories, and other
- * non-regular files are rejected. The size cap is applied before the read.
+ * Accept one untrusted job-output string. Missing and oversized values are
+ * rejected before JSON parsing. Schema and run binding stay in
+ * reviewCleanupManifest.
  */
-export function readCleanupManifestFile(
-  filePath: string | undefined,
-  options: { workspace: string },
+export function readCleanupManifestText(
+  value: string | undefined,
 ): CleanupManifestRead {
-  if (!filePath || !isAbsolute(filePath)) {
-    return { ok: false, reason: "manifest_path" };
+  if (value === undefined || value.length === 0) {
+    return { ok: false, reason: "manifest_absent" };
   }
-  const resolved = resolve(filePath);
-  if (basename(resolved) !== MANIFEST_FILE_NAME) {
-    return { ok: false, reason: "manifest_path" };
+  if (Buffer.byteLength(value, "utf8") > MANIFEST_MAX_BYTES) {
+    return { ok: false, reason: "manifest_oversize" };
   }
-  const workspace = resolve(options.workspace);
-  if (containedBy(workspace, resolved)) {
-    return { ok: false, reason: "manifest_inside_checkout" };
-  }
-  const parent = dirname(resolved);
-  let parentStat;
-  try {
-    parentStat = lstatSync(parent);
-  } catch (error) {
-    return errorCode(error) === "ENOENT"
-      ? { ok: false, reason: "manifest_absent" }
-      : { ok: false, reason: "manifest_unreadable" };
-  }
-  if (parentStat.isSymbolicLink()) {
-    return { ok: false, reason: "manifest_symlink" };
-  }
-  if (!parentStat.isDirectory()) {
-    return { ok: false, reason: "manifest_path" };
-  }
-  let parentReal: string;
-  try {
-    parentReal = realpathSync(parent);
-  } catch {
-    return { ok: false, reason: "manifest_unreadable" };
-  }
-  let workspaceReal = workspace;
-  try {
-    workspaceReal = realpathSync(workspace);
-  } catch {
-    workspaceReal = workspace;
-  }
-  if (
-    containedBy(workspaceReal, parentReal) ||
-    containedBy(workspace, parentReal)
-  ) {
-    return { ok: false, reason: "manifest_inside_checkout" };
-  }
-
-  let listed;
-  try {
-    listed = lstatSync(resolved);
-  } catch (error) {
-    return errorCode(error) === "ENOENT"
-      ? { ok: false, reason: "manifest_absent" }
-      : { ok: false, reason: "manifest_unreadable" };
-  }
-  if (listed.isSymbolicLink()) return { ok: false, reason: "manifest_symlink" };
-  if (listed.isDirectory()) return { ok: false, reason: "manifest_directory" };
-  if (!listed.isFile()) return { ok: false, reason: "manifest_not_regular" };
-
-  let fd: number | null = null;
-  try {
-    if (!constants.O_NOFOLLOW) {
-      return { ok: false, reason: "manifest_unreadable" };
-    }
-    fd = openSync(
-      resolved,
-      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-    );
-    const stat = fstatSync(fd);
-    if (stat.isDirectory()) return { ok: false, reason: "manifest_directory" };
-    if (!stat.isFile()) return { ok: false, reason: "manifest_not_regular" };
-    if (!Number.isSafeInteger(stat.size) || stat.size > MANIFEST_MAX_BYTES) {
-      return { ok: false, reason: "manifest_oversize" };
-    }
-    const buffer = Buffer.alloc(stat.size);
-    let offset = 0;
-    while (offset < stat.size) {
-      const count = readSync(fd, buffer, offset, stat.size - offset, offset);
-      if (count === 0) return { ok: false, reason: "manifest_unreadable" };
-      offset += count;
-    }
-    return { ok: true, text: buffer.toString("utf8") };
-  } catch (error) {
-    const code = errorCode(error);
-    if (code === "ENOENT") return { ok: false, reason: "manifest_absent" };
-    if (code === "ELOOP") return { ok: false, reason: "manifest_symlink" };
-    if (code === "EISDIR") return { ok: false, reason: "manifest_directory" };
-    return { ok: false, reason: "manifest_unreadable" };
-  } finally {
-    if (fd !== null) closeSync(fd);
-  }
+  return { ok: true, text: value };
 }
 
 export function withManifestReadDetail(
@@ -637,9 +509,7 @@ async function main(): Promise<number> {
     startedAt: process.env.ACCEPTANCE_STARTED_AT ?? "",
   };
   mask(identity.runNonce);
-  const read = readCleanupManifestFile(process.env.ACCEPTANCE_MANIFEST_PATH, {
-    workspace: process.env.GITHUB_WORKSPACE ?? process.cwd(),
-  });
+  const read = readCleanupManifestText(process.env.ACCEPTANCE_MANIFEST);
   const result = withManifestReadDetail(
     read,
     await runAcceptanceCleanup({

@@ -12,7 +12,7 @@ import {
   CLEANUP_CLIENT_LABELS,
   expectedClientName,
   reviewCleanupManifest,
-  writeManifestAtomic,
+  writeManifestOutput,
   type CleanupClientLabel,
   type CleanupIdentity,
   type CleanupManifest,
@@ -57,7 +57,6 @@ import {
 } from "../src/server/config/environments.ts";
 
 const GENERIC_REDIRECT = "https://example.com/oauth/callback";
-const MANIFEST_PATH = "acceptance-cleanup-manifest.json";
 const APPROVE_PERMISSIONS = [
   "business.read",
   "reports.read",
@@ -1847,7 +1846,7 @@ const EVIDENCE_GAPS: readonly AcceptanceCase[] = [
   acceptanceCase(
     "cleanup.hard_kill",
     "gap",
-    "If this job is cancelled or killed before the manifest upload, cleanup downloads no artifact. That is not a pass. Cleanup looks up the two emails and three client names derived from the trusted preflight nonce, requires one exact match inside the run window, and deletes only those. Ambiguous matches are left in place and the cleanup result stays fail.",
+    "If this job is cancelled or killed before the manifest output is written, cleanup receives no manifest. That is not a pass. Cleanup looks up the two emails and three client names derived from the trusted preflight nonce, requires one exact match inside the run window, and deletes only those. Ambiguous matches are left in place and the cleanup result stays fail.",
   ),
   acceptanceCase(
     "direct.audit_and_grants",
@@ -1985,7 +1984,8 @@ async function main(): Promise<number> {
     bypass: bypass.value ?? null,
     schema: reviewedSchema(),
     writeManifest: (body) => {
-      writeManifestAtomic(MANIFEST_PATH, body);
+      // Do not mask this value. A masked job output is dropped.
+      writeManifestOutput(body, process.env.GITHUB_OUTPUT);
     },
   });
   console.log(formatAcceptanceReport(report));

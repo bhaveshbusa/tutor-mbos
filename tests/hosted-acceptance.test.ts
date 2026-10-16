@@ -737,22 +737,23 @@ describe("hosted acceptance harness", () => {
       "SUPABASE_DEVELOPMENT_ACCESS_TOKEN",
     );
     expect(JSON.stringify(accept)).not.toContain("VERCEL_TOKEN");
-    const upload = accept.steps.find((step) =>
-      step.uses?.startsWith("actions/upload-artifact@"),
+    expect(accept.outputs?.manifest).toBe(
+      "${{ steps.acceptance.outputs.manifest }}",
     );
-    expect(upload?.if).toBe("always()");
-    expect(upload?.["timeout-minutes"]).toBe(1);
-    expect(upload?.with?.["retention-days"]).toBe(1);
+    expect(acceptRun?.id).toBe("acceptance");
+    expect(text).not.toContain("actions/upload-artifact");
+    expect(text).not.toContain("actions/download-artifact");
+    expect(text).not.toContain("runner.temp");
     const cleanupRun = cleanup.steps.find((step) =>
       step.run?.includes("accept:development:cleanup"),
     );
     expect(cleanupRun?.run).toBe("pnpm accept:development:cleanup");
+    expect(cleanupRun?.run).not.toContain("${{");
     expect(cleanupRun?.["working-directory"]).toBeUndefined();
     expect(cleanupRun?.env).toEqual({
       SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY:
         "${{ secrets.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY }}",
-      ACCEPTANCE_MANIFEST_PATH:
-        "${{ runner.temp }}/acceptance-cleanup-data/acceptance-cleanup-manifest.json",
+      ACCEPTANCE_MANIFEST: "${{ needs.accept.outputs.manifest }}",
     });
     expect(cleanup.env?.ACCEPTANCE_RUN_NONCE).toBe(
       "${{ needs.preflight.outputs.nonce }}",
@@ -764,27 +765,28 @@ describe("hosted acceptance harness", () => {
       "SUPABASE_DEVELOPMENT_ACCESS_TOKEN",
     );
     expect(JSON.stringify(cleanup)).not.toContain("VERCEL_TOKEN");
-    const download = cleanup.steps.find((step) =>
-      step.uses?.startsWith("actions/download-artifact@"),
+    expect(cleanup.steps.some((step) => step.uses?.includes("artifact"))).toBe(
+      false,
     );
-    expect(download?.["continue-on-error"]).toBe(true);
-    expect(download?.with?.path).toBe(
-      "${{ runner.temp }}/acceptance-cleanup-data",
-    );
-    expect(download?.with?.path).not.toBe(".");
-    expect(download?.with?.path).not.toContain("github.workspace");
     const script = readFileSync("scripts/hosted-acceptance.ts", "utf8");
     expect(script).toContain("mask(runNonce)");
     expect(script).toContain("probeDirectTenants");
+    expect(script).toContain(
+      "writeManifestOutput(body, process.env.GITHUB_OUTPUT)",
+    );
+    expect(script).not.toContain("mask(body)");
+    expect(script).not.toContain("writeManifestAtomic");
     const cleanupScript = readFileSync(
       "scripts/hosted-acceptance-cleanup.ts",
       "utf8",
     );
     expect(cleanupScript).toContain("mask(identity.runNonce)");
-    expect(cleanupScript).toContain("O_NOFOLLOW");
-    expect(cleanupScript).toContain("ACCEPTANCE_MANIFEST_PATH");
+    expect(cleanupScript).toContain("ACCEPTANCE_MANIFEST");
+    expect(cleanupScript).not.toContain("ACCEPTANCE_MANIFEST_PATH");
+    expect(cleanupScript).not.toContain("O_NOFOLLOW");
     expect(cleanupScript).not.toContain("readFileSync");
     expect(cleanupScript).not.toContain("import(");
+    expect(cleanupScript).not.toContain("download-artifact");
     expect(script).not.toContain("/auth/v1/admin");
     expect(script).not.toContain("auth.users");
     expect(script).not.toContain("SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY");
@@ -792,6 +794,33 @@ describe("hosted acceptance harness", () => {
     expect(script).not.toContain(".vercel/.env.production.local");
     expect(script).not.toMatch(/method:\s*"PATCH"/);
     expect(script).not.toMatch(/method:\s*"DELETE"/);
+  });
+
+  it("exports a bounded manifest when the business run fails before signup", async () => {
+    const bodies: string[] = [];
+    const doubled = developmentDouble({ healthStatus: 503 });
+    const report = await runHostedAcceptance(
+      input(doubled.fetchImpl, {
+        writeManifest: (body) => {
+          bodies.push(body);
+        },
+      }),
+    );
+    expect(
+      report.results.find((row) => row.id === "cleanup.manifest")?.detail,
+    ).toBe("no_hosted_users");
+    expect(bodies.length).toBeGreaterThan(0);
+    for (const body of bodies) {
+      expect(Buffer.byteLength(body)).toBeLessThanOrEqual(4096);
+      expect(body).not.toContain("@example.com");
+      expect(body).not.toContain("07".repeat(16));
+      const parsed = JSON.parse(body) as {
+        users: unknown[];
+        clients: unknown[];
+      };
+      expect(parsed.users).toEqual([]);
+      expect(parsed.clients).toEqual([]);
+    }
   });
 
   it("stops before signup when health does not match the source", async () => {

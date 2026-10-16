@@ -3,7 +3,8 @@
  * The manifest is untrusted. This module does not open connections,
  * read credentials, or delete anything.
  */
-import { renameSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { appendFileSync, renameSync, writeFileSync } from "node:fs";
 import { ENVIRONMENT_BINDINGS } from "../config/environments";
 
 export const AUTH_ADMIN_KEY_SECRET = "SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY";
@@ -38,6 +39,11 @@ export const CLEANUP_PROJECT_REF =
 export const CLEANUP_REDIRECT_URI = "https://example.com/oauth/callback";
 
 export const CLEANUP_TIME_SKEW_MS = 120_000;
+
+/** A legitimate manifest is a few hundred bytes. Job outputs are not masked. */
+export const MANIFEST_MAX_BYTES = 4096;
+
+export const MANIFEST_OUTPUT_NAME = "manifest";
 
 export const CLEANUP_CLIENT_LABELS = [
   "acceptance",
@@ -212,6 +218,34 @@ export function writeManifestAtomic(filePath: string, body: string): void {
   const temporary = `${filePath}.${process.pid}.tmp`;
   writeFileSync(temporary, body);
   renameSync(temporary, filePath);
+}
+
+/**
+ * Append one manifest job output. The value is not masked: Actions drops a
+ * masked job output. The body is written to the output file, not through a
+ * shell. An oversized body is refused before any write.
+ */
+export function writeManifestOutput(
+  body: string,
+  outputPath: string | undefined,
+): void {
+  if (Buffer.byteLength(body, "utf8") > MANIFEST_MAX_BYTES) {
+    throw new Error("manifest_oversize");
+  }
+  if (!outputPath) {
+    if (process.env.GITHUB_ACTIONS === "true") {
+      throw new Error("manifest_output_absent");
+    }
+    return;
+  }
+  let delimiter = "";
+  do {
+    delimiter = `MANIFEST_${randomBytes(16).toString("hex")}`;
+  } while (body.includes(delimiter));
+  appendFileSync(
+    outputPath,
+    `${MANIFEST_OUTPUT_NAME}<<${delimiter}\n${body}\n${delimiter}\n`,
+  );
 }
 
 function reviewUsers(

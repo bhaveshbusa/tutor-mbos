@@ -12,21 +12,19 @@ name: Accept development
 # and installs from the lockfile with the shared pnpm cache disabled. The
 # business job cannot change the cleanup job's checkout, install, or
 # environment. The only data that crosses from the business job is the
-# cleanup manifest artifact: labels and UUIDs, one-day retention. On a public
-# repository that artifact is downloadable. It has no emails, keys, tokens,
-# or database URLs. Cleanup downloads it under runner.temp, outside the
-# checkout and the lockfile install, and opens only
-# acceptance-cleanup-manifest.json from that directory. Extra artifact
-# files are ignored and are not imported or executed. The pinned download
-# action strips leading ../ and does not extract symlink entries. The run
-# nonce and started_at are preflight job outputs.
+# cleanup manifest job output: labels and UUIDs. It has no emails, keys,
+# tokens, or database URLs. The accept step writes that JSON before it
+# exits, including when the step fails. The value is not masked there,
+# because Actions drops a masked job output. Cleanup binds it to an
+# environment variable and does not place it in a shell command. There is
+# no artifact upload or download. The run nonce and started_at are
+# preflight job outputs.
 # The business job cannot rewrite them through its own step environment.
 # The nonce is not masked in preflight: Actions drops a masked job output.
 # Accept and cleanup mask it when they read it. It is not a credential.
 # The admin capability step runs before pnpm dlx vercel, so that unlocked
 # package cannot change the environment of a step that holds the admin key
-# or the Management API token. Same-run v4 artifact upload and download use
-# the workflow contents permission.
+# or the Management API token. The workflow contents permission is enough.
 on:
   workflow_dispatch:
 
@@ -117,6 +115,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: development
+    outputs:
+      manifest: ${{ steps.acceptance.outputs.manifest }}
     env:
       TUTOR_MBOS_ACCEPTANCE: development
       ACCEPTANCE_RUN_NONCE: ${{ needs.preflight.outputs.nonce }}
@@ -136,21 +136,13 @@ jobs:
         with:
           pnpm-cache: "false"
       - name: Run hosted acceptance
+        id: acceptance
         timeout-minutes: 12
         env:
           VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
           TUTOR_MBOS_APP_DATABASE_URL: ${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}
           NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
         run: pnpm accept:development
-      - name: Upload cleanup manifest
-        if: always()
-        timeout-minutes: 1
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: acceptance-cleanup-manifest
-          path: acceptance-cleanup-manifest.json
-          retention-days: 1
-          if-no-files-found: warn
 
   cleanup:
     name: Clean acceptance Auth resources
@@ -176,14 +168,8 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           pnpm-cache: "false"
-      - name: Download cleanup manifest
-        continue-on-error: true
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: acceptance-cleanup-manifest
-          path: ${{ runner.temp }}/acceptance-cleanup-data
       - name: Clean acceptance Auth resources
         env:
           SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY: ${{ secrets.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY }}
-          ACCEPTANCE_MANIFEST_PATH: ${{ runner.temp }}/acceptance-cleanup-data/acceptance-cleanup-manifest.json
+          ACCEPTANCE_MANIFEST: ${{ needs.accept.outputs.manifest }}
         run: pnpm accept:development:cleanup
