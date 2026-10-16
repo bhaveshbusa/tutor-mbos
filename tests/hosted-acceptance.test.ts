@@ -647,6 +647,7 @@ describe("hosted acceptance harness", () => {
             env?: Record<string, string>;
             "timeout-minutes"?: number;
             "continue-on-error"?: boolean;
+            "working-directory"?: string;
           }[];
           env?: Record<string, string>;
         }
@@ -745,9 +746,13 @@ describe("hosted acceptance harness", () => {
     const cleanupRun = cleanup.steps.find((step) =>
       step.run?.includes("accept:development:cleanup"),
     );
+    expect(cleanupRun?.run).toBe("pnpm accept:development:cleanup");
+    expect(cleanupRun?.["working-directory"]).toBeUndefined();
     expect(cleanupRun?.env).toEqual({
       SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY:
         "${{ secrets.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY }}",
+      ACCEPTANCE_MANIFEST_PATH:
+        "${{ runner.temp }}/acceptance-cleanup-data/acceptance-cleanup-manifest.json",
     });
     expect(cleanup.env?.ACCEPTANCE_RUN_NONCE).toBe(
       "${{ needs.preflight.outputs.nonce }}",
@@ -763,6 +768,11 @@ describe("hosted acceptance harness", () => {
       step.uses?.startsWith("actions/download-artifact@"),
     );
     expect(download?.["continue-on-error"]).toBe(true);
+    expect(download?.with?.path).toBe(
+      "${{ runner.temp }}/acceptance-cleanup-data",
+    );
+    expect(download?.with?.path).not.toBe(".");
+    expect(download?.with?.path).not.toContain("github.workspace");
     const script = readFileSync("scripts/hosted-acceptance.ts", "utf8");
     expect(script).toContain("mask(runNonce)");
     expect(script).toContain("probeDirectTenants");
@@ -771,6 +781,10 @@ describe("hosted acceptance harness", () => {
       "utf8",
     );
     expect(cleanupScript).toContain("mask(identity.runNonce)");
+    expect(cleanupScript).toContain("O_NOFOLLOW");
+    expect(cleanupScript).toContain("ACCEPTANCE_MANIFEST_PATH");
+    expect(cleanupScript).not.toContain("readFileSync");
+    expect(cleanupScript).not.toContain("import(");
     expect(script).not.toContain("/auth/v1/admin");
     expect(script).not.toContain("auth.users");
     expect(script).not.toContain("SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY");

@@ -1,4 +1,14 @@
-import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -15,7 +25,9 @@ import {
 } from "@/server/application/acceptance-cleanup";
 import {
   formatCleanupExecution,
+  readCleanupManifestFile,
   runAcceptanceCleanup,
+  withManifestReadDetail,
 } from "../scripts/hosted-acceptance-cleanup.ts";
 import { runAcceptancePreflight } from "../scripts/hosted-acceptance-preflight.ts";
 import { ENVIRONMENT_BINDINGS } from "@/server/config/environments";
@@ -498,5 +510,223 @@ describe("admin capability preflight", () => {
     expect(denied.ok).toBe(false);
     expect(denied.reason).toBe("admin_capability_http_401");
     expect(denied.nonce).toBeNull();
+  });
+});
+
+describe("cleanup manifest file boundary", () => {
+  const filename = "acceptance-cleanup-manifest.json";
+  const plantedSentinel = "PLANTED_PACKAGE_SCRIPT";
+  const dummyKey = "sb_secret_ci";
+
+  function layout(): { root: string; checkout: string; data: string } {
+    const root = mkdtempSync(join(tmpdir(), "acceptance-manifest-"));
+    const checkout = join(root, "checkout");
+    const data = join(root, "acceptance-cleanup-data");
+    mkdirSync(join(checkout, "scripts"), { recursive: true });
+    mkdirSync(data, { recursive: true });
+    writeFileSync(join(checkout, "package.json"), '{"name":"trusted"}\n');
+    writeFileSync(
+      join(checkout, "scripts", "hosted-acceptance-cleanup.ts"),
+      "export const trusted = true;\n",
+    );
+    return { root, checkout, data };
+  }
+
+  function plantedScript(marker: string): string {
+    return [
+      plantedSentinel,
+      "import { writeFileSync } from 'node:fs';",
+      `writeFileSync(${JSON.stringify(marker)}, process.env.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY ?? "");`,
+    ].join("\n");
+  }
+
+  it("rejects a directory artifact and leaves the trusted checkout unexecuted", async () => {
+    const { root, checkout, data } = layout();
+    const marker = join(root, "planted-ran");
+    const previous = process.env.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY;
+    process.env.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY = dummyKey;
+    try {
+      writeFileSync(
+        join(data, "package.json"),
+        `{"name":"${plantedSentinel}"}\n`,
+      );
+      mkdirSync(join(data, "scripts"), { recursive: true });
+      writeFileSync(
+        join(data, "scripts", "hosted-acceptance-cleanup.ts"),
+        plantedScript(marker),
+      );
+      mkdirSync(join(data, filename));
+      writeFileSync(
+        join(data, filename, "package.json"),
+        plantedScript(marker),
+      );
+      const read = readCleanupManifestFile(join(data, filename), {
+        workspace: checkout,
+      });
+      expect(read).toEqual({ ok: false, reason: "manifest_directory" });
+      expect(JSON.stringify(read)).not.toContain(plantedSentinel);
+      expect(readFileSync(join(checkout, "package.json"), "utf8")).toBe(
+        '{"name":"trusted"}\n',
+      );
+      expect(
+        readFileSync(
+          join(checkout, "scripts", "hosted-acceptance-cleanup.ts"),
+          "utf8",
+        ),
+      ).toBe("export const trusted = true;\n");
+      const execution = await runAcceptanceCleanup({
+        manifestText: null,
+        adminKey: dummyKey,
+        identity,
+        supabaseUrl: "https://example.test",
+        fetchImpl: async () => Response.json({ users: [], clients: [] }),
+        nowMs,
+      });
+      const reported = withManifestReadDetail(read, execution);
+      const text = formatCleanupExecution(reported);
+      expect(reported.status).toBe("fail");
+      expect(text).toContain("manifest_directory");
+      expect(text).not.toContain(dummyKey);
+      expect(text).not.toContain(plantedSentinel);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY;
+      } else {
+        process.env.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY = previous;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a symlink manifest without returning the target body", () => {
+    const { root, checkout, data } = layout();
+    try {
+      const target = join(root, "secret-target.json");
+      const body = "SYMLINK-TARGET-BODY";
+      writeFileSync(target, body);
+      symlinkSync(target, join(data, filename));
+      const read = readCleanupManifestFile(join(data, filename), {
+        workspace: checkout,
+      });
+      expect(read).toEqual({ ok: false, reason: "manifest_symlink" });
+      expect(JSON.stringify(read)).not.toContain(body);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a symlink parent without following it into the checkout", () => {
+    const { root, checkout } = layout();
+    try {
+      const body = "SYMLINK-PARENT-BODY";
+      writeFileSync(join(checkout, filename), body);
+      const linked = join(root, "linked-checkout");
+      symlinkSync(checkout, linked);
+      const read = readCleanupManifestFile(join(linked, filename), {
+        workspace: checkout,
+      });
+      expect(read).toEqual({ ok: false, reason: "manifest_symlink" });
+      expect(JSON.stringify(read)).not.toContain(body);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an oversized manifest before returning its bytes", () => {
+    const { root, checkout, data } = layout();
+    try {
+      const body = `OVERSIZE-SENTINEL${"x".repeat(4096)}`;
+      writeFileSync(join(data, filename), body);
+      const read = readCleanupManifestFile(join(data, filename), {
+        workspace: checkout,
+      });
+      expect(read).toEqual({ ok: false, reason: "manifest_oversize" });
+      expect(JSON.stringify(read)).not.toContain("OVERSIZE-SENTINEL");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a fifo without opening it for execution", () => {
+    const { root, checkout, data } = layout();
+    try {
+      execFileSync("mkfifo", [join(data, filename)]);
+      const read = readCleanupManifestFile(join(data, filename), {
+        workspace: checkout,
+      });
+      expect(read).toEqual({ ok: false, reason: "manifest_not_regular" });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reads one regular manifest and ignores other artifact files", () => {
+    const { root, checkout, data } = layout();
+    const marker = join(root, "planted-ran");
+    try {
+      const body = '{"version":1}\n';
+      writeFileSync(join(data, filename), body);
+      writeFileSync(join(data, "package.json"), plantedScript(marker));
+      mkdirSync(join(data, "scripts"), { recursive: true });
+      writeFileSync(
+        join(data, "scripts", "hosted-acceptance-cleanup.ts"),
+        plantedScript(marker),
+      );
+      const read = readCleanupManifestFile(join(data, filename), {
+        workspace: checkout,
+      });
+      expect(read).toEqual({ ok: true, text: body });
+      expect(read.ok ? read.text : "").not.toContain(plantedSentinel);
+      expect(existsSync(marker)).toBe(false);
+      expect(readFileSync(join(checkout, "package.json"), "utf8")).toBe(
+        '{"name":"trusted"}\n',
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a regular manifest stored inside the checkout", () => {
+    const { root, checkout } = layout();
+    try {
+      const body = "CHECKOUT-MANIFEST-BODY";
+      writeFileSync(join(checkout, filename), body);
+      const read = readCleanupManifestFile(join(checkout, filename), {
+        workspace: checkout,
+      });
+      expect(read).toEqual({ ok: false, reason: "manifest_inside_checkout" });
+      expect(JSON.stringify(read)).not.toContain(body);
+      expect(
+        readCleanupManifestFile(filename, { workspace: checkout }),
+      ).toEqual({ ok: false, reason: "manifest_path" });
+      expect(
+        readCleanupManifestFile(join(root, "package.json"), {
+          workspace: checkout,
+        }),
+      ).toEqual({ ok: false, reason: "manifest_path" });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a rejected read as a failed cleanup without doubling an absent manifest", () => {
+    const absent = {
+      status: "fail" as const,
+      usersDeleted: 0,
+      clientsDeleted: 0,
+      detail: "manifest_absent recovered_users=0 recovered_clients=0",
+    };
+    expect(
+      withManifestReadDetail({ ok: false, reason: "manifest_absent" }, absent)
+        .detail,
+    ).toBe(absent.detail);
+    expect(
+      withManifestReadDetail({ ok: false, reason: "manifest_oversize" }, absent)
+        .detail,
+    ).toBe(`manifest_oversize ${absent.detail}`);
+    expect(withManifestReadDetail({ ok: true, text: "{}" }, absent)).toEqual(
+      absent,
+    );
   });
 });
