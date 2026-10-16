@@ -213,10 +213,43 @@ describe("acceptance comment authorization", () => {
   });
 
   it("counts an earlier authorized run and ignores noise", () => {
-    expect(review({}, { acceptance: acceptance([acceptanceRun()]) })).toEqual({
-      ok: false,
-      reason: "duplicate_request",
-    });
+    expect(
+      review(
+        { runId: "200" },
+        {
+          acceptance: acceptance([
+            acceptanceRun({
+              id: "100",
+              jobs: [
+                job(AUTHORIZE_JOB_NAME, "completed", "success"),
+                job(AUTHORIZE_JOB_NAME, "completed", "skipped"),
+              ],
+            }),
+          ]),
+        },
+      ),
+    ).toEqual({ ok: false, reason: "duplicate_request" });
+    expect(
+      review(
+        { runId: "200" },
+        {
+          acceptance: acceptance([
+            acceptanceRun({
+              id: "100",
+              event: "workflow_dispatch",
+              actorId: null,
+              actorLogin: null,
+              jobs: [
+                job(PREFLIGHT_JOB_NAME, "completed", "success"),
+                job(PREFLIGHT_JOB_NAME, "completed", "skipped"),
+                job(ACCEPT_JOB_NAME, "completed", "success"),
+                job(ACCEPT_JOB_NAME, "completed", "skipped"),
+              ],
+            }),
+          ]),
+        },
+      ),
+    ).toEqual({ ok: false, reason: "duplicate_request" });
     expect(
       review(
         {},
@@ -256,6 +289,7 @@ describe("acceptance comment authorization", () => {
               conclusion: "success",
               status: "completed",
               jobs: [
+                job(AUTHORIZE_JOB_NAME, "completed", "skipped"),
                 job(AUTHORIZE_JOB_NAME, "completed", "skipped"),
                 job(PREFLIGHT_JOB_NAME, "completed", "skipped"),
                 job(ACCEPT_JOB_NAME, "completed", "skipped"),
@@ -477,11 +511,13 @@ describe("acceptance comment authorization", () => {
               total_count: 2,
               jobs: [
                 {
+                  id: 1,
                   name: PREFLIGHT_JOB_NAME,
                   status: "completed",
                   conclusion: "failure",
                 },
                 {
+                  id: 2,
                   name: ACCEPT_JOB_NAME,
                   status: "completed",
                   conclusion: "skipped",
@@ -494,6 +530,7 @@ describe("acceptance comment authorization", () => {
               total_count: 1,
               jobs: [
                 {
+                  id: 3,
                   name: AUTHORIZE_JOB_NAME,
                   status: "completed",
                   conclusion: "success",
@@ -505,6 +542,7 @@ describe("acceptance comment authorization", () => {
             total_count: 1,
             jobs: [
               {
+                id: 4,
                 name: AUTHORIZE_JOB_NAME,
                 status: "completed",
                 conclusion: "skipped",
@@ -538,7 +576,8 @@ describe("acceptance comment authorization", () => {
         (url) => url.includes("event=issue_comment") && url.includes("page=2"),
       ),
     ).toBe(true);
-    expect(calls.some((url) => url.includes("/runs/120/jobs"))).toBe(true);
+    expect(calls.some((url) => url.includes("/runs/120/jobs?"))).toBe(true);
+    expect(calls.some((url) => url.includes("filter=all"))).toBe(true);
     expect(calls.some((url) => url.includes("/runs/900/jobs"))).toBe(false);
     expect(calls.some((url) => url.includes("actor=someone"))).toBe(false);
   });
@@ -563,16 +602,19 @@ describe("acceptance comment authorization", () => {
             total_count: 3,
             jobs: [
               {
+                id: 1,
                 name: AUTHORIZE_JOB_NAME,
                 status: "completed",
                 conclusion: "skipped",
               },
               {
+                id: 2,
                 name: PREFLIGHT_JOB_NAME,
                 status: "completed",
                 conclusion: "skipped",
               },
               {
+                id: 3,
                 name: ACCEPT_JOB_NAME,
                 status: "completed",
                 conclusion: "skipped",
@@ -621,6 +663,119 @@ describe("acceptance comment authorization", () => {
       reason: "acceptance_lookup_truncated",
       detail: `bound=${ACCEPTANCE_RUN_RESULT_BOUND} total=${ACCEPTANCE_RUN_RESULT_BOUND + 1}`,
     });
+  });
+
+  it("keeps an earlier attempt when a later attempt is skipped", async () => {
+    const calls: string[] = [];
+    const decision = await authorizeAcceptanceComment({
+      env: env({ ACCEPTANCE_RUN_ID: "200" }),
+      fetchImpl: async (input) => {
+        const url = String(input);
+        calls.push(url);
+        if (url.endsWith("/pulls/8")) return pullResponse();
+        if (url.includes("/workflows/deploy-development.yml/")) {
+          return Response.json({
+            total_count: 1,
+            workflow_runs: [deliveryRun()],
+          });
+        }
+        if (url.includes("event=workflow_dispatch")) {
+          return Response.json({
+            total_count: 1,
+            workflow_runs: [
+              githubRun({
+                id: 50,
+                event: "workflow_dispatch",
+                status: "completed",
+                conclusion: "success",
+              }),
+            ],
+          });
+        }
+        if (url.includes("event=issue_comment")) {
+          return Response.json({
+            total_count: 1,
+            workflow_runs: [
+              githubRun({
+                id: 100,
+                status: "completed",
+                conclusion: "success",
+              }),
+            ],
+          });
+        }
+        const runId = /\/runs\/(\d+)\/jobs/.exec(url)?.[1];
+        const page = /[?&]page=(\d+)/.exec(url)?.[1];
+        if (runId === "100" && page === "1") {
+          return Response.json({
+            total_count: 101,
+            jobs: Array.from({ length: 100 }, (_, index) => ({
+              id: index + 1,
+              name: "Clean acceptance Auth resources",
+              status: "completed",
+              conclusion: "skipped",
+            })),
+          });
+        }
+        if (runId === "100") {
+          return Response.json({
+            total_count: 101,
+            jobs: [
+              {
+                id: 101,
+                name: AUTHORIZE_JOB_NAME,
+                status: "completed",
+                conclusion: "success",
+              },
+            ],
+          });
+        }
+        return Response.json({
+          total_count: 4,
+          jobs: [
+            {
+              id: 201,
+              name: PREFLIGHT_JOB_NAME,
+              status: "completed",
+              conclusion: "success",
+            },
+            {
+              id: 202,
+              name: PREFLIGHT_JOB_NAME,
+              status: "completed",
+              conclusion: "skipped",
+            },
+            {
+              id: 203,
+              name: ACCEPT_JOB_NAME,
+              status: "completed",
+              conclusion: "success",
+            },
+            {
+              id: 204,
+              name: ACCEPT_JOB_NAME,
+              status: "completed",
+              conclusion: "skipped",
+            },
+          ],
+        });
+      },
+    });
+    expect(decision).toEqual({ ok: false, reason: "duplicate_request" });
+    expect(calls).toContain(
+      `https://api.github.com/repos/${ACCEPTANCE_REPOSITORY}/actions/runs/100/jobs?filter=all&per_page=100&page=1`,
+    );
+    expect(calls).toContain(
+      `https://api.github.com/repos/${ACCEPTANCE_REPOSITORY}/actions/runs/100/jobs?filter=all&per_page=100&page=2`,
+    );
+    expect(calls).toContain(
+      `https://api.github.com/repos/${ACCEPTANCE_REPOSITORY}/actions/runs/50/jobs?filter=all&per_page=100&page=1`,
+    );
+    expect(
+      calls.some(
+        (url) => url.includes("/jobs?") && !url.includes("filter=all"),
+      ),
+    ).toBe(false);
   });
 
   it("checks the authorized candidate without executing it", () => {

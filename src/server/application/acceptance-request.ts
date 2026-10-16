@@ -228,46 +228,42 @@ function commentAuthorized(
     return "ignore";
   }
   if (!run.jobsComplete) return "unknown";
-  const jobs = run.jobs.filter((job) => job.name === AUTHORIZE_JOB_NAME);
-  if (jobs.length === 0) return "ignore";
-  if (jobs.length > 1) return "unknown";
-  const job = jobs[0];
-  if (!job || !knownJob(job)) return "unknown";
-  if (job.status !== "completed" || job.conclusion === "success")
-    return "block";
-  return "ignore";
+  return attemptsOf(run.jobs, AUTHORIZE_JOB_NAME, (job) => {
+    return job.status !== "completed" || job.conclusion === "success";
+  });
 }
 
 function dispatchAccepted(
   run: AcceptanceRunSnapshot,
 ): "ignore" | "block" | "unknown" {
   if (!run.jobsComplete) return "unknown";
-  const preflight = oneJob(run.jobs, PREFLIGHT_JOB_NAME);
-  const accept = oneJob(run.jobs, ACCEPT_JOB_NAME);
-  if (preflight === "duplicate" || accept === "duplicate") return "unknown";
-  if ((preflight && !knownJob(preflight)) || (accept && !knownJob(accept))) {
-    return "unknown";
-  }
-  if (
-    preflight &&
-    (preflight.status !== "completed" || preflight.conclusion === "success")
-  ) {
-    return "block";
-  }
-  if (!accept) return "ignore";
-  if (accept.status !== "completed") return "block";
-  if (accept.conclusion === "success") return "block";
-  if (accept.conclusion && ACCEPT_RAN.has(accept.conclusion)) return "block";
+  const preflight = attemptsOf(run.jobs, PREFLIGHT_JOB_NAME, (job) => {
+    return job.status !== "completed" || job.conclusion === "success";
+  });
+  const accept = attemptsOf(run.jobs, ACCEPT_JOB_NAME, (job) => {
+    if (job.status !== "completed" || job.conclusion === "success") return true;
+    return job.conclusion !== null && ACCEPT_RAN.has(job.conclusion);
+  });
+  if (preflight === "block" || accept === "block") return "block";
+  if (preflight === "unknown" || accept === "unknown") return "unknown";
   return "ignore";
 }
 
-function oneJob(
+function attemptsOf(
   jobs: readonly AcceptanceJobSnapshot[],
   name: string,
-): AcceptanceJobSnapshot | "duplicate" | null {
-  const matches = jobs.filter((job) => job.name === name);
-  if (matches.length > 1) return "duplicate";
-  return matches[0] ?? null;
+  blocks: (job: AcceptanceJobSnapshot) => boolean,
+): "ignore" | "block" | "unknown" {
+  let unknown = false;
+  for (const job of jobs) {
+    if (job.name !== name) continue;
+    if (!knownJob(job)) {
+      unknown = true;
+      continue;
+    }
+    if (blocks(job)) return "block";
+  }
+  return unknown ? "unknown" : "ignore";
 }
 
 function knownJob(job: AcceptanceJobSnapshot): boolean {

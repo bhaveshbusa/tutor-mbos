@@ -352,10 +352,12 @@ async function getJobs(
 > {
   if (!/^[0-9]+$/.test(runId)) return { ok: false };
   const jobs: AcceptanceJobSnapshot[] = [];
+  const seen = new Set<string>();
   let totalCount = 0;
   const pageCount = ACCEPTANCE_RUN_RESULT_BOUND / ACCEPTANCE_RUN_PAGE_SIZE;
   for (let page = 1; page <= pageCount; page += 1) {
     const query = new URLSearchParams({
+      filter: "all",
       per_page: String(ACCEPTANCE_RUN_PAGE_SIZE),
       page: String(page),
     });
@@ -369,10 +371,15 @@ async function getJobs(
     if (!parsed) return { ok: false };
     totalCount = parsed.totalCount;
     if (totalCount > ACCEPTANCE_RUN_RESULT_BOUND) return { ok: false };
-    jobs.push(...parsed.jobs);
+    for (const job of parsed.jobs) {
+      if (seen.has(job.id)) return { ok: false };
+      seen.add(job.id);
+      jobs.push(job);
+    }
+    if (jobs.length > totalCount) return { ok: false };
     if (jobs.length >= totalCount || parsed.jobs.length === 0) break;
   }
-  if (jobs.length < totalCount) return { ok: false };
+  if (jobs.length !== totalCount) return { ok: false };
   return { ok: true, runId, jobs };
 }
 
@@ -541,19 +548,21 @@ function parseRunPage(
   return { totalCount, runs };
 }
 
-function parseJobs(
-  body: unknown,
-): { totalCount: number; jobs: AcceptanceJobSnapshot[] } | null {
+function parseJobs(body: unknown): {
+  totalCount: number;
+  jobs: (AcceptanceJobSnapshot & { id: string })[];
+} | null {
   const record = asRecord(body);
   if (!record || !Number.isSafeInteger(record.total_count)) return null;
   const totalCount = record.total_count as number;
   if (totalCount < 0 || !Array.isArray(record.jobs)) return null;
   if (record.jobs.length > ACCEPTANCE_RUN_PAGE_SIZE) return null;
-  const jobs: AcceptanceJobSnapshot[] = [];
+  const jobs: (AcceptanceJobSnapshot & { id: string })[] = [];
   for (const entry of record.jobs) {
     const job = asRecord(entry);
     if (
       !job ||
+      !Number.isSafeInteger(job.id) ||
       typeof job.name !== "string" ||
       typeof job.status !== "string"
     ) {
@@ -562,6 +571,7 @@ function parseJobs(
     if (job.conclusion !== null && typeof job.conclusion !== "string")
       return null;
     jobs.push({
+      id: String(job.id),
       name: job.name,
       status: job.status,
       conclusion: typeof job.conclusion === "string" ? job.conclusion : null,
