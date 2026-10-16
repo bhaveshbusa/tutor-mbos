@@ -608,9 +608,15 @@ describe("hosted acceptance harness", () => {
       "utf8",
     );
     const workflow = parse(text) as { on: Record<string, unknown> };
-    expect(Object.keys(workflow.on)).toEqual(["workflow_dispatch"]);
+    expect(Object.keys(workflow.on)).toEqual([
+      "workflow_dispatch",
+      "issue_comment",
+    ]);
+    expect(workflow.on.issue_comment).toEqual({ types: ["created"] });
     expect(text).not.toContain(ENVIRONMENT_BINDINGS.production.vercelProjectId);
-    expect(text).not.toContain("pull_request");
+    expect(text).not.toContain("pull_request:");
+    expect(text).not.toContain("pull_request_target");
+    expect(text).not.toContain("pull_request.head");
     expect(text).not.toContain("migrate:development");
     expect(text).not.toContain("deploy --prebuilt");
     expect(text).toContain(
@@ -619,7 +625,11 @@ describe("hosted acceptance harness", () => {
     expect(text).toContain(
       "TUTOR_MBOS_APP_DATABASE_URL is absent. Expected secret scope: GitHub environment development",
     );
-    expect(text).toContain("group: development-delivery");
+    expect(text).toContain(
+      "github.event_name == 'workflow_dispatch' && 'development-delivery'",
+    );
+    expect(text).toContain("github.actor_id == 3823973");
+    expect(text).toContain("acceptance-ignore-");
     expect(text).toContain("queue: max");
     expect(text).not.toContain("development-acceptance");
     expect(text).toContain(
@@ -637,6 +647,7 @@ describe("hosted acceptance harness", () => {
           "timeout-minutes"?: number;
           environment?: string;
           outputs?: Record<string, string>;
+          permissions?: Record<string, string>;
           steps: {
             id?: string;
             name?: string;
@@ -656,15 +667,45 @@ describe("hosted acceptance harness", () => {
     expect(parsed.permissions).toEqual({ contents: "read" });
     expect(text).not.toContain("actions: write");
     expect(Object.keys(parsed.jobs)).toEqual([
+      "authorize",
       "preflight",
       "accept",
       "cleanup",
     ]);
-    expect(parsed.concurrency?.group).toBe("development-delivery");
+    expect(String(parsed.concurrency?.group)).toContain("development-delivery");
     expect(text).not.toContain("GITHUB_ENV");
+    expect(text).not.toContain("cron:");
+    expect(text).not.toContain("workflow_run");
+    const authorize = parsed.jobs.authorize!;
     const preflight = parsed.jobs.preflight!;
     const accept = parsed.jobs.accept!;
     const cleanup = parsed.jobs.cleanup!;
+    expect(authorize.environment).toBeUndefined();
+    expect(authorize.if).toContain("github.event_name == 'issue_comment'");
+    expect(authorize.if).toContain("github.actor_id == 3823973");
+    expect(authorize.permissions).toEqual({
+      contents: "read",
+      "pull-requests": "read",
+      actions: "read",
+    });
+    expect(JSON.stringify(authorize.permissions)).not.toContain("write");
+    expect(JSON.stringify(authorize)).not.toContain("SUPABASE_");
+    expect(JSON.stringify(authorize)).not.toContain("VERCEL_");
+    const authorizeRun = authorize.steps.find((step) =>
+      step.run?.includes("accept:development:authorize"),
+    );
+    expect(authorizeRun?.run).toBe("pnpm accept:development:authorize");
+    expect(authorizeRun?.run).not.toContain("${{");
+    expect(authorizeRun?.env?.ACCEPTANCE_COMMENT_BODY).toBe(
+      "${{ github.event.comment.body }}",
+    );
+    expect(authorize.outputs?.candidate).toBe(
+      "${{ steps.gate.outputs.candidate }}",
+    );
+    expect(preflight.needs).toBe("authorize");
+    expect(preflight.if).toContain("github.event_name == 'workflow_dispatch'");
+    expect(preflight.if).toContain("needs.authorize.result == 'success'");
+    expect(preflight.if).toContain("always()");
     expect(preflight.environment).toBe("development");
     expect(accept.environment).toBe("development");
     expect(cleanup.environment).toBe("development");
@@ -675,7 +716,7 @@ describe("hosted acceptance harness", () => {
     expect(preflight["timeout-minutes"]).toBe(5);
     expect(accept["timeout-minutes"]).toBe(15);
     expect(cleanup["timeout-minutes"]).toBe(5);
-    for (const job of [preflight, accept, cleanup]) {
+    for (const job of [authorize, preflight, accept, cleanup]) {
       const checkout = job.steps.find((step) =>
         step.uses?.startsWith("actions/checkout@"),
       );
@@ -686,6 +727,24 @@ describe("hosted acceptance harness", () => {
       );
       expect(setup?.with?.["pnpm-cache"]).toBe("false");
     }
+    const candidate = preflight.steps.find((step) =>
+      step.run?.includes("assert-acceptance-candidate.mjs"),
+    );
+    expect(candidate?.if).toBe("github.event_name == 'issue_comment'");
+    expect(candidate?.run).toBe("node scripts/assert-acceptance-candidate.mjs");
+    expect(candidate?.run).not.toContain("${{");
+    expect(candidate?.env?.ACCEPTANCE_CANDIDATE).toBe(
+      "${{ needs.authorize.outputs.candidate }}",
+    );
+    const candidateAt = preflight.steps.indexOf(candidate!);
+    const preflightCheckoutAt = preflight.steps.findIndex((step) =>
+      step.uses?.startsWith("actions/checkout@"),
+    );
+    const secretAt = preflight.steps.findIndex((step) =>
+      step.run?.includes("accept:development:preflight"),
+    );
+    expect(candidateAt).toBeGreaterThan(preflightCheckoutAt);
+    expect(secretAt).toBeGreaterThan(candidateAt);
     const identityAt = preflight.steps.findIndex(
       (step) => step.run === "pnpm accept:development:preflight",
     );

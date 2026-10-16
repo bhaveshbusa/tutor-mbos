@@ -21,6 +21,7 @@
     "accept:development": "tsx scripts/hosted-acceptance.ts",
     "accept:development:preflight": "tsx scripts/hosted-acceptance-preflight.ts",
     "accept:development:cleanup": "tsx scripts/hosted-acceptance-cleanup.ts",
+    "accept:development:authorize": "tsx scripts/hosted-acceptance-authorize.ts",
     "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm hygiene && pnpm build"
   },
   "dependencies": {
