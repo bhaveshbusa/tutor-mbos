@@ -53,6 +53,13 @@ export const CLEANUP_CLIENT_LABELS = [
 
 export const CLEANUP_USER_LABELS = ["tenant-a", "tenant-b"] as const;
 
+/**
+ * Resend receiving domain for synthetic acceptance mail.
+ * Signup, cleanup lookup, and the receiving reader all use this binding.
+ * The sender domain is `tutor.wonderkidz.co.uk`.
+ */
+export const ACCEPTANCE_RECEIVING_DOMAIN = "weeveo.resend.app";
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const JWT = /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 
@@ -94,7 +101,7 @@ export function expectedCleanupEmail(
   label: CleanupUserLabel,
   nonce: string,
 ): string {
-  return `tos3-${label}-${nonce}@example.com`;
+  return `tos3-${label}-${nonce}@${ACCEPTANCE_RECEIVING_DOMAIN}`;
 }
 
 export function expectedClientName(

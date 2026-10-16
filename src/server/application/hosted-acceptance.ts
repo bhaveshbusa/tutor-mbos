@@ -335,6 +335,32 @@ export function classifyIssuedAudience(
   );
 }
 
+/**
+ * Publishable-key reads of the Data API root are not proof that `app` is
+ * exposed. The gateway withholds that document from publishable keys.
+ * Management `db_schema` and the direct probes remain the schema authority.
+ * A body that still names `app` fails.
+ */
+export function classifyOpenApiDocument(
+  status: number,
+  body: unknown,
+): AcceptanceCase {
+  if (openApiExposesApp(body)) {
+    return acceptanceCase("data_api.openapi", "fail", "app_exposed");
+  }
+  if (status === 200) {
+    return acceptanceCase("data_api.openapi", "pass", "app_absent");
+  }
+  if (status === 401 || status === 403) {
+    return acceptanceCase(
+      "data_api.openapi",
+      "pass",
+      `http_${status} withheld`,
+    );
+  }
+  return acceptanceCase("data_api.openapi", "fail", `http_${status}`);
+}
+
 export function openApiExposesApp(document: unknown): boolean {
   const text = JSON.stringify(document ?? {});
   if (text.includes("app.businesses") || text.includes('"schema":"app"')) {

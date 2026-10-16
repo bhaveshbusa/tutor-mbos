@@ -31,6 +31,19 @@ name: Accept development
 # no artifact upload or download. The run nonce and started_at are
 # preflight job outputs.
 # The business job cannot rewrite them through its own step environment.
+# Confirmation and recovery mail are read by separate steps in the accept
+# job. Those steps share the runner with signup, continuation, and finish.
+# That is not filesystem isolation. Those steps receive only
+# RESEND_DEVELOPMENT_RECEIVING_API_KEY. Resend can read receiving only
+# with an account-wide full_access key. That scope is accepted only
+# because the Resend team is synthetic-only. sending_access cannot read
+# receiving, and domain restriction applies only to sending_access.
+# Filtering to the receiving domain and omitting the key from other step
+# environments do not narrow it. The name is design-only. Do not create
+# the key. The mail steps do not receive the admin key, the Management
+# API token, the database URL, the publishable key, or the Vercel token,
+# and they do not open the session file. Signup, continuation, and finish
+# do not receive the receiving key.
 # The nonce is not masked in preflight: Actions drops a masked job output.
 # Accept and cleanup mask it when they read it. It is not a credential.
 # The admin capability step runs before pnpm dlx vercel, so that unlocked
@@ -183,12 +196,13 @@ jobs:
     needs: preflight
     if: "${{ !cancelled() && needs.preflight.result == 'success' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'issue_comment' && github.run_attempt == 1)) }}"
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     environment: development
     outputs:
       manifest: ${{ steps.acceptance.outputs.manifest }}
     env:
       TUTOR_MBOS_ACCEPTANCE: development
+      ACCEPTANCE_MAIL_MODE: required
       ACCEPTANCE_RUN_NONCE: ${{ needs.preflight.outputs.nonce }}
       ACCEPTANCE_STARTED_AT: ${{ needs.preflight.outputs.started_at }}
       ACCEPTANCE_PREFLIGHT_CASES: ${{ needs.preflight.outputs.cases }}
@@ -211,10 +225,42 @@ jobs:
           ACCEPTANCE_EVENT_NAME: ${{ github.event_name }}
           ACCEPTANCE_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: node scripts/assert-acceptance-attempt.mjs
-      - name: Run hosted acceptance
+      - name: Sign up synthetic tenants
+        id: signup
+        timeout-minutes: 4
+        env:
+          ACCEPTANCE_PHASE: signup
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
+        run: pnpm accept:development
+      - name: Read confirmation mail
+        if: steps.signup.outputs.continue == 'true'
+        timeout-minutes: 3
+        env:
+          ACCEPTANCE_MAIL_PURPOSE: confirmation
+          RESEND_DEVELOPMENT_RECEIVING_API_KEY: ${{ secrets.RESEND_DEVELOPMENT_RECEIVING_API_KEY }}
+        run: pnpm accept:development:mail
+      - name: Continue acceptance through recovery request
+        if: steps.signup.outputs.continue == 'true'
+        timeout-minutes: 4
+        env:
+          ACCEPTANCE_PHASE: continue
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
+        run: pnpm accept:development
+      - name: Read recovery mail
+        if: steps.signup.outputs.continue == 'true'
+        timeout-minutes: 3
+        env:
+          ACCEPTANCE_MAIL_PURPOSE: recovery
+          RESEND_DEVELOPMENT_RECEIVING_API_KEY: ${{ secrets.RESEND_DEVELOPMENT_RECEIVING_API_KEY }}
+        run: pnpm accept:development:mail
+      - name: Finish hosted acceptance
         id: acceptance
+        if: always()
         timeout-minutes: 12
         env:
+          ACCEPTANCE_PHASE: finish
           VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
           TUTOR_MBOS_APP_DATABASE_URL: ${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}
           NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}

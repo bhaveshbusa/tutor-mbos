@@ -1,5 +1,7 @@
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import {
@@ -23,6 +25,11 @@ import {
   probeDirectTenants,
   sanitizeDetail,
 } from "@/server/application/hosted-acceptance";
+import {
+  readCheckpoint,
+  writeMailResult,
+} from "@/server/application/acceptance-checkpoint";
+import { authStorageKey } from "@/server/application/acceptance-mail";
 import { siteOriginFor } from "@/server/config/access";
 import {
   ENVIRONMENT_BINDINGS,
@@ -65,6 +72,8 @@ interface DoubleOptions {
   closingCommit?: string;
   denyLocation?: string;
   dataApi?: { status: number; code: string };
+  openApi?: { status: number; body: unknown };
+  signupStatus?: number;
 }
 
 function developmentDouble(options: DoubleOptions = {}) {
@@ -225,6 +234,9 @@ function developmentDouble(options: DoubleOptions = {}) {
       });
     }
     if (url.pathname === "/rest/v1/" || url.pathname === "/rest/v1") {
+      if (options.openApi) {
+        return json(options.openApi.status, options.openApi.body);
+      }
       return json(200, { paths: { "/": {} } });
     }
     if (url.pathname === "/rest/v1/businesses") {
@@ -236,6 +248,9 @@ function developmentDouble(options: DoubleOptions = {}) {
     if (url.pathname === "/auth/v1/signup") {
       const email = String(jsonBody().email ?? "");
       const user = userIdFor(email);
+      if (options.signupStatus) {
+        return json(options.signupStatus, { error: "invalid" });
+      }
       if (options.autoconfirm === false)
         return json(200, { user: { id: user.id } });
       return json(200, {
@@ -584,11 +599,271 @@ describe("hosted acceptance harness", () => {
     const report = await runHostedAcceptance(input(doubled.fetchImpl));
     expect(
       report.results.find((row) => row.id === "signup.tenant_a")?.detail,
-    ).toBe("blocked:mailer_autoconfirm_false");
+    ).toBe("http_200 confirmation_required");
     expect(
       report.results.find((row) => row.id === "ui.tenant_a_positive")?.detail,
-    ).toContain("blocked:mailer_autoconfirm_false");
+    ).toContain("blocked:confirmation_required");
     expect(doubled.urls.some((url) => url.includes("/admin"))).toBe(false);
+  });
+
+  it("keeps an HTTP signup failure when confirmation is required", async () => {
+    const doubled = developmentDouble({
+      autoconfirm: false,
+      signupStatus: 422,
+    });
+    const report = await runHostedAcceptance(input(doubled.fetchImpl));
+    expect(
+      report.results.find((row) => row.id === "signup.tenant_a")?.detail,
+    ).toBe("http_422");
+    expect(JSON.stringify(report)).not.toContain("invalid");
+  });
+
+  it("treats a publishable-key OpenAPI 401 as withheld and still fails an app document", async () => {
+    const withheld = await runHostedAcceptance(
+      input(
+        developmentDouble({
+          openApi: { status: 401, body: { message: "Invalid API key" } },
+        }).fetchImpl,
+      ),
+    );
+    expect(
+      withheld.results.find((row) => row.id === "data_api.openapi"),
+    ).toMatchObject({ status: "pass", detail: "http_401 withheld" });
+    const exposed = await runHostedAcceptance(
+      input(
+        developmentDouble({
+          openApi: {
+            status: 401,
+            body: { paths: { "/app.businesses": {} } },
+          },
+        }).fetchImpl,
+      ),
+    );
+    expect(
+      exposed.results.find((row) => row.id === "data_api.openapi"),
+    ).toMatchObject({ status: "fail", detail: "app_exposed" });
+  });
+
+  it("confirms and recovers from mail files without calling Resend", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tos3-mail-"));
+    try {
+      const doubled = developmentDouble({ autoconfirm: false });
+      const storageKey = authStorageKey(supabaseUrl);
+      const seen: {
+        authorization: string;
+        url: string;
+        cookie: string;
+        refresh: string;
+      }[] = [];
+      const fetchImpl: typeof fetch = async (resource, init) => {
+        const url =
+          typeof resource === "string" ? resource : resource.toString();
+        const headers = new Headers(init?.headers);
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        let refresh = "";
+        if (bodyText.startsWith("{")) {
+          refresh = String(
+            (JSON.parse(bodyText) as { refresh_token?: unknown })
+              .refresh_token ?? "",
+          );
+        }
+        seen.push({
+          authorization: headers.get("authorization") ?? "",
+          url,
+          cookie: headers.get("cookie") ?? "",
+          refresh,
+        });
+        const parsed = new URL(url);
+        if (
+          parsed.pathname === "/auth/v1/token" &&
+          refresh === "refresh-confirmed"
+        ) {
+          return Response.json({ error: "invalid_grant" }, { status: 400 });
+        }
+        if (parsed.pathname === "/api/auth/login") {
+          const response = await doubled.fetchImpl(resource, init);
+          const next = new Headers(response.headers);
+          const payload = Buffer.from(
+            JSON.stringify({
+              access_token: "access-replaced",
+              refresh_token: "refresh-replaced",
+            }),
+          ).toString("base64url");
+          next.append(
+            "set-cookie",
+            `${storageKey}=base64-${payload}; Path=/; HttpOnly`,
+          );
+          return new Response(response.body, {
+            status: response.status,
+            headers: next,
+          });
+        }
+        if (parsed.pathname === "/auth/callback") {
+          const payload = Buffer.from(
+            JSON.stringify({
+              access_token: "access-confirmed",
+              refresh_token: "refresh-confirmed",
+            }),
+          ).toString("base64url");
+          return new Response(null, {
+            status: 303,
+            headers: {
+              location: `${site}/business`,
+              "set-cookie": `${storageKey}=base64-${payload}; Path=/; HttpOnly`,
+            },
+          });
+        }
+        if (parsed.pathname === "/auth/recovery") {
+          return new Response(null, {
+            status: 303,
+            headers: { location: `${site}/auth/update-password` },
+          });
+        }
+        if (parsed.pathname === "/api/auth/password") {
+          return new Response(null, {
+            status: 303,
+            headers: { location: `${site}/business` },
+          });
+        }
+        if (parsed.pathname === "/api/auth/recover") {
+          const response = await doubled.fetchImpl(resource, init);
+          const next = new Headers(response.headers);
+          next.append("set-cookie", "sb-recovery=1; Path=/; HttpOnly");
+          return new Response(response.body, {
+            status: response.status,
+            headers: next,
+          });
+        }
+        return doubled.fetchImpl(resource, init);
+      };
+      const base = input(fetchImpl);
+      const signup = await runHostedAcceptance({
+        ...base,
+        phase: "signup",
+        mailMode: "required",
+        stateDir: dir,
+      });
+      expect(
+        signup.results.find((row) => row.id === "signup.tenant_a")?.detail,
+      ).toBe("http_200 confirmation_required");
+      const saved = readCheckpoint(dir, base.runNonce);
+      const verifier = saved?.tenants[0]?.verifier ?? "";
+      expect(verifier.length).toBeGreaterThan(10);
+      expect(JSON.stringify(signup)).not.toContain(verifier);
+      expect(seen.some((call) => call.url.includes("api.resend.com"))).toBe(
+        false,
+      );
+      writeMailResult(dir, {
+        version: 1,
+        purpose: "confirmation",
+        status: "ready",
+        actions: [
+          {
+            label: "tenant-a",
+            path: "/auth/callback",
+            code: "confirm-code-tenant-a",
+          },
+          {
+            label: "tenant-b",
+            path: "/auth/callback",
+            code: "confirm-code-tenant-b",
+          },
+        ],
+      });
+      const continued = await runHostedAcceptance({
+        ...base,
+        phase: "continue",
+        mailMode: "required",
+        stateDir: dir,
+      });
+      expect(
+        continued.results.find(
+          (row) => row.id === "signup.confirmation.tenant_a",
+        )?.status,
+      ).toBe("pass");
+      const callback = seen.find((call) => call.url.includes("/auth/callback"));
+      expect(callback?.cookie).toContain("-code-verifier=");
+      expect(callback?.authorization).toBe("");
+      writeMailResult(dir, {
+        version: 1,
+        purpose: "recovery",
+        status: "ready",
+        actions: [
+          {
+            label: "tenant-a",
+            path: "/auth/recovery",
+            code: "recovery-code-tenant-a",
+          },
+        ],
+      });
+      const finished = await runHostedAcceptance({
+        ...base,
+        phase: "finish",
+        mailMode: "required",
+        stateDir: dir,
+      });
+      expect(
+        finished.results.find((row) => row.id === "recovery.email_callback")
+          ?.status,
+      ).toBe("pass");
+      expect(
+        finished.results.find((row) => row.id === "recovery.completion")
+          ?.status,
+      ).toBe("pass");
+      const recoveryCall = seen.find((call) =>
+        call.url.includes("/auth/recovery?code="),
+      );
+      expect(recoveryCall?.cookie).toContain("sb-recovery=");
+      expect(recoveryCall?.authorization).toBe("");
+      expect(
+        finished.results.find(
+          (row) => row.id === "recovery.previous_refresh_rejected",
+        ),
+      ).toMatchObject({ status: "pass", detail: "revoked" });
+      expect(
+        finished.results.find((row) => row.id === "recovery.session_replaced")
+          ?.status,
+      ).toBe("pass");
+      expect(
+        finished.results.find((row) => row.id === "refresh.platform")?.status,
+      ).toBe("pass");
+      expect(
+        finished.results.find((row) => row.id === "ui.tenant_a_page")?.status,
+      ).toBe("pass");
+      expect(
+        finished.results.find((row) => row.id === "ui.tenant_b_page")?.status,
+      ).toBe("pass");
+      const refreshes = seen
+        .filter((call) => call.url.includes("/auth/v1/token"))
+        .map((call) => call.refresh);
+      expect(refreshes[0]).toBe("refresh-confirmed");
+      expect(refreshes).toContain("refresh-replaced");
+      const passwordAt = seen.findIndex((call) =>
+        call.url.includes("/api/auth/password"),
+      );
+      const rejectedAt = seen.findIndex(
+        (call) => call.refresh === "refresh-confirmed",
+      );
+      const replacedLoginAt = seen.findIndex(
+        (call, index) =>
+          index > passwordAt && call.url.includes("/api/auth/login"),
+      );
+      expect(passwordAt).toBeGreaterThan(-1);
+      expect(rejectedAt).toBeGreaterThan(passwordAt);
+      expect(replacedLoginAt).toBeGreaterThan(rejectedAt);
+      const text = formatAcceptanceReport(finished);
+      expect(text).not.toContain("confirm-code-tenant-a");
+      expect(text).not.toContain("recovery-code-tenant-a");
+      expect(text).not.toContain("refresh-confirmed");
+      expect(text).not.toContain("refresh-replaced");
+      expect(text).not.toContain(verifier);
+      expect(text).not.toContain("@weeveo.resend.app");
+      expect(seen.some((call) => call.url.includes("api.resend.com"))).toBe(
+        false,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("names a missing management token and does not call the Management API", async () => {
@@ -779,7 +1054,7 @@ describe("hosted acceptance harness", () => {
     expect(cleanup.if).toContain("needs.preflight.result == 'success'");
     expect(cleanup.if).not.toContain("run_attempt");
     expect(preflight["timeout-minutes"]).toBe(5);
-    expect(accept["timeout-minutes"]).toBe(15);
+    expect(accept["timeout-minutes"]).toBe(20);
     expect(cleanup["timeout-minutes"]).toBe(5);
     for (const job of [authorize, preflight, accept, cleanup]) {
       const checkout = job.steps.find((step) =>
@@ -908,6 +1183,7 @@ describe("hosted acceptance harness", () => {
     });
     expect(accept.env).toEqual({
       TUTOR_MBOS_ACCEPTANCE: "development",
+      ACCEPTANCE_MAIL_MODE: "required",
       ACCEPTANCE_RUN_NONCE: "${{ needs.preflight.outputs.nonce }}",
       ACCEPTANCE_STARTED_AT: "${{ needs.preflight.outputs.started_at }}",
       ACCEPTANCE_PREFLIGHT_CASES: "${{ needs.preflight.outputs.cases }}",
@@ -974,8 +1250,13 @@ describe("hosted acceptance harness", () => {
     expect(cleanup.steps.some((step) => step.run?.includes("vercel"))).toBe(
       false,
     );
-    const acceptRun = accept.steps.find(
-      (step) => step.run === "pnpm accept:development",
+    const acceptRun = accept.steps.find((step) => step.id === "acceptance");
+    const signupRun = accept.steps.find((step) => step.id === "signup");
+    const continueRun = accept.steps.find(
+      (step) => step.env?.ACCEPTANCE_PHASE === "continue",
+    );
+    const mailSteps = accept.steps.filter((step) =>
+      step.run?.includes("accept:development:mail"),
     );
     const acceptAttempt = accept.steps.find((step) =>
       step.run?.includes("assert-acceptance-attempt.mjs"),
@@ -994,19 +1275,67 @@ describe("hosted acceptance harness", () => {
     ).toBe(false);
     expect(acceptRun?.["timeout-minutes"]).toBe(12);
     expect(acceptRun?.env).toEqual({
+      ACCEPTANCE_PHASE: "finish",
       VERCEL_AUTOMATION_BYPASS_SECRET:
         "${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}",
       TUTOR_MBOS_APP_DATABASE_URL: "${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}",
       NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:
         "${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}",
     });
+    expect(signupRun?.env).toEqual({
+      ACCEPTANCE_PHASE: "signup",
+      VERCEL_AUTOMATION_BYPASS_SECRET:
+        "${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}",
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:
+        "${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}",
+    });
+    expect(continueRun?.env).toEqual({
+      ACCEPTANCE_PHASE: "continue",
+      VERCEL_AUTOMATION_BYPASS_SECRET:
+        "${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}",
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:
+        "${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}",
+    });
+    expect(mailSteps.map((step) => step.env?.ACCEPTANCE_MAIL_PURPOSE)).toEqual([
+      "confirmation",
+      "recovery",
+    ]);
+    for (const step of mailSteps) {
+      expect(Object.keys(step.env ?? {}).sort()).toEqual([
+        "ACCEPTANCE_MAIL_PURPOSE",
+        "RESEND_DEVELOPMENT_RECEIVING_API_KEY",
+      ]);
+      expect(step.env?.RESEND_DEVELOPMENT_RECEIVING_API_KEY).toBe(
+        "${{ secrets.RESEND_DEVELOPMENT_RECEIVING_API_KEY }}",
+      );
+    }
+    for (const step of [signupRun, continueRun, acceptRun]) {
+      expect(step?.env ?? {}).not.toHaveProperty(
+        "RESEND_DEVELOPMENT_RECEIVING_API_KEY",
+      );
+      expect(step?.env ?? {}).not.toHaveProperty("VERCEL_TOKEN");
+    }
+    expect(signupRun?.env ?? {}).not.toHaveProperty(
+      "TUTOR_MBOS_APP_DATABASE_URL",
+    );
+    expect(continueRun?.env ?? {}).not.toHaveProperty(
+      "TUTOR_MBOS_APP_DATABASE_URL",
+    );
     for (const step of accept.steps) {
-      if (step === acceptRun) continue;
+      if (
+        step === acceptRun ||
+        step === signupRun ||
+        step === continueRun ||
+        mailSteps.includes(step)
+      ) {
+        continue;
+      }
       for (const name of [
         "VERCEL_AUTOMATION_BYPASS_SECRET",
         "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
         "TUTOR_MBOS_APP_DATABASE_URL",
         "VERCEL_TOKEN",
+        "RESEND_DEVELOPMENT_RECEIVING_API_KEY",
       ]) {
         expect(step.env ?? {}).not.toHaveProperty(name);
       }
@@ -1092,6 +1421,23 @@ describe("hosted acceptance harness", () => {
     expect(cleanupScript).not.toContain("import(");
     expect(cleanupScript).not.toContain("download-artifact");
     expect(script).not.toContain("/auth/v1/admin");
+    expect(script).not.toContain("api.resend.com");
+    expect(script).not.toContain(
+      "process.env.RESEND_DEVELOPMENT_RECEIVING_API_KEY",
+    );
+    const mailScript = readFileSync(
+      "scripts/hosted-acceptance-mail.ts",
+      "utf8",
+    );
+    const mailModule = readFileSync(
+      "src/server/application/acceptance-mail.ts",
+      "utf8",
+    );
+    expect(mailModule).toContain("https://api.resend.com");
+    expect(mailScript).not.toContain("session.json");
+    expect(mailScript).toContain('readMailResult(stateDir, "confirmation")');
+    expect(mailScript).not.toContain("TUTOR_MBOS_APP_DATABASE_URL");
+    expect(mailScript).not.toContain("SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY");
     expect(script).not.toContain("auth.users");
     expect(script).not.toContain("SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY");
     expect(script).not.toContain("registration_client_uri");

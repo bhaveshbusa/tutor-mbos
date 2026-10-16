@@ -5,11 +5,12 @@
  * executed from a coding workspace.
  */
 import { createHash, randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { resolveProtectionBypass } from "./smoke-health.ts";
 import {
   CLEANUP_CLIENT_LABELS,
+  expectedCleanupEmail,
   expectedClientName,
   reviewCleanupManifest,
   writeManifestOutput,
@@ -17,6 +18,20 @@ import {
   type CleanupIdentity,
   type CleanupManifest,
 } from "../src/server/application/acceptance-cleanup.ts";
+import {
+  readCheckpoint,
+  readMailResult,
+  writeCheckpoint,
+  writeRecoveryWindow,
+  type AcceptanceCheckpoint,
+  type AcceptanceStage,
+} from "../src/server/application/acceptance-checkpoint.ts";
+import {
+  RECEIVING_API_KEY_SECRET,
+  authStorageKey,
+  pkceVerifierCookie,
+  readSessionTokens,
+} from "../src/server/application/acceptance-mail.ts";
 import {
   APP_DATABASE_URL_SECRET,
   EXPECTED_AUTHORIZATION_PATH,
@@ -29,14 +44,15 @@ import {
   classifyAuthSettings,
   classifyDirectProbes,
   classifyExposedSchemas,
+  classifyOpenApiDocument,
   acceptanceTally,
   classifyIssuedAudience,
   dataApiDenied,
   decodePreflightCases,
   formatAcceptanceReport,
   jwtAudience,
-  openApiExposesApp,
   probeDirectTenants,
+  secretAbsent,
   schemaIdentity,
   type AcceptanceCase,
   type AcceptanceReport,
@@ -114,6 +130,8 @@ const KEY_IDS = [
   ...SESSION_IDS,
 ] as const;
 
+export type HostedPhase = "all" | "signup" | "continue" | "finish";
+
 export interface HostedAcceptanceInput {
   commit: string;
   publishableKey: string | null;
@@ -128,6 +146,10 @@ export interface HostedAcceptanceInput {
   startedAt: string;
   preflightCases?: AcceptanceCase[] | null;
   requestTimeoutMs?: number;
+  phase?: HostedPhase;
+  mailMode?: "required";
+  stateDir?: string;
+  writePhaseOutput?: (name: string, value: string) => void;
   writeManifest?: (body: string) => void;
   probeDatabase?: (
     url: string,
@@ -157,6 +179,8 @@ interface Tenant {
   businessId: string | null;
   delegatedToken: string | null;
   responseLost: boolean;
+  confirmed: boolean;
+  verifier: string;
   jar: Map<string, string>;
 }
 
@@ -259,10 +283,28 @@ export async function runHostedAcceptance(
   let closingCommit = "";
   let openingOk = false;
   let closingChecked = false;
-  const tenants: Tenant[] = (["tenant-a", "tenant-b"] as const).map(
-    (label) => ({
+  const phase = input.phase ?? "all";
+  const mailRequired = input.mailMode === "required" || phase !== "all";
+  const stateDir = input.stateDir;
+  const restored =
+    phase === "continue" || phase === "finish"
+      ? stateDir
+        ? readCheckpoint(stateDir, nonce)
+        : null
+      : null;
+  let phasePaused = false;
+  let metadataPass = false;
+  let authorizationEndpoint: string | null = null;
+  let tokenEndpoint: string | null = null;
+  let registrationEndpoint: string | null = null;
+  let mailerAutoconfirmFalse = false;
+  let recoveryRequestedAt: string | null = null;
+  const recoveryJar = new Map<string, string>();
+  const tenants: Tenant[] = (["tenant-a", "tenant-b"] as const).map((label) => {
+    const verifier = rng(32).toString("base64url");
+    return {
       label,
-      email: `tos3-${label}-${nonce}@example.com`,
+      email: expectedCleanupEmail(label, nonce),
       password: syntheticPassword(rng(24)),
       userId: null,
       accessToken: null,
@@ -270,9 +312,11 @@ export async function runHostedAcceptance(
       businessId: null,
       delegatedToken: null,
       responseLost: false,
+      confirmed: false,
+      verifier,
       jar: new Map<string, string>(),
-    }),
-  );
+    };
+  });
   const tenantA = requiredTenant(tenants[0]);
   const tenantB = requiredTenant(tenants[1]);
   const registered: RegisteredClient[] = [];
@@ -337,7 +381,7 @@ export async function runHostedAcceptance(
     "content-type": "application/json",
   });
 
-  const rememberCookies = (tenant: Tenant, headers: Headers) => {
+  const rememberCookiesOn = (jar: Map<string, string>, headers: Headers) => {
     const listed =
       typeof headers.getSetCookie === "function" ? headers.getSetCookie() : [];
     for (const line of listed) {
@@ -346,70 +390,43 @@ export async function runHostedAcceptance(
       if (eq <= 0) continue;
       const name = pair.slice(0, eq).trim();
       const value = pair.slice(eq + 1);
-      if (value.length === 0 || /max-age=0/i.test(line))
-        tenant.jar.delete(name);
-      else tenant.jar.set(name, value);
+      if (value.length === 0 || /max-age=0/i.test(line)) jar.delete(name);
+      else jar.set(name, value);
     }
+  };
+
+  const rememberCookies = (tenant: Tenant, headers: Headers) => {
+    rememberCookiesOn(tenant.jar, headers);
   };
 
   const cookieHeader = (tenant: Tenant): string =>
     [...tenant.jar].map(([name, value]) => `${name}=${value}`).join("; ");
 
-  try {
-    const nonceReady = /^[a-f0-9]{32}$/.test(nonce);
-    const attemptReady = /^[0-9]+$/.test(input.runAttempt);
-    const startedReady = Number.isFinite(Date.parse(input.startedAt));
-    const localDetail = !nonceReady
-      ? "run_nonce_absent"
-      : !attemptReady
-        ? "run_attempt_absent"
-        : !startedReady
-          ? "started_at_absent"
-          : "";
-    if (!input.bypass) {
-      openingOk = false;
-      results.push(
-        acceptanceCase(
-          "health",
-          "fail",
-          localDetail || "protection_bypass_absent",
-        ),
-      );
-    } else {
-      const health = await request(`${target.site}/api/v1/health`, {
-        headers: { accept: "application/json" },
-      });
-      const healthBody = json(health) as {
-        status?: unknown;
-        environment?: unknown;
-        supabaseProjectRef?: unknown;
-        commit?: unknown;
-      };
-      deployedCommit =
-        typeof healthBody?.commit === "string" ? healthBody.commit : "";
-      const healthPass =
-        health.status === 200 &&
-        healthBody?.status === "ok" &&
-        healthBody.environment === "development" &&
-        healthBody.supabaseProjectRef === target.ref &&
-        deployedCommit === input.commit;
-      openingOk = healthPass && nonceReady && attemptReady && startedReady;
-      results.push(
-        acceptanceCase(
-          "health",
-          openingOk ? "pass" : "fail",
-          openingOk
-            ? "development_commit_match"
-            : localDetail ||
-                `http_${health.status} commit=${commitEvidence(deployedCommit, input.commit)}`,
-        ),
-      );
-    }
+  if (restored) applyCheckpoint(restored);
 
-    if (!openingOk) {
-      publishManifest();
+  try {
+    if (phase === "continue" || phase === "finish") {
+      if (!restored) {
+        results.push(
+          acceptanceCase("runner.checkpoint", "fail", "checkpoint_absent"),
+        );
+      } else if (restored.stage === "blocked") {
+        openingOk = false;
+      } else if (phase === "finish" && restored.stage === "signed_up") {
+        openingOk = true;
+        results.push(
+          acceptanceCase(
+            "runner.checkpoint",
+            "fail",
+            "acceptance_stage_incomplete",
+          ),
+        );
+      } else {
+        openingOk = true;
+        await resumeAcceptedWork(restored.stage);
+      }
     } else {
-      await runMutableChecks();
+      await openAndRun();
     }
   } catch (error) {
     results.push(
@@ -420,7 +437,7 @@ export async function runHostedAcceptance(
       ),
     );
   } finally {
-    if (openingOk && !closingChecked) {
+    if (!phasePaused && openingOk && !closingChecked) {
       try {
         await closingHealth();
       } catch (error) {
@@ -433,7 +450,18 @@ export async function runHostedAcceptance(
         );
       }
     }
-    publishManifest();
+    if (!phasePaused) publishManifest();
+  }
+
+  if (phasePaused) {
+    return {
+      environment: "development",
+      source: input.commit,
+      deployedCommit,
+      closingCommit,
+      schema: input.schema,
+      results,
+    };
   }
 
   results.push(
@@ -485,6 +513,150 @@ export async function runHostedAcceptance(
     results,
   };
 
+  function applyCheckpoint(saved: AcceptanceCheckpoint): void {
+    deployedCommit = saved.deployedCommit;
+    results.push(...saved.results);
+    mailerAutoconfirmFalse = saved.mailerAutoconfirmFalse;
+    metadataPass = saved.metadataPass;
+    authorizationEndpoint = saved.authorizationEndpoint;
+    tokenEndpoint = saved.tokenEndpoint;
+    registrationEndpoint = saved.registrationEndpoint;
+    recoveryRequestedAt = saved.recoveryRequestedAt;
+    recoveryJar.clear();
+    for (const [name, value] of saved.recoveryJar) recoveryJar.set(name, value);
+    for (const tenant of tenants) {
+      const savedTenant = saved.tenants.find(
+        (row) => row.label === tenant.label,
+      );
+      if (!savedTenant) continue;
+      tenant.email = savedTenant.email;
+      tenant.password = savedTenant.password;
+      tenant.userId = savedTenant.userId;
+      tenant.accessToken = savedTenant.accessToken;
+      tenant.refreshToken = savedTenant.refreshToken;
+      tenant.businessId = savedTenant.businessId;
+      tenant.delegatedToken = savedTenant.delegatedToken;
+      tenant.responseLost = savedTenant.responseLost;
+      tenant.confirmed = savedTenant.confirmed;
+      tenant.verifier = savedTenant.verifier;
+      tenant.jar = new Map(savedTenant.jar);
+    }
+  }
+
+  function pause(stage: AcceptanceStage): void {
+    phasePaused = true;
+    if (!stateDir) return;
+    const checkpoint: AcceptanceCheckpoint = {
+      version: 1,
+      stage,
+      deployedCommit,
+      results: [...results],
+      mailerAutoconfirmFalse,
+      metadataPass,
+      authorizationEndpoint,
+      tokenEndpoint,
+      registrationEndpoint,
+      recoveryRequestedAt,
+      recoveryJar: [...recoveryJar],
+      tenants: tenants.map((tenant) => ({
+        label: tenant.label,
+        email: tenant.email,
+        password: tenant.password,
+        userId: tenant.userId,
+        accessToken: tenant.accessToken,
+        refreshToken: tenant.refreshToken,
+        businessId: tenant.businessId,
+        delegatedToken: tenant.delegatedToken,
+        responseLost: tenant.responseLost,
+        confirmed: tenant.confirmed,
+        verifier: tenant.verifier,
+        jar: [...tenant.jar],
+      })),
+    };
+    writeCheckpoint(stateDir, checkpoint);
+    if (stage === "recovery_requested" && recoveryRequestedAt) {
+      writeRecoveryWindow(stateDir, recoveryRequestedAt);
+    }
+    if (stage === "signed_up") input.writePhaseOutput?.("continue", "true");
+    if (stage === "blocked") input.writePhaseOutput?.("continue", "false");
+  }
+
+  async function openAndRun(): Promise<void> {
+    const nonceReady = /^[a-f0-9]{32}$/.test(nonce);
+    const attemptReady = /^[0-9]+$/.test(input.runAttempt);
+    const startedReady = Number.isFinite(Date.parse(input.startedAt));
+    const localDetail = !nonceReady
+      ? "run_nonce_absent"
+      : !attemptReady
+        ? "run_attempt_absent"
+        : !startedReady
+          ? "started_at_absent"
+          : "";
+    if (!input.bypass) {
+      openingOk = false;
+      results.push(
+        acceptanceCase(
+          "health",
+          "fail",
+          localDetail || "protection_bypass_absent",
+        ),
+      );
+    } else {
+      const health = await request(`${target.site}/api/v1/health`, {
+        headers: { accept: "application/json" },
+      });
+      const healthBody = json(health) as {
+        status?: unknown;
+        environment?: unknown;
+        supabaseProjectRef?: unknown;
+        commit?: unknown;
+      };
+      deployedCommit =
+        typeof healthBody?.commit === "string" ? healthBody.commit : "";
+      const healthPass =
+        health.status === 200 &&
+        healthBody?.status === "ok" &&
+        healthBody.environment === "development" &&
+        healthBody.supabaseProjectRef === target.ref &&
+        deployedCommit === input.commit;
+      openingOk = healthPass && nonceReady && attemptReady && startedReady;
+      results.push(
+        acceptanceCase(
+          "health",
+          openingOk ? "pass" : "fail",
+          openingOk
+            ? "development_commit_match"
+            : localDetail ||
+                `http_${health.status} commit=${commitEvidence(deployedCommit, input.commit)}`,
+        ),
+      );
+    }
+    if (!openingOk) {
+      publishManifest();
+      if (phase === "signup") pause("blocked");
+      return;
+    }
+    await runMutableChecks();
+  }
+
+  async function resumeAcceptedWork(stage: AcceptanceStage): Promise<void> {
+    if (phase === "continue") {
+      await sessionGate();
+      return;
+    }
+    if (stage === "recovery_requested") {
+      const sessionCurrent = await completeRecovery(tenantA);
+      const sessionsBlocked = results.some(
+        (row) =>
+          row.id === "login.tenant_a" && row.detail.startsWith("blocked:"),
+      );
+      if (sessionCurrent && !sessionsBlocked) await finishAcceptedWork();
+      await runManagement();
+      await runDirectDatabase();
+      await closingHealth();
+    }
+  }
+
   async function runMutableChecks(): Promise<void> {
     const resourceReply = await request(
       `${target.site}/.well-known/oauth-protected-resource`,
@@ -518,6 +690,11 @@ export async function runHostedAcceptance(
       );
     } else {
       await runWithKey();
+    }
+    if (phasePaused) return;
+    if (phase === "signup") {
+      pause(openingOk ? "signed_up" : "blocked");
+      return;
     }
     await runManagement();
     await runDirectDatabase();
@@ -611,11 +788,23 @@ export async function runHostedAcceptance(
       token_endpoint?: unknown;
       registration_endpoint?: unknown;
     };
-    const metadataPass =
+    metadataPass =
       metadataReply.status === 200 &&
       sameOrigin(metadata.authorization_endpoint, target.supabaseUrl) &&
       sameOrigin(metadata.token_endpoint, target.supabaseUrl) &&
       sameOrigin(metadata.registration_endpoint, target.supabaseUrl);
+    authorizationEndpoint =
+      typeof metadata.authorization_endpoint === "string"
+        ? metadata.authorization_endpoint
+        : null;
+    tokenEndpoint =
+      typeof metadata.token_endpoint === "string"
+        ? metadata.token_endpoint
+        : null;
+    registrationEndpoint =
+      typeof metadata.registration_endpoint === "string"
+        ? metadata.registration_endpoint
+        : null;
     results.push(
       acceptanceCase(
         "auth.oauth_metadata",
@@ -631,18 +820,7 @@ export async function runHostedAcceptance(
         accept: "application/openapi+json",
       },
     });
-    const openApiBody = json(openApi);
-    results.push(
-      acceptanceCase(
-        "data_api.openapi",
-        openApi.status === 200 && !openApiExposesApp(openApiBody)
-          ? "pass"
-          : "fail",
-        openApi.status === 200 && !openApiExposesApp(openApiBody)
-          ? "app_absent"
-          : `http_${openApi.status}`,
-      ),
-    );
+    results.push(classifyOpenApiDocument(openApi.status, json(openApi)));
     const anonRead = await request(`${target.supabaseUrl}/rest/v1/businesses`, {
       headers: { apikey: key, authorization: `Bearer ${key}` },
     });
@@ -653,6 +831,8 @@ export async function runHostedAcceptance(
         `http_${anonRead.status}`,
       ),
     );
+
+    mailerAutoconfirmFalse = settings?.mailer_autoconfirm === false;
 
     if (settings?.disable_signup === true) {
       results.push(
@@ -669,14 +849,23 @@ export async function runHostedAcceptance(
     for (const tenant of tenants) {
       let created: Reply;
       try {
-        created = await request(`${target.supabaseUrl}/auth/v1/signup`, {
-          method: "POST",
-          headers: authHeaders(),
-          body: JSON.stringify({
-            email: tenant.email,
-            password: tenant.password,
-          }),
-        });
+        const redirectTo = `${target.site}/auth/callback`;
+        const challenge = createHash("sha256")
+          .update(tenant.verifier)
+          .digest("base64url");
+        created = await request(
+          `${target.supabaseUrl}/auth/v1/signup?redirect_to=${encodeURIComponent(redirectTo)}`,
+          {
+            method: "POST",
+            headers: authHeaders(),
+            body: JSON.stringify({
+              email: tenant.email,
+              password: tenant.password,
+              code_challenge: challenge,
+              code_challenge_method: "s256",
+            }),
+          },
+        );
       } catch (error) {
         if (!(error instanceof RequestTimeoutError)) throw error;
         tenant.responseLost = true;
@@ -716,36 +905,332 @@ export async function runHostedAcceptance(
         typeof body?.access_token === "string" ? body.access_token : null;
       tenant.refreshToken =
         typeof body?.refresh_token === "string" ? body.refresh_token : null;
-      const confirmed = created.status < 300 && Boolean(tenant.accessToken);
+      const sessionIssued = created.status < 300 && Boolean(tenant.accessToken);
       publishManifest();
       results.push(
         acceptanceCase(
           `signup.${tenant.label.replace("tenant-", "tenant_")}`,
-          confirmed ? "pass" : "fail",
-          confirmed
+          sessionIssued ? "pass" : "fail",
+          sessionIssued
             ? "session_issued"
-            : settings?.mailer_autoconfirm === false
-              ? "blocked:mailer_autoconfirm_false"
-              : `http_${created.status}`,
+            : created.status >= 300
+              ? `http_${created.status}`
+              : mailerAutoconfirmFalse
+                ? `http_${created.status} confirmation_required`
+                : `http_${created.status}`,
         ),
       );
     }
 
-    if (tenants.some((tenant) => tenant.responseLost || !tenant.accessToken)) {
+    if (phase === "signup") {
+      pause("signed_up");
+      return;
+    }
+    await sessionGate();
+  }
+
+  function mailFailureDetail(purpose: "confirmation" | "recovery"): string {
+    if (!stateDir) return "mail_result_absent";
+    const mail = readMailResult(stateDir, purpose);
+    if (!mail) return "mail_result_absent";
+    if (mail.status === "secret_absent") {
+      return secretAbsent(RECEIVING_API_KEY_SECRET);
+    }
+    if (mail.status === "receiving_http") {
+      return `receiving_http_${mail.httpStatus ?? 0}`;
+    }
+    return mail.status;
+  }
+
+  async function exchangeAppCode(
+    tenant: Tenant,
+    path: "/auth/callback" | "/auth/recovery",
+    code: string,
+    expectedLocation: string,
+  ): Promise<boolean> {
+    const cookie = pkceVerifierCookie(
+      authStorageKey(target.supabaseUrl),
+      tenant.verifier,
+    );
+    tenant.jar.set(cookie.name, cookie.value);
+    const reply = await request(
+      `${target.site}${path}?code=${encodeURIComponent(code)}`,
+      {
+        headers: { cookie: cookieHeader(tenant), accept: "text/html" },
+      },
+    );
+    rememberCookies(tenant, reply.headers);
+    const location = reply.headers.get("location") ?? "";
+    if (reply.status !== 303 || location !== expectedLocation) return false;
+    tenant.confirmed = true;
+    const tokens = readSessionTokens(
+      authStorageKey(target.supabaseUrl),
+      tenant.jar,
+    );
+    if (tokens) {
+      tenant.accessToken = tokens.accessToken;
+      tenant.refreshToken = tokens.refreshToken;
+    }
+    return true;
+  }
+
+  async function applyConfirmation(): Promise<void> {
+    const pending = tenants.filter(
+      (tenant) =>
+        !tenant.responseLost && !tenant.accessToken && !tenant.confirmed,
+    );
+    if (pending.length === 0 || !mailerAutoconfirmFalse || !mailRequired)
+      return;
+    const mail = stateDir ? readMailResult(stateDir, "confirmation") : null;
+    for (const tenant of pending) {
+      const id = `signup.confirmation.${tenant.label.replace("tenant-", "tenant_")}`;
+      const action =
+        mail?.status === "ready"
+          ? mail.actions.find(
+              (row) =>
+                row.label === tenant.label && row.path === "/auth/callback",
+            )
+          : undefined;
+      if (!action) {
+        results.push(
+          acceptanceCase(
+            id,
+            "fail",
+            mail?.status === "ready"
+              ? "link_rejected"
+              : mailFailureDetail("confirmation"),
+          ),
+        );
+        continue;
+      }
+      const exchanged = await exchangeAppCode(
+        tenant,
+        action.path,
+        action.code,
+        `${target.site}/business`,
+      );
+      results.push(
+        acceptanceCase(
+          id,
+          exchanged ? "pass" : "fail",
+          exchanged ? "confirmed" : "callback_rejected",
+        ),
+      );
+    }
+  }
+
+  async function completeRecovery(tenant: Tenant): Promise<boolean> {
+    if (!mailRequired || phase === "continue" || phase === "signup")
+      return true;
+    const mail = stateDir ? readMailResult(stateDir, "recovery") : null;
+    const action =
+      mail?.status === "ready"
+        ? mail.actions.find(
+            (row) =>
+              row.label === tenant.label && row.path === "/auth/recovery",
+          )
+        : undefined;
+    if (!action) {
+      const detail =
+        mail?.status === "ready"
+          ? "link_rejected"
+          : mailFailureDetail("recovery");
+      results.push(acceptanceCase("recovery.email_callback", "fail", detail));
+      results.push(acceptanceCase("recovery.completion", "fail", detail));
+      results.push(
+        acceptanceCase("recovery.previous_refresh_rejected", "fail", detail),
+      );
+      results.push(acceptanceCase("recovery.session_replaced", "fail", detail));
+      return true;
+    }
+    const reply = await request(
+      `${target.site}/auth/recovery?code=${encodeURIComponent(action.code)}`,
+      {
+        headers: {
+          cookie: [...recoveryJar]
+            .map(([name, value]) => `${name}=${value}`)
+            .join("; "),
+          accept: "text/html",
+        },
+      },
+    );
+    rememberCookiesOn(recoveryJar, reply.headers);
+    const location = reply.headers.get("location") ?? "";
+    const callbackPass =
+      reply.status === 303 &&
+      location === `${target.site}/auth/update-password`;
+    results.push(
+      acceptanceCase(
+        "recovery.email_callback",
+        callbackPass ? "pass" : "fail",
+        callbackPass ? "recovery_callback" : "callback_rejected",
+      ),
+    );
+    if (!callbackPass) {
+      results.push(
+        acceptanceCase("recovery.completion", "fail", "callback_rejected"),
+      );
+      results.push(
+        acceptanceCase(
+          "recovery.previous_refresh_rejected",
+          "fail",
+          "callback_rejected",
+        ),
+      );
+      results.push(
+        acceptanceCase(
+          "recovery.session_replaced",
+          "fail",
+          "callback_rejected",
+        ),
+      );
+      return true;
+    }
+    const previousRefresh = tenant.refreshToken;
+    const nextPassword = syntheticPassword(rng(24));
+    tenant.password = nextPassword;
+    const updated = await request(`${target.site}/api/auth/password`, {
+      method: "POST",
+      headers: {
+        origin: target.site,
+        "content-type": "application/x-www-form-urlencoded",
+        cookie: [...recoveryJar]
+          .map(([name, value]) => `${name}=${value}`)
+          .join("; "),
+      },
+      body: new URLSearchParams({
+        password: nextPassword,
+      }).toString(),
+    });
+    const updatedLocation = updated.headers.get("location") ?? "";
+    const pass =
+      updated.status === 303 && updatedLocation === `${target.site}/business`;
+    results.push(
+      acceptanceCase(
+        "recovery.completion",
+        pass ? "pass" : "fail",
+        pass ? "password_updated" : `http_${updated.status}`,
+      ),
+    );
+    if (!pass) {
+      results.push(
+        acceptanceCase(
+          "recovery.previous_refresh_rejected",
+          "fail",
+          "not_executed",
+        ),
+      );
+      results.push(
+        acceptanceCase("recovery.session_replaced", "fail", "not_executed"),
+      );
+      return true;
+    }
+    const revoked = await previousRefreshRejected(previousRefresh);
+    results.push(
+      acceptanceCase(
+        "recovery.previous_refresh_rejected",
+        revoked ? "pass" : "fail",
+        revoked
+          ? "revoked"
+          : previousRefresh
+            ? "refresh_still_accepted"
+            : "refresh_absent",
+      ),
+    );
+    const replaced = await replaceRevokedSession(tenant, previousRefresh);
+    results.push(
+      acceptanceCase(
+        "recovery.session_replaced",
+        replaced ? "pass" : "fail",
+        replaced ? "password_session" : "login_rejected",
+      ),
+    );
+    return replaced;
+  }
+
+  async function previousRefreshRejected(
+    refreshToken: string | null,
+  ): Promise<boolean> {
+    if (!refreshToken) return false;
+    const reply = await request(
+      `${target.supabaseUrl}/auth/v1/token?grant_type=refresh_token`,
+      {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      },
+    );
+    return reply.status === 400 || reply.status === 401 || reply.status === 403;
+  }
+
+  async function replaceRevokedSession(
+    tenant: Tenant,
+    previousRefresh: string | null,
+  ): Promise<boolean> {
+    tenant.jar.clear();
+    tenant.accessToken = null;
+    tenant.refreshToken = null;
+    const reply = await request(`${target.site}/api/auth/login`, {
+      method: "POST",
+      headers: {
+        origin: target.site,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        email: tenant.email,
+        password: tenant.password,
+        next: "/business",
+      }).toString(),
+    });
+    rememberCookies(tenant, reply.headers);
+    const tokens = readSessionTokens(
+      authStorageKey(target.supabaseUrl),
+      tenant.jar,
+    );
+    const location = reply.headers.get("location") ?? "";
+    const pass =
+      reply.status === 303 &&
+      location.startsWith(`${target.site}/business`) &&
+      tokens !== null &&
+      tokens.refreshToken !== previousRefresh &&
+      tenant.jar.size > 0;
+    if (!pass || !tokens) return false;
+    tenant.accessToken = tokens.accessToken;
+    tenant.refreshToken = tokens.refreshToken;
+    return true;
+  }
+
+  async function sessionGate(): Promise<void> {
+    await applyConfirmation();
+    const pending = tenants.some(
+      (tenant) =>
+        tenant.responseLost || (!tenant.accessToken && !tenant.confirmed),
+    );
+    if (pending) {
       const reason = tenants.some((tenant) => tenant.responseLost)
         ? "signup.response_lost"
-        : settings?.mailer_autoconfirm === false
-          ? "mailer_autoconfirm_false"
+        : mailerAutoconfirmFalse
+          ? "confirmation_required"
           : "signup_session_absent";
       results.push(...blockedCases(SESSION_IDS, reason));
       await recovery(tenantA);
+      if (phase === "continue") {
+        pause("recovery_requested");
+        return;
+      }
+      await completeRecovery(tenantA);
       return;
     }
-
-    for (const tenant of tenants) {
-      await login(tenant);
-    }
+    for (const tenant of tenants) await login(tenant);
     await recovery(tenantA);
+    if (phase === "continue") {
+      pause("recovery_requested");
+      return;
+    }
+    if (await completeRecovery(tenantA)) await finishAcceptedWork();
+  }
+
+  async function finishAcceptedWork(): Promise<void> {
     await refreshUi(tenantA);
     for (const tenant of tenants) await createOwnBusiness(tenant);
     await businessPages();
@@ -757,10 +1242,7 @@ export async function runHostedAcceptance(
       results.push(...blockedCases(GENERIC_IDS, "oauth_metadata"));
       return;
     }
-    registration = await register(
-      metadata.registration_endpoint as string,
-      "acceptance",
-    );
+    registration = await register(registrationEndpoint ?? "", "acceptance");
     if (!registration) {
       results.push(...blockedCases(GENERIC_IDS, "dynamic_registration"));
       return;
@@ -768,8 +1250,8 @@ export async function runHostedAcceptance(
     const approvedA = await consent(
       tenantA,
       registration,
-      metadata.authorization_endpoint as string,
-      metadata.token_endpoint as string,
+      authorizationEndpoint ?? "",
+      tokenEndpoint ?? "",
       "approve",
     );
     results.push(
@@ -798,8 +1280,8 @@ export async function runHostedAcceptance(
     const approvedB = await consent(
       tenantB,
       registration,
-      metadata.authorization_endpoint as string,
-      metadata.token_endpoint as string,
+      authorizationEndpoint ?? "",
+      tokenEndpoint ?? "",
       "approve",
     );
     if (!approvedB.ok || !tenantB.delegatedToken) {
@@ -824,19 +1306,16 @@ export async function runHostedAcceptance(
     await revokeAndReconnect(
       tenantA,
       registration,
-      metadata.authorization_endpoint as string,
-      metadata.token_endpoint as string,
+      authorizationEndpoint ?? "",
+      tokenEndpoint ?? "",
     );
-    denialRegistration = await register(
-      metadata.registration_endpoint as string,
-      "denial",
-    );
+    denialRegistration = await register(registrationEndpoint ?? "", "denial");
     const denied = denialRegistration
       ? await consent(
           tenantA,
           denialRegistration,
-          metadata.authorization_endpoint as string,
-          metadata.token_endpoint as string,
+          authorizationEndpoint ?? "",
+          tokenEndpoint ?? "",
           "deny",
         )
       : { ok: false, token: null };
@@ -848,7 +1327,7 @@ export async function runHostedAcceptance(
       ),
     );
     restrictedRegistration = await register(
-      metadata.registration_endpoint as string,
+      registrationEndpoint ?? "",
       "restricted",
     );
     if (!restrictedRegistration) {
@@ -858,8 +1337,8 @@ export async function runHostedAcceptance(
     const restricted = await consent(
       tenantA,
       restrictedRegistration,
-      metadata.authorization_endpoint as string,
-      metadata.token_endpoint as string,
+      authorizationEndpoint ?? "",
+      tokenEndpoint ?? "",
       "approve",
       { permissions: ["business.read"], remember: false },
     );
@@ -916,6 +1395,7 @@ export async function runHostedAcceptance(
   }
 
   async function recovery(tenant: Tenant): Promise<void> {
+    recoveryRequestedAt = new Date().toISOString();
     const reply = await request(`${target.site}/api/auth/recover`, {
       method: "POST",
       headers: {
@@ -927,6 +1407,7 @@ export async function runHostedAcceptance(
         redirect: "https://example.com/phish",
       }).toString(),
     });
+    rememberCookiesOn(recoveryJar, reply.headers);
     const location = reply.headers.get("location") ?? "";
     const pass =
       reply.status === 303 &&
@@ -1858,12 +2339,22 @@ const EVIDENCE_GAPS: readonly AcceptanceCase[] = [
   acceptanceCase(
     "recovery.email_callback",
     "gap",
-    "The recovery request response is not an email callback. This workflow does not read mail, so it cannot show delivery or a return to /auth/recovery.",
+    "Secretless runs do not read mail. The protected workflow records this case from the isolated receiving step.",
   ),
   acceptanceCase(
     "recovery.completion",
     "gap",
-    "Recovery completion follows the email callback. This workflow does not read mail or call the admin API.",
+    "Recovery completion follows the email callback. Secretless runs do not read mail or call the admin API.",
+  ),
+  acceptanceCase(
+    "recovery.previous_refresh_rejected",
+    "gap",
+    "Secretless runs do not update the password, so they do not observe GoTrue revoking the earlier refresh token.",
+  ),
+  acceptanceCase(
+    "recovery.session_replaced",
+    "gap",
+    "Secretless runs do not sign in again after recovery. The protected workflow replaces the revoked tenant session before the later checks.",
   ),
   acceptanceCase(
     "ui.browser_interaction",
@@ -2003,6 +2494,20 @@ async function main(): Promise<number> {
   const preflightCases =
     decodePreflightCases(process.env.ACCEPTANCE_PREFLIGHT_CASES ?? "") ??
     blockedCases(MANAGEMENT_CASE_IDS, "preflight_cases_absent");
+  let phase: HostedPhase;
+  try {
+    phase = readPhase(process.env.ACCEPTANCE_PHASE);
+  } catch {
+    console.error("::error::ACCEPTANCE_PHASE is not a supported phase.");
+    return 2;
+  }
+  const stateDir = process.env.RUNNER_TEMP
+    ? `${process.env.RUNNER_TEMP}/tos3-acceptance`
+    : undefined;
+  if (phase !== "all" && !stateDir) {
+    console.error("::error::RUNNER_TEMP is absent.");
+    return 2;
+  }
   const report = await runHostedAcceptance({
     commit: process.env.GITHUB_SHA ?? "",
     runId,
@@ -2014,14 +2519,35 @@ async function main(): Promise<number> {
     appDatabaseUrl: material.appDatabaseUrl,
     preflightCases,
     bypass: bypass.value ?? null,
+    phase,
+    mailMode:
+      process.env.ACCEPTANCE_MAIL_MODE === "required" ? "required" : undefined,
+    stateDir,
+    writePhaseOutput: (name, value) => {
+      const output = process.env.GITHUB_OUTPUT;
+      if (!output || /[\r\n]/.test(value)) return;
+      appendFileSync(output, `${name}=${value}\n`);
+    },
     schema: reviewedSchema(),
     writeManifest: (body) => {
       // Do not mask this value. A masked job output is dropped.
       writeManifestOutput(body, process.env.GITHUB_OUTPUT);
     },
   });
+  if (phase === "signup" || phase === "continue") {
+    console.log(`acceptance_stage=${phase}`);
+    return 0;
+  }
   console.log(formatAcceptanceReport(report));
   return acceptanceTally(report.results).exitCode;
+}
+
+function readPhase(value: string | undefined): HostedPhase {
+  if (!value || value === "all") return "all";
+  if (value === "signup" || value === "continue" || value === "finish") {
+    return value;
+  }
+  throw new Error("acceptance_phase");
 }
 
 if (
