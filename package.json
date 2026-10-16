@@ -19,6 +19,7 @@
     "hygiene": "node scripts/check-repo-hygiene.ts",
     "migrate:development": "tsx scripts/apply-migrations.ts",
     "accept:development": "tsx scripts/hosted-acceptance.ts",
+    "accept:development:mail": "tsx scripts/hosted-acceptance-mail.ts",
     "accept:development:preflight": "tsx scripts/hosted-acceptance-preflight.ts",
     "accept:development:health": "tsx scripts/probe-development-health.ts",
     "accept:development:cleanup": "tsx scripts/hosted-acceptance-cleanup.ts",
