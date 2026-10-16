@@ -16,6 +16,12 @@ export const PREFLIGHT_JOB_NAME = "Preflight tutor-mbos-dev";
 export const ACCEPT_JOB_NAME = "Accept tutor-mbos-dev";
 export const CAPABILITY_STEP_NAME =
   "Check admin capability and mint run identity";
+export const RUNNER_SETUP_STEP_NAME = "Set up job";
+export const RUNNER_COMPLETE_STEP_NAME = "Complete job";
+export const POST_BOUNDARY_STEP_NAMES = [
+  "Pull Vercel project settings and environment",
+  "Verify deployment target binding",
+] as const;
 export const ACCEPTANCE_RUN_PAGE_SIZE = 100;
 /** Documented workflow-run search cap when actor, event, or head_sha is set. */
 export const ACCEPTANCE_RUN_RESULT_BOUND = 1_000;
@@ -137,13 +143,9 @@ export type AcceptanceRequestReason =
   | "recovery_denied"
   | "rerun";
 
-export function reviewAcceptanceComment(input: {
-  request: AcceptanceCommentRequest;
-  pullRequest: PullRequestSnapshot | null;
-  delivery: WorkflowRunList | null;
-  acceptance: AcceptanceRunList | null;
-}): AcceptanceRequestDecision {
-  const request = input.request;
+export function reviewAcceptanceRequestShape(
+  request: AcceptanceCommentRequest,
+): AcceptanceRequestDecision {
   if (
     request.eventName !== "issue_comment" ||
     request.eventAction !== "created"
@@ -163,11 +165,24 @@ export function reviewAcceptanceComment(input: {
   if (!DIGITS.test(request.issueNumber)) return reject("issue_number");
   const parsed = parseAcceptanceCommand(request.commentBody);
   if (!parsed) return reject("command");
-  const command = parsed.candidate;
-  if (!SHA.test(request.githubSha) || command !== request.githubSha) {
+  if (!SHA.test(request.githubSha) || parsed.candidate !== request.githubSha) {
     return reject("candidate_not_head");
   }
   if (!request.pullRequestPresent) return reject("not_pull_request");
+  return { ok: true, candidate: parsed.candidate };
+}
+
+export function reviewAcceptanceComment(input: {
+  request: AcceptanceCommentRequest;
+  pullRequest: PullRequestSnapshot | null;
+  delivery: WorkflowRunList | null;
+  acceptance: AcceptanceRunList | null;
+}): AcceptanceRequestDecision {
+  const shape = reviewAcceptanceRequestShape(input.request);
+  if (!shape.ok) return shape;
+  const parsed = parseAcceptanceCommand(input.request.commentBody);
+  if (!parsed) return reject("command");
+  const command = parsed.candidate;
   const pullRequest = input.pullRequest;
   if (!pullRequest) return reject("not_pull_request");
   if (!pullRequest.merged) return reject("pull_request_unmerged");
@@ -177,7 +192,7 @@ export function reviewAcceptanceComment(input: {
   ) {
     return reject("pull_request_base");
   }
-  if (pullRequest.number !== request.issueNumber) {
+  if (pullRequest.number !== input.request.issueNumber) {
     return reject("pull_request_number");
   }
   if (pullRequest.mergeCommitSha !== command) {
@@ -195,7 +210,7 @@ export function reviewAcceptanceComment(input: {
   if (parsed.kind === "accept") {
     let unknown = false;
     for (const run of input.acceptance.runs) {
-      const evidence = earlierAcceptance(run, request.runId, command);
+      const evidence = earlierAcceptance(run, input.request.runId, command);
       if (evidence === "block") return reject("duplicate_request");
       if (evidence === "unknown") unknown = true;
     }
@@ -206,7 +221,7 @@ export function reviewAcceptanceComment(input: {
   let denied = false;
   let unknown = false;
   for (const run of input.acceptance.runs) {
-    const evidence = recoveryEvidence(run, request.runId, command);
+    const evidence = recoveryEvidence(run, input.request.runId, command);
     if (evidence === "proven") proven = true;
     else if (evidence === "deny") denied = true;
     else if (evidence === "unknown") unknown = true;
@@ -393,6 +408,7 @@ function failedBeforeCapability(
     return "deny";
   }
   let earlierFailure = false;
+  const earlier = job.steps.filter((step) => step.number < boundary.number);
   for (const step of job.steps) {
     if (!knownStep(step)) return "unknown";
     if (step.number < boundary.number) {
@@ -400,11 +416,44 @@ function failedBeforeCapability(
       if (step.conclusion === "failure") earlierFailure = true;
       continue;
     }
-    if (step.status !== "completed" || step.conclusion !== "skipped") {
-      return "deny";
+    if (step.name === CAPABILITY_STEP_NAME && step.number === boundary.number) {
+      continue;
     }
+    const after = stepAfterBoundary(step, earlier);
+    if (after === "deny") return "deny";
+    if (after === "unknown") return "unknown";
   }
   return earlierFailure ? "proven" : "unknown";
+}
+
+function stepAfterBoundary(
+  step: AcceptanceStepSnapshot,
+  earlier: readonly AcceptanceStepSnapshot[],
+): "allow" | "deny" | "unknown" {
+  if ((POST_BOUNDARY_STEP_NAMES as readonly string[]).includes(step.name)) {
+    return step.status === "completed" && step.conclusion === "skipped"
+      ? "allow"
+      : "deny";
+  }
+  if (isRunnerTeardown(step.name, earlier)) {
+    return step.status === "completed" &&
+      (step.conclusion === "success" || step.conclusion === "skipped")
+      ? "allow"
+      : "unknown";
+  }
+  return "unknown";
+}
+
+function isRunnerTeardown(
+  name: string,
+  earlier: readonly AcceptanceStepSnapshot[],
+): boolean {
+  if (name === RUNNER_COMPLETE_STEP_NAME) return true;
+  if (!name.startsWith("Post ")) return false;
+  const rest = name.slice("Post ".length);
+  return earlier.some(
+    (step) => step.name === rest || step.name === `Run ${rest}`,
+  );
 }
 
 function knownStep(step: AcceptanceStepSnapshot): boolean {

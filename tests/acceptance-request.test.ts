@@ -9,8 +9,12 @@ import {
   ACCEPTANCE_RUN_RESULT_BOUND,
   AUTHORIZE_JOB_NAME,
   CAPABILITY_STEP_NAME,
+  POST_BOUNDARY_STEP_NAMES,
   PREFLIGHT_JOB_NAME,
+  RUNNER_COMPLETE_STEP_NAME,
+  RUNNER_SETUP_STEP_NAME,
   reviewAcceptanceComment,
+  reviewAcceptanceRequestShape,
   type AcceptanceCommentRequest,
   type AcceptanceJobSnapshot,
   type AcceptanceRunList,
@@ -1029,6 +1033,169 @@ describe("acceptance comment authorization", () => {
     ).toEqual({ ok: false, reason: "recovery_denied" });
   });
 
+  it("fetches history before it can prove a recover command", async () => {
+    const recoverEnv = env({
+      ACCEPTANCE_RUN_ID: "200",
+      ACCEPTANCE_COMMENT_BODY: `/tutor-mbos recover-development ${sha}`,
+    });
+    expect(
+      reviewAcceptanceRequestShape(
+        request({
+          runId: "200",
+          commentBody: `/tutor-mbos recover-development ${sha}`,
+        }),
+      ),
+    ).toEqual({ ok: true, candidate: sha });
+    const calls: string[] = [];
+    const proven = await authorizeAcceptanceComment({
+      env: recoverEnv,
+      fetchImpl: async (input) => {
+        const url = String(input);
+        calls.push(url);
+        return recoveryApi(url, realisticPreflightJobs());
+      },
+    });
+    expect(proven).toEqual({ ok: true, candidate: sha });
+    expect(calls.some((url) => url.includes("filter=all"))).toBe(true);
+    const capabilityStarted = await authorizeAcceptanceComment({
+      env: recoverEnv,
+      fetchImpl: async (input) =>
+        recoveryApi(
+          String(input),
+          realisticPreflightJobs(
+            preResourceSteps().map((step) =>
+              step.name === CAPABILITY_STEP_NAME
+                ? { ...step, conclusion: "failure" }
+                : step,
+            ),
+          ),
+        ),
+    });
+    expect(capabilityStarted).toEqual({
+      ok: false,
+      reason: "recovery_denied",
+    });
+    const businessStarted = await authorizeAcceptanceComment({
+      env: recoverEnv,
+      fetchImpl: async (input) =>
+        recoveryApi(String(input), [
+          ...realisticPreflightJobs().slice(0, -1),
+          {
+            id: 8,
+            name: ACCEPT_JOB_NAME,
+            status: "completed",
+            conclusion: "failure",
+            steps: [],
+          },
+        ]),
+    });
+    expect(businessStarted).toEqual({ ok: false, reason: "recovery_denied" });
+    const missingSteps = await authorizeAcceptanceComment({
+      env: recoverEnv,
+      fetchImpl: async (input) =>
+        recoveryApi(String(input), [
+          {
+            id: 1,
+            name: AUTHORIZE_JOB_NAME,
+            status: "completed",
+            conclusion: "success",
+          },
+          {
+            id: 2,
+            name: PREFLIGHT_JOB_NAME,
+            status: "completed",
+            conclusion: "failure",
+          },
+          {
+            id: 3,
+            name: ACCEPT_JOB_NAME,
+            status: "completed",
+            conclusion: "skipped",
+          },
+        ]),
+    });
+    expect(missingSteps).toEqual({
+      ok: false,
+      reason: "acceptance_evidence_unknown",
+    });
+    const unrecognized = await authorizeAcceptanceComment({
+      env: recoverEnv,
+      fetchImpl: async (input) =>
+        recoveryApi(
+          String(input),
+          realisticPreflightJobs([
+            ...preResourceSteps(),
+            {
+              name: "Archive results",
+              number: 12,
+              status: "completed",
+              conclusion: "skipped",
+            },
+          ]),
+        ),
+    });
+    expect(unrecognized).toEqual({
+      ok: false,
+      reason: "acceptance_evidence_unknown",
+    });
+    const strayPost = await authorizeAcceptanceComment({
+      env: recoverEnv,
+      fetchImpl: async (input) =>
+        recoveryApi(
+          String(input),
+          realisticPreflightJobs([
+            ...preResourceSteps(),
+            {
+              name: "Post Run evil/action@v1",
+              number: 24,
+              status: "completed",
+              conclusion: "success",
+            },
+          ]),
+        ),
+    });
+    expect(strayPost).toEqual({
+      ok: false,
+      reason: "acceptance_evidence_unknown",
+    });
+    const protectedStep = await authorizeAcceptanceComment({
+      env: recoverEnv,
+      fetchImpl: async (input) =>
+        recoveryApi(
+          String(input),
+          realisticPreflightJobs(
+            preResourceSteps().map((step) =>
+              step.name === POST_BOUNDARY_STEP_NAMES[0]
+                ? { ...step, conclusion: "success" }
+                : step,
+            ),
+          ),
+        ),
+    });
+    expect(protectedStep).toEqual({ ok: false, reason: "recovery_denied" });
+    const duplicate = await authorizeAcceptanceComment({
+      env: recoverEnv,
+      fetchImpl: jobsResponse({
+        total_count: 2,
+        jobs: [
+          {
+            id: 7,
+            name: AUTHORIZE_JOB_NAME,
+            status: "completed",
+            conclusion: "success",
+          },
+          {
+            id: 7,
+            name: AUTHORIZE_JOB_NAME,
+            status: "completed",
+            conclusion: "skipped",
+          },
+        ],
+      }),
+    });
+    expect(duplicate).toEqual({ ok: false, reason: "acceptance_lookup" });
+  });
+
   it("checks the authorized candidate without executing it", () => {
     expect(
       execFileSync("node", ["scripts/assert-acceptance-candidate.mjs"], {
@@ -1108,30 +1275,92 @@ function githubRun(
 }
 
 function preResourceSteps(): AcceptanceJobSnapshot["steps"] {
+  const checkout = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
+  const setup = "./.github/actions/setup";
   return [
     {
-      name: "Require main",
+      name: RUNNER_SETUP_STEP_NAME,
       number: 1,
       status: "completed",
       conclusion: "success",
     },
     {
-      name: "Require Auth admin cleanup credential",
+      name: `Run ${checkout}`,
+      number: 2,
+      status: "completed",
+      conclusion: "success",
+    },
+    {
+      name: "Require main",
+      number: 3,
+      status: "completed",
+      conclusion: "skipped",
+    },
+    {
+      name: "Reject comment rerun",
+      number: 4,
+      status: "completed",
+      conclusion: "success",
+    },
+    {
+      name: "Require authorized candidate",
+      number: 5,
+      status: "completed",
+      conclusion: "success",
+    },
+    {
+      name: `Run ${setup}`,
       number: 6,
+      status: "completed",
+      conclusion: "success",
+    },
+    {
+      name: "Require Auth admin cleanup credential",
+      number: 7,
       status: "completed",
       conclusion: "failure",
     },
     {
-      name: CAPABILITY_STEP_NAME,
+      name: "Report acceptance credentials",
       number: 8,
       status: "completed",
       conclusion: "skipped",
     },
     {
-      name: "Pull Vercel project settings and environment",
+      name: CAPABILITY_STEP_NAME,
       number: 9,
       status: "completed",
       conclusion: "skipped",
+    },
+    {
+      name: POST_BOUNDARY_STEP_NAMES[0],
+      number: 10,
+      status: "completed",
+      conclusion: "skipped",
+    },
+    {
+      name: POST_BOUNDARY_STEP_NAMES[1],
+      number: 11,
+      status: "completed",
+      conclusion: "skipped",
+    },
+    {
+      name: `Post Run ${setup}`,
+      number: 21,
+      status: "completed",
+      conclusion: "success",
+    },
+    {
+      name: `Post Run ${checkout}`,
+      number: 22,
+      status: "completed",
+      conclusion: "success",
+    },
+    {
+      name: RUNNER_COMPLETE_STEP_NAME,
+      number: 23,
+      status: "completed",
+      conclusion: "success",
     },
   ];
 }
@@ -1199,4 +1428,75 @@ function env(
     GITHUB_TOKEN: "ci-token",
     ...overrides,
   };
+}
+
+function realisticPreflightJobs(
+  steps: AcceptanceJobSnapshot["steps"] = preResourceSteps(),
+): Record<string, unknown>[] {
+  return [
+    {
+      id: 11,
+      name: AUTHORIZE_JOB_NAME,
+      status: "completed",
+      conclusion: "skipped",
+      steps: [],
+    },
+    {
+      id: 1,
+      name: AUTHORIZE_JOB_NAME,
+      status: "completed",
+      conclusion: "success",
+      steps: [],
+    },
+    {
+      id: 12,
+      name: PREFLIGHT_JOB_NAME,
+      status: "completed",
+      conclusion: "skipped",
+      steps: [],
+    },
+    {
+      id: 2,
+      name: PREFLIGHT_JOB_NAME,
+      status: "completed",
+      conclusion: "failure",
+      steps,
+    },
+    {
+      id: 13,
+      name: ACCEPT_JOB_NAME,
+      status: "completed",
+      conclusion: "skipped",
+      steps: [],
+    },
+    {
+      id: 3,
+      name: ACCEPT_JOB_NAME,
+      status: "completed",
+      conclusion: "skipped",
+      steps: [],
+    },
+  ];
+}
+
+function recoveryApi(url: string, jobs: Record<string, unknown>[]): Response {
+  if (url.endsWith("/pulls/8")) return pullResponse();
+  if (url.includes("/workflows/deploy-development.yml/")) {
+    return Response.json({
+      total_count: 1,
+      workflow_runs: [deliveryRun()],
+    });
+  }
+  if (url.includes("event=workflow_dispatch")) {
+    return Response.json({ total_count: 0, workflow_runs: [] });
+  }
+  if (url.includes("event=issue_comment")) {
+    return Response.json({
+      total_count: 1,
+      workflow_runs: [
+        githubRun({ id: 100, status: "completed", conclusion: "failure" }),
+      ],
+    });
+  }
+  return Response.json({ total_count: jobs.length, jobs });
 }

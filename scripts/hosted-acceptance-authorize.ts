@@ -16,6 +16,7 @@ import {
   ACCEPTANCE_RUN_RESULT_BOUND,
   DEPLOY_WORKFLOW_FILE,
   reviewAcceptanceComment,
+  reviewAcceptanceRequestShape,
   type AcceptanceCommentRequest,
   type AcceptanceJobSnapshot,
   type AcceptanceRequestReason,
@@ -72,12 +73,7 @@ export async function authorizeAcceptanceComment(input: {
   | { ok: false; reason: string; detail?: string }
 > {
   const request = requestFromEnv(input.env);
-  const local = reviewAcceptanceComment({
-    request,
-    pullRequest: request.pullRequestPresent ? placeholderPull(request) : null,
-    delivery: { complete: true, runs: delivered(request.githubSha) },
-    acceptance: { complete: true, runs: [] },
-  });
+  const local = reviewAcceptanceRequestShape(request);
   if (!local.ok) return { ok: false, reason: safeReason(local.reason) };
   const token = input.env.GITHUB_TOKEN ?? "";
   if (!token) return { ok: false, reason: "token_absent" };
@@ -134,29 +130,6 @@ function requestFromEnv(
     runId: env.ACCEPTANCE_RUN_ID ?? "",
     runAttempt: env.ACCEPTANCE_RUN_ATTEMPT ?? "",
   };
-}
-
-function placeholderPull(
-  request: AcceptanceCommentRequest,
-): PullRequestSnapshot {
-  return {
-    number: request.issueNumber,
-    merged: true,
-    baseRef: "main",
-    baseRepository: ACCEPTANCE_REPOSITORY,
-    mergeCommitSha: request.githubSha,
-  };
-}
-
-function delivered(headSha: string): WorkflowRunSnapshot[] {
-  return [
-    {
-      id: "0",
-      headSha,
-      status: "completed",
-      conclusion: "success",
-    },
-  ];
 }
 
 function boundDetail(totalCount: number | undefined): string | undefined {
