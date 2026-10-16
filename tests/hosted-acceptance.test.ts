@@ -633,6 +633,9 @@ describe("hosted acceptance harness", () => {
     expect(text).toContain(
       "startsWith(github.event.comment.body, '/tutor-mbos accept-development ')",
     );
+    expect(text).toContain(
+      "startsWith(github.event.comment.body, '/tutor-mbos recover-development ')",
+    );
     expect(text).toContain("queue: max");
     expect(text).not.toContain("development-acceptance");
     expect(text).toContain(
@@ -689,6 +692,9 @@ describe("hosted acceptance harness", () => {
     expect(authorize.if).toContain("github.run_attempt == 1");
     expect(authorize.if).toContain(
       "startsWith(github.event.comment.body, '/tutor-mbos accept-development ')",
+    );
+    expect(authorize.if).toContain(
+      "startsWith(github.event.comment.body, '/tutor-mbos recover-development ')",
     );
     expect(authorize.permissions).toEqual({
       contents: "read",
