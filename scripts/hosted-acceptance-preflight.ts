@@ -264,7 +264,8 @@ async function main(): Promise<number> {
     console.error(`::error::${result.reason}`);
     return 1;
   }
-  mask(result.nonce);
+  // The nonce is not a credential. Masking it here makes Actions drop the
+  // job output, so accept and cleanup would see an empty nonce.
   writeOutput("nonce", result.nonce);
   writeOutput("started_at", result.startedAt);
   writeOutput("cases", encodePreflightCases(result.cases));

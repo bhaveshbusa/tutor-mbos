@@ -36,7 +36,7 @@ import {
   formatAcceptanceReport,
   jwtAudience,
   openApiExposesApp,
-  probeDirectTenantAccess,
+  probeDirectTenants,
   schemaIdentity,
   type AcceptanceCase,
   type AcceptanceReport,
@@ -1642,21 +1642,18 @@ export async function runHostedAcceptance(
       return;
     }
     try {
-      const probes: DirectProbe[] = [];
-      for (const tenant of tenants) {
+      const probeInputs = tenants.map((tenant) => {
         const other = tenant.label === "tenant-a" ? tenantB : tenantA;
-        const probeInput = {
+        return {
           userId: tenant.userId ?? "",
           ownBusinessId: tenant.businessId ?? "",
           otherBusinessId: other.businessId ?? "",
           clientIds: registered.map((client) => client.clientId),
         };
-        probes.push(
-          input.probeDatabase
-            ? await input.probeDatabase(input.appDatabaseUrl, probeInput)
-            : await probeWithPg(probeInput),
-        );
-      }
+      });
+      const probes = input.probeDatabase
+        ? await probeEach(input.appDatabaseUrl, probeInputs)
+        : await probeWithPg(probeInputs);
       results.push(...classifyDirectProbes(probes));
     } catch (error) {
       results.push(
@@ -1666,12 +1663,23 @@ export async function runHostedAcceptance(
     }
   }
 
+  async function probeEach(
+    url: string,
+    probeInputs: readonly DirectProbeInput[],
+  ): Promise<DirectProbe[]> {
+    const probes: DirectProbe[] = [];
+    for (const probeInput of probeInputs) {
+      probes.push(await input.probeDatabase!(url, probeInput));
+    }
+    return probes;
+  }
+
   async function probeWithPg(
-    probeInput: DirectProbeInput,
-  ): Promise<DirectProbe> {
+    probeInputs: readonly DirectProbeInput[],
+  ): Promise<DirectProbe[]> {
     const connection = pgConnection(input.appDatabaseUrl ?? "");
     try {
-      return await probeDirectTenantAccess(connection, probeInput);
+      return await probeDirectTenants(connection, probeInputs);
     } finally {
       await connection.close();
     }
@@ -1933,6 +1941,7 @@ async function main(): Promise<number> {
     return 2;
   }
   const runNonce = process.env.ACCEPTANCE_RUN_NONCE ?? "";
+  mask(runNonce);
   if (!/^[a-f0-9]{32}$/.test(runNonce)) {
     console.error(
       "::error::ACCEPTANCE_RUN_NONCE must be 32 hex characters before signup.",

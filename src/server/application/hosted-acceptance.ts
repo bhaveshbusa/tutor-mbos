@@ -485,6 +485,94 @@ export async function probeDirectTenantAccess(
   };
 }
 
+interface TenantView {
+  input: DirectProbeInput;
+  clientIds: string[];
+  ownVisible: boolean;
+  otherVisible: boolean;
+  exact: boolean;
+}
+
+/**
+ * Reads every tenant's visible businesses before any cleanup. A tenant who
+ * can see anything except exactly their own business aborts the whole set,
+ * so one delete cannot hide the other tenant's row from the next check.
+ */
+export async function probeDirectTenants(
+  db: SqlConnection,
+  inputs: readonly DirectProbeInput[],
+): Promise<DirectProbe[]> {
+  let runtimeReadDenied = false;
+  try {
+    await db.query("select id::text as id from app.businesses");
+  } catch (error) {
+    runtimeReadDenied = permissionDenied(error);
+  }
+  const views: TenantView[] = [];
+  for (const input of inputs) {
+    const clientIds = [...(input.clientIds ?? [])];
+    const visible = await asRequest(db, input.userId, visibleIds);
+    views.push({
+      input,
+      clientIds,
+      ownVisible:
+        visible.includes(input.ownBusinessId) &&
+        !visible.includes(input.otherBusinessId),
+      otherVisible: visible.includes(input.otherBusinessId),
+      exact: visible.length === 1 && visible[0] === input.ownBusinessId,
+    });
+  }
+  if (views.some((view) => !view.exact || view.clientIds.length > 3)) {
+    return views.map((view) => ({
+      runtimeReadDenied,
+      ownVisible: view.ownVisible,
+      otherVisible: view.otherVisible,
+      deleted: false,
+      aborted: true,
+      abortReason: "visibility",
+    }));
+  }
+  const probes: DirectProbe[] = [];
+  let stopped = false;
+  for (const view of views) {
+    if (stopped) {
+      probes.push({
+        runtimeReadDenied,
+        ownVisible: view.ownVisible,
+        otherVisible: view.otherVisible,
+        deleted: false,
+        aborted: true,
+        abortReason: "count",
+      });
+      continue;
+    }
+    let removed = false;
+    try {
+      await asRequest(db, view.input.userId, async (tx) => {
+        await deleteOwnedRows(tx, view.input, view.clientIds);
+      });
+      removed = true;
+    } catch {
+      removed = false;
+    }
+    const remaining = await asRequest(db, view.input.userId, visibleIds);
+    const deleted =
+      removed &&
+      !remaining.includes(view.input.ownBusinessId) &&
+      !remaining.includes(view.input.otherBusinessId);
+    if (!deleted) stopped = true;
+    probes.push({
+      runtimeReadDenied,
+      ownVisible: view.ownVisible,
+      otherVisible: view.otherVisible,
+      deleted,
+      aborted: !deleted,
+      abortReason: deleted ? null : "count",
+    });
+  }
+  return probes;
+}
+
 async function deleteOwnedRows(
   tx: Sql,
   input: DirectProbeInput,

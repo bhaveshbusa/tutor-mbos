@@ -16,12 +16,17 @@ name: Accept development
 # repository that artifact is downloadable. It has no emails, keys, tokens,
 # or database URLs. The run nonce and started_at are preflight job outputs.
 # The business job cannot rewrite them through its own step environment.
+# The nonce is not masked in preflight: Actions drops a masked job output.
+# Accept and cleanup mask it when they read it. It is not a credential.
+# The admin capability step runs before pnpm dlx vercel, so that unlocked
+# package cannot change the environment of a step that holds the admin key
+# or the Management API token. Same-run v4 artifact upload and download use
+# the workflow contents permission.
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
-  actions: write
 
 concurrency:
   group: development-delivery
@@ -88,18 +93,18 @@ jobs:
           else
             echo "TUTOR_MBOS_APP_DATABASE_URL is present. Expected secret scope: GitHub environment development."
           fi
-      - name: Pull Vercel project settings and environment
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-        run: pnpm dlx "vercel@${VERCEL_CLI_VERSION}" pull --yes --environment=production
-      - name: Verify deployment target binding
-        run: node scripts/assert-deploy-target.ts "$DEPLOY_ENVIRONMENT"
       - name: Check admin capability and mint run identity
         id: identity
         env:
           SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY: ${{ secrets.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY }}
           SUPABASE_DEVELOPMENT_ACCESS_TOKEN: ${{ secrets.SUPABASE_DEVELOPMENT_ACCESS_TOKEN }}
         run: pnpm accept:development:preflight
+      - name: Pull Vercel project settings and environment
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: pnpm dlx "vercel@${VERCEL_CLI_VERSION}" pull --yes --environment=production
+      - name: Verify deployment target binding
+        run: node scripts/assert-deploy-target.ts "$DEPLOY_ENVIRONMENT"
 
   accept:
     name: Accept tutor-mbos-dev

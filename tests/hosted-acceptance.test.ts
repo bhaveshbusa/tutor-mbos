@@ -18,6 +18,7 @@ import {
   dataApiDenied,
   formatAcceptanceReport,
   probeDirectTenantAccess,
+  probeDirectTenants,
   sanitizeDetail,
 } from "@/server/application/hosted-acceptance";
 import { siteOriginFor } from "@/server/config/access";
@@ -625,6 +626,7 @@ describe("hosted acceptance harness", () => {
       "SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY is absent. Expected secret scope: GitHub environment development",
     );
     const parsed = parse(text) as {
+      permissions?: Record<string, string>;
       concurrency?: { group?: string };
       jobs: Record<
         string,
@@ -634,7 +636,9 @@ describe("hosted acceptance harness", () => {
           timeout?: number;
           "timeout-minutes"?: number;
           environment?: string;
+          outputs?: Record<string, string>;
           steps: {
+            id?: string;
             name?: string;
             run?: string;
             if?: string;
@@ -648,6 +652,8 @@ describe("hosted acceptance harness", () => {
         }
       >;
     };
+    expect(parsed.permissions).toEqual({ contents: "read" });
+    expect(text).not.toContain("actions: write");
     expect(Object.keys(parsed.jobs)).toEqual([
       "preflight",
       "accept",
@@ -679,9 +685,30 @@ describe("hosted acceptance harness", () => {
       );
       expect(setup?.with?.["pnpm-cache"]).toBe("false");
     }
-    expect(preflight.steps.some((step) => step.run?.includes("vercel"))).toBe(
-      true,
+    const identityAt = preflight.steps.findIndex(
+      (step) => step.run === "pnpm accept:development:preflight",
     );
+    const pullAt = preflight.steps.findIndex((step) =>
+      step.run?.includes("pnpm dlx"),
+    );
+    expect(identityAt).toBeGreaterThan(-1);
+    expect(pullAt).toBeGreaterThan(identityAt);
+    expect(preflight.steps[identityAt]?.id).toBe("identity");
+    expect(preflight.outputs?.nonce).toBe(
+      "${{ steps.identity.outputs.nonce }}",
+    );
+    expect(preflight.outputs?.started_at).toBe(
+      "${{ steps.identity.outputs.started_at }}",
+    );
+    const preflightScript = readFileSync(
+      "scripts/hosted-acceptance-preflight.ts",
+      "utf8",
+    );
+    expect(preflightScript).toContain("mask(adminKey)");
+    expect(preflightScript).toContain("mask(managementToken)");
+    expect(preflightScript.match(/mask\(/g)).toHaveLength(3);
+    expect(preflightScript).toContain('writeOutput("nonce", result.nonce)');
+    expect(preflightScript).not.toContain("mask(result.nonce)");
     expect(accept.steps.some((step) => step.run?.includes("vercel"))).toBe(
       false,
     );
@@ -737,6 +764,13 @@ describe("hosted acceptance harness", () => {
     );
     expect(download?.["continue-on-error"]).toBe(true);
     const script = readFileSync("scripts/hosted-acceptance.ts", "utf8");
+    expect(script).toContain("mask(runNonce)");
+    expect(script).toContain("probeDirectTenants");
+    const cleanupScript = readFileSync(
+      "scripts/hosted-acceptance-cleanup.ts",
+      "utf8",
+    );
+    expect(cleanupScript).toContain("mask(identity.runNonce)");
     expect(script).not.toContain("/auth/v1/admin");
     expect(script).not.toContain("auth.users");
     expect(script).not.toContain("SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY");
@@ -1008,25 +1042,27 @@ describe("direct tenant probe", () => {
       "grant app_request to app_runtime with inherit false, set true",
     );
     await connection.exec("set session authorization app_runtime");
-    const probe = await probeDirectTenantAccess(connection, {
-      userId: userA,
-      ownBusinessId: createdA.business.id,
-      otherBusinessId: createdB.business.id,
-      clientIds: [],
-    });
-    expect(probe.runtimeReadDenied).toBe(true);
-    expect(probe.ownVisible).toBe(true);
-    expect(probe.otherVisible).toBe(false);
-    expect(probe.deleted).toBe(true);
-    const probeB = await probeDirectTenantAccess(connection, {
-      userId: userB,
-      ownBusinessId: createdB.business.id,
-      otherBusinessId: createdA.business.id,
-      clientIds: [],
-    });
-    expect(probeB.ownVisible).toBe(true);
-    expect(probeB.otherVisible).toBe(false);
-    expect(probeB.deleted).toBe(true);
+    const [probe, probeB] = await probeDirectTenants(connection, [
+      {
+        userId: userA,
+        ownBusinessId: createdA.business.id,
+        otherBusinessId: createdB.business.id,
+        clientIds: [],
+      },
+      {
+        userId: userB,
+        ownBusinessId: createdB.business.id,
+        otherBusinessId: createdA.business.id,
+        clientIds: [],
+      },
+    ]);
+    expect(probe?.runtimeReadDenied).toBe(true);
+    expect(probe?.ownVisible).toBe(true);
+    expect(probe?.otherVisible).toBe(false);
+    expect(probe?.deleted).toBe(true);
+    expect(probeB?.ownVisible).toBe(true);
+    expect(probeB?.otherVisible).toBe(false);
+    expect(probeB?.deleted).toBe(true);
     await connection.exec("reset session authorization");
     expect(await store.readBusiness(actor(userB))).toBeNull();
     expect(await store.readBusiness(actor(userA))).toBeNull();
@@ -1099,6 +1135,154 @@ describe("direct tenant probe", () => {
     await db.close();
   });
 
+  it("stops before any write when tenant B can see the other businesses", async () => {
+    const { db, connection, store } = await migratedDatabase();
+    const userA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
+    const userB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2";
+    const userC = "12121212-1212-4121-8121-121212121212";
+    const actor = (userId: string) => ({
+      path: "ui-session" as const,
+      userId,
+      clientId: null,
+    });
+    const createdA = await store.createBusiness(actor(userA), {
+      displayName: "Synthetic A",
+      idempotencyKey: "tos3-a",
+    });
+    const createdB = await store.createBusiness(actor(userB), {
+      displayName: "Synthetic B",
+      idempotencyKey: "tos3-b",
+    });
+    const createdC = await store.createBusiness(actor(userC), {
+      displayName: "Synthetic C",
+      idempotencyKey: "tos3-c",
+    });
+    await connection.exec(
+      "alter policy businesses_owner on app.businesses using (true) with check (true)",
+    );
+    await connection.exec(
+      "alter policy creation_keys_owner on app.business_creation_keys using (true) with check (true)",
+    );
+    await connection.exec("create role app_runtime login noinherit");
+    await connection.exec(
+      "grant app_request to app_runtime with inherit false, set true",
+    );
+    await connection.exec("set session authorization app_runtime");
+    const probe = await probeDirectTenantAccess(connection, {
+      userId: userB,
+      ownBusinessId: createdB.business.id,
+      otherBusinessId: createdA.business.id,
+      clientIds: [],
+    });
+    expect(probe.otherVisible).toBe(true);
+    expect(probe.deleted).toBe(false);
+    expect(probe.aborted).toBe(true);
+    expect(probe.abortReason).toBe("visibility");
+    const claims = JSON.stringify({
+      sub: userB,
+      role: "authenticated",
+      aud: "authenticated",
+    });
+    const remaining = await connection.transaction(async (tx) => {
+      await tx.query("select set_config('request.jwt.claims', $1, true)", [
+        claims,
+      ]);
+      await tx.query("select set_config('request.jwt.claim.sub', $1, true)", [
+        userB,
+      ]);
+      await tx.exec("set local role app_request");
+      return tx.query<{ id: string }>(
+        "select id::text as id from app.businesses",
+      );
+    });
+    expect(remaining.rows.map((row) => row.id).sort()).toEqual(
+      [createdA.business.id, createdB.business.id, createdC.business.id].sort(),
+    );
+    await db.close();
+  });
+
+  it("reads both tenants before either cleanup when the owner policy is permissive", async () => {
+    const { db, connection, store } = await migratedDatabase();
+    const userA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
+    const userB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2";
+    const userC = "12121212-1212-4121-8121-121212121212";
+    const actor = (userId: string) => ({
+      path: "ui-session" as const,
+      userId,
+      clientId: null,
+    });
+    const createdA = await store.createBusiness(actor(userA), {
+      displayName: "Synthetic A",
+      idempotencyKey: "tos3-a",
+    });
+    const createdB = await store.createBusiness(actor(userB), {
+      displayName: "Synthetic B",
+      idempotencyKey: "tos3-b",
+    });
+    const createdC = await store.createBusiness(actor(userC), {
+      displayName: "Synthetic C",
+      idempotencyKey: "tos3-c",
+    });
+    await connection.exec(
+      "alter policy businesses_owner on app.businesses using (true) with check (true)",
+    );
+    await connection.exec(
+      "alter policy creation_keys_owner on app.business_creation_keys using (true) with check (true)",
+    );
+    await connection.exec("create role app_runtime login noinherit");
+    await connection.exec(
+      "grant app_request to app_runtime with inherit false, set true",
+    );
+    await connection.exec("set session authorization app_runtime");
+    const probes = await probeDirectTenants(connection, [
+      {
+        userId: userA,
+        ownBusinessId: createdA.business.id,
+        otherBusinessId: createdB.business.id,
+        clientIds: [],
+      },
+      {
+        userId: userB,
+        ownBusinessId: createdB.business.id,
+        otherBusinessId: createdA.business.id,
+        clientIds: [],
+      },
+    ]);
+    expect(probes.map((probe) => probe.otherVisible)).toEqual([true, true]);
+    expect(probes.every((probe) => probe.deleted === false)).toBe(true);
+    expect(probes.every((probe) => probe.abortReason === "visibility")).toBe(
+      true,
+    );
+    const claims = JSON.stringify({
+      sub: userA,
+      role: "authenticated",
+      aud: "authenticated",
+    });
+    const remaining = await connection.transaction(async (tx) => {
+      await tx.query("select set_config('request.jwt.claims', $1, true)", [
+        claims,
+      ]);
+      await tx.query("select set_config('request.jwt.claim.sub', $1, true)", [
+        userA,
+      ]);
+      await tx.exec("set local role app_request");
+      const businesses = await tx.query<{ id: string }>(
+        "select id::text as id from app.businesses",
+      );
+      const keys = await tx.query<{ business_id: string }>(
+        "select business_id::text as business_id from app.business_creation_keys",
+      );
+      return { businesses, keys };
+    });
+    expect(remaining.businesses.rows.map((row) => row.id).sort()).toEqual(
+      [createdA.business.id, createdB.business.id, createdC.business.id].sort(),
+    );
+    expect(remaining.keys.rows.map((row) => row.business_id).sort()).toEqual(
+      [createdA.business.id, createdB.business.id, createdC.business.id].sort(),
+    );
+    await db.close();
+  });
+
   it("rolls back when the scoped creation-key count is not exactly one", async () => {
     const { db, connection, store } = await migratedDatabase();
     const userA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
@@ -1134,6 +1318,62 @@ describe("direct tenant probe", () => {
     });
     expect(probe.deleted).toBe(false);
     expect(probe.abortReason).toBe("count");
+    await connection.exec("reset session authorization");
+    expect((await store.readBusiness(actor(userA)))?.id).toBe(
+      createdA.business.id,
+    );
+    expect((await store.readBusiness(actor(userB)))?.id).toBe(
+      createdB.business.id,
+    );
+    await db.close();
+  });
+
+  it("does not delete the second tenant after the first cleanup rolls back", async () => {
+    const { db, connection, store } = await migratedDatabase();
+    const userA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
+    const userB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2";
+    const actor = (userId: string) => ({
+      path: "ui-session" as const,
+      userId,
+      clientId: null,
+    });
+    const createdA = await store.createBusiness(actor(userA), {
+      displayName: "Synthetic A",
+      idempotencyKey: "tos3-a",
+    });
+    const createdB = await store.createBusiness(actor(userB), {
+      displayName: "Synthetic B",
+      idempotencyKey: "tos3-b",
+    });
+    await connection.query(
+      `insert into app.business_creation_keys (owner_user_id, idempotency_key, business_id)
+       values ($1::uuid, 'extra', $2::uuid)`,
+      [userA, createdA.business.id],
+    );
+    await connection.exec("create role app_runtime login noinherit");
+    await connection.exec(
+      "grant app_request to app_runtime with inherit false, set true",
+    );
+    await connection.exec("set session authorization app_runtime");
+    const probes = await probeDirectTenants(connection, [
+      {
+        userId: userA,
+        ownBusinessId: createdA.business.id,
+        otherBusinessId: createdB.business.id,
+        clientIds: [],
+      },
+      {
+        userId: userB,
+        ownBusinessId: createdB.business.id,
+        otherBusinessId: createdA.business.id,
+        clientIds: [],
+      },
+    ]);
+    expect(probes[0]?.abortReason).toBe("count");
+    expect(probes[0]?.deleted).toBe(false);
+    expect(probes[1]?.deleted).toBe(false);
+    expect(probes[0]?.otherVisible).toBe(false);
+    expect(probes[1]?.otherVisible).toBe(false);
     await connection.exec("reset session authorization");
     expect((await store.readBusiness(actor(userA)))?.id).toBe(
       createdA.business.id,

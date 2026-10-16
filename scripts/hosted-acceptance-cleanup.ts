@@ -476,6 +476,7 @@ async function main(): Promise<number> {
     runNonce: process.env.ACCEPTANCE_RUN_NONCE ?? "",
     startedAt: process.env.ACCEPTANCE_STARTED_AT ?? "",
   };
+  mask(identity.runNonce);
   const manifestText = existsSync(MANIFEST_PATH)
     ? readFileSync(MANIFEST_PATH, "utf8")
     : null;
