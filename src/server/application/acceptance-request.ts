@@ -14,6 +14,8 @@ export const ACCEPT_WORKFLOW_FILE = "accept-development.yml";
 export const AUTHORIZE_JOB_NAME = "Authorize acceptance comment";
 export const PREFLIGHT_JOB_NAME = "Preflight tutor-mbos-dev";
 export const ACCEPT_JOB_NAME = "Accept tutor-mbos-dev";
+export const CLEANUP_JOB_NAME = "Clean acceptance Auth resources";
+export const EMPTY_RESOURCES_STEP_NAME = "Record empty acceptance resources";
 export const CAPABILITY_STEP_NAME =
   "Check admin capability and mint run identity";
 export const RUNNER_SETUP_STEP_NAME = "Set up job";
@@ -267,7 +269,13 @@ function earlierAcceptance(
   if (run.headSha !== candidate) return "ignore";
   if (!DIGITS.test(run.id) || !DIGITS.test(currentRunId)) return "unknown";
   if (BigInt(run.id) >= BigInt(currentRunId)) return "ignore";
-  if (run.event === "issue_comment") return commentAuthorized(run);
+  if (run.event === "issue_comment") {
+    const authorized = commentAuthorized(run);
+    if (authorized === "block" && finishedWithoutHostedResources(run)) {
+      return "ignore";
+    }
+    return authorized;
+  }
   if (run.event === "workflow_dispatch") return dispatchAccepted(run);
   return "unknown";
 }
@@ -302,6 +310,72 @@ function dispatchAccepted(
   if (preflight === "block" || accept === "block") return "block";
   if (preflight === "unknown" || accept === "unknown") return "unknown";
   return "ignore";
+}
+
+/**
+ * A finished comment run may be followed by a new accept command when the
+ * business job failed and cleanup proved both synthetic emails and the three
+ * client names are absent for that nonce. An empty manifest is not that
+ * proof. A recorded user or client stays ineligible after deletion. Recover
+ * is unchanged and stays denied once accept has started.
+ */
+function finishedWithoutHostedResources(run: AcceptanceRunSnapshot): boolean {
+  if (!run.jobsComplete) return false;
+  const authorizeJobs = run.jobs.filter(
+    (job) => job.name === AUTHORIZE_JOB_NAME,
+  );
+  if (
+    authorizeJobs.length === 0 ||
+    authorizeJobs.some((job) => !knownJob(job) || job.status !== "completed")
+  ) {
+    return false;
+  }
+  if (
+    !authorizeJobs.some((job) => job.conclusion === "success") ||
+    authorizeJobs.some(
+      (job) => job.conclusion !== "success" && job.conclusion !== "skipped",
+    )
+  ) {
+    return false;
+  }
+  const accepts = run.jobs.filter((job) => job.name === ACCEPT_JOB_NAME);
+  if (
+    accepts.length === 0 ||
+    accepts.some(
+      (job) =>
+        !knownJob(job) ||
+        job.status !== "completed" ||
+        job.conclusion !== "failure",
+    )
+  ) {
+    return false;
+  }
+  const cleanups = run.jobs.filter((job) => job.name === CLEANUP_JOB_NAME);
+  if (cleanups.length === 0) return false;
+  return cleanups.every(emptyResourcesStepProven);
+}
+
+function emptyResourcesStepProven(job: AcceptanceJobSnapshot): boolean {
+  if (
+    !knownJob(job) ||
+    job.status !== "completed" ||
+    job.conclusion !== "success" ||
+    !job.stepsComplete
+  ) {
+    return false;
+  }
+  const marks = job.steps.filter(
+    (step) => step.name === EMPTY_RESOURCES_STEP_NAME,
+  );
+  return (
+    marks.length > 0 &&
+    marks.every(
+      (step) =>
+        knownStep(step) &&
+        step.status === "completed" &&
+        step.conclusion === "success",
+    )
+  );
 }
 
 function attemptsOf(

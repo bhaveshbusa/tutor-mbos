@@ -1034,11 +1034,23 @@ describe("hosted acceptance harness", () => {
     expect(cleanupRun?.run).toBe("pnpm accept:development:cleanup");
     expect(cleanupRun?.run).not.toContain("${{");
     expect(cleanupRun?.["working-directory"]).toBeUndefined();
+    expect(cleanupRun?.id).toBe("cleanup");
     expect(cleanupRun?.env).toEqual({
       SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY:
         "${{ secrets.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY }}",
       ACCEPTANCE_MANIFEST: "${{ needs.accept.outputs.manifest }}",
     });
+    const emptyResources = cleanup.steps.find(
+      (step) => step.name === "Record empty acceptance resources",
+    );
+    expect(emptyResources?.if).toBe(
+      "steps.cleanup.outputs.hosted_resources == 'none'",
+    );
+    expect(emptyResources?.run).toBe("echo hosted_resources=none");
+    expect(emptyResources?.env).toBeUndefined();
+    expect(cleanup.steps.indexOf(emptyResources!)).toBe(
+      cleanup.steps.indexOf(cleanupRun!) + 1,
+    );
     expect(cleanup.env?.ACCEPTANCE_RUN_NONCE).toBe(
       "${{ needs.preflight.outputs.nonce }}",
     );
@@ -1162,6 +1174,45 @@ describe("hosted acceptance harness", () => {
     );
     expect(untrimmedText).toContain("TUTOR_MBOS_APP_DATABASE_URL is present.");
     expect(untrimmedText).not.toContain("is absent");
+  });
+
+  it("publishes an empty manifest when signup throws after the user is committed", async () => {
+    const doubled = developmentDouble();
+    const bodies: string[] = [];
+    const fetchImpl: typeof fetch = async (requestInput, init) => {
+      const url = new URL(
+        typeof requestInput === "string"
+          ? requestInput
+          : requestInput.toString(),
+      );
+      if (url.pathname === "/auth/v1/signup") {
+        await doubled.fetchImpl(requestInput, init);
+        throw new TypeError("fetch failed");
+      }
+      return doubled.fetchImpl(requestInput, init);
+    };
+    const report = await runHostedAcceptance(
+      input(fetchImpl, {
+        writeManifest: (body) => {
+          bodies.push(body);
+        },
+      }),
+    );
+    expect(
+      report.results.find((row) => row.id === "runner.exception")?.detail,
+    ).toBe("TypeError");
+    expect(
+      report.results.find((row) => row.id === "cleanup.manifest")?.detail,
+    ).toBe("no_hosted_users");
+    const last = bodies.at(-1);
+    expect(last).toBeDefined();
+    const parsed = JSON.parse(last ?? "{}") as {
+      users: unknown[];
+      clients: unknown[];
+    };
+    expect(parsed.users).toEqual([]);
+    expect(parsed.clients).toEqual([]);
+    expect(last).not.toContain("@example.com");
   });
 
   it("exports a bounded manifest when the business run fails before signup", async () => {

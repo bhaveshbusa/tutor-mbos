@@ -10,7 +10,12 @@ name: Accept development
 # delivery and a later delivery waits behind the acceptance run. An ordinary
 # owner comment, a foreign comment, and a comment rerun use a per-run group
 # and do not enter that queue. A recover-development comment from that actor
-# on attempt 1 uses the same delivery queue. Neither cancels the other. A comment run is
+# on attempt 1 uses the same delivery queue. A later accept-development
+# comment is allowed only when every earlier authorized comment run failed
+# in the business job and cleanup proved both synthetic emails and the three
+# client names are absent for that nonce. An empty manifest is not proof.
+# Recover stays denied once that job has started.
+# Neither cancels the other. A comment run is
 # authorized only on attempt 1. workflow_dispatch is the manual path and is
 # not rejected for a later attempt. Coding CI stays secretless.
 #
@@ -240,7 +245,11 @@ jobs:
         with:
           pnpm-cache: "false"
       - name: Clean acceptance Auth resources
+        id: cleanup
         env:
           SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY: ${{ secrets.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY }}
           ACCEPTANCE_MANIFEST: ${{ needs.accept.outputs.manifest }}
         run: pnpm accept:development:cleanup
+      - name: Record empty acceptance resources
+        if: steps.cleanup.outputs.hosted_resources == 'none'
+        run: echo hosted_resources=none

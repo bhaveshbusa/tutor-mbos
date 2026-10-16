@@ -25,10 +25,12 @@ import {
   type CleanupManifest,
 } from "@/server/application/acceptance-cleanup";
 import {
+  emptyHostedResources,
   formatCleanupExecution,
   readCleanupManifestText,
   runAcceptanceCleanup,
   withManifestReadDetail,
+  writeHostedResourcesOutput,
 } from "../scripts/hosted-acceptance-cleanup.ts";
 import { runAcceptancePreflight } from "../scripts/hosted-acceptance-preflight.ts";
 import { ENVIRONMENT_BINDINGS } from "@/server/config/environments";
@@ -432,6 +434,111 @@ describe("auth admin cleanup execution", () => {
         (call) => call === `DELETE /auth/v1/admin/oauth/clients/${clientA}`,
       ),
     ).toBe(true);
+  });
+
+  it("records an empty manifest and does not record a deleted user", async () => {
+    const doubled = adminDouble();
+    const result = await run(
+      JSON.stringify(manifest({ users: [], clients: [] })),
+      doubled,
+    );
+    expect(result).toMatchObject({
+      status: "pass",
+      usersDeleted: 0,
+      clientsDeleted: 0,
+      detail: "verified_run_resources_removed",
+    });
+    expect(emptyHostedResources(result)).toBe(true);
+    expect(
+      doubled.calls.filter((call) =>
+        call.startsWith("GET /auth/v1/admin/users"),
+      ),
+    ).toHaveLength(2);
+    expect(
+      doubled.calls.filter(
+        (call) => call === "GET /auth/v1/admin/oauth/clients",
+      ),
+    ).toHaveLength(3);
+    expect(doubled.calls.some((call) => call.startsWith("DELETE"))).toBe(false);
+    const removed = {
+      status: "pass" as const,
+      usersDeleted: 1,
+      clientsDeleted: 0,
+      detail: "verified_run_resources_removed",
+    };
+    expect(emptyHostedResources(removed)).toBe(false);
+    const dir = mkdtempSync(join(tmpdir(), "hosted-resources-"));
+    const output = join(dir, "github-output");
+    writeFileSync(output, "");
+    try {
+      writeHostedResourcesOutput(result, output);
+      writeHostedResourcesOutput(removed, output);
+      writeHostedResourcesOutput(result, undefined);
+      expect(readFileSync(output, "utf8")).toBe("hosted_resources=none\n");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not prove an empty manifest while a nonce user still exists", async () => {
+    const doubled = adminDouble({
+      listUsers: [
+        {
+          id: userA,
+          email: expectedCleanupEmail("tenant-a", nonce),
+          created_at: startedAt,
+        },
+      ],
+    });
+    const result = await run(
+      JSON.stringify(manifest({ users: [], clients: [] })),
+      doubled,
+    );
+    expect(result.status).toBe("fail");
+    expect(result.usersDeleted).toBe(1);
+    expect(result.clientsDeleted).toBe(0);
+    expect(emptyHostedResources(result)).toBe(false);
+    expect(result.detail).toContain("empty_manifest_not_absent");
+    expect(formatCleanupExecution(result)).not.toContain("@example.com");
+    const dir = mkdtempSync(join(tmpdir(), "hosted-resources-present-"));
+    const output = join(dir, "github-output");
+    writeFileSync(output, "");
+    try {
+      writeHostedResourcesOutput(result, output);
+      expect(readFileSync(output, "utf8")).toBe("");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    expect(
+      doubled.calls.some(
+        (call) => call === `DELETE /auth/v1/admin/users/${userA}`,
+      ),
+    ).toBe(true);
+  });
+
+  it("does not prove an empty manifest when a nonce lookup fails", async () => {
+    const doubled = adminDouble();
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      if (url.pathname === "/auth/v1/admin/users") {
+        return Response.json({ message: "unavailable" }, { status: 500 });
+      }
+      return doubled.fetchImpl(input, init);
+    };
+    const result = await runAcceptanceCleanup({
+      manifestText: JSON.stringify(manifest({ users: [], clients: [] })),
+      adminKey: secretKey,
+      identity,
+      supabaseUrl,
+      fetchImpl,
+      nowMs,
+    });
+    expect(result.status).toBe("fail");
+    expect(result.usersDeleted).toBe(0);
+    expect(result.clientsDeleted).toBe(0);
+    expect(emptyHostedResources(result)).toBe(false);
+    expect(result.detail).toContain("user_get_failed:tenant-a");
+    expect(result.detail).not.toContain("@example.com");
   });
 
   it("accepts a regular manifest job output and deletes only the verified ids", async () => {

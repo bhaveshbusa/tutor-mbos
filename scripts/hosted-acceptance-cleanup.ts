@@ -11,6 +11,7 @@
  * derived from the trusted nonce, the redirect, and a created_at inside
  * this run's window.
  */
+import { appendFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import {
   AUTH_ADMIN_KEY_SECRET,
@@ -118,6 +119,25 @@ export async function runAcceptanceCleanup(input: {
     users.deleted === loaded.manifest.users.length &&
     clients.deleted === loaded.manifest.clients.length &&
     failures.length === 0;
+  if (
+    pass &&
+    loaded.manifest.users.length === 0 &&
+    loaded.manifest.clients.length === 0
+  ) {
+    const recovered = await recoverByNonce(context);
+    const absent =
+      recovered.usersDeleted === 0 &&
+      recovered.clientsDeleted === 0 &&
+      recovered.notes.length === 0;
+    if (!absent) {
+      return {
+        status: "fail",
+        usersDeleted: recovered.usersDeleted,
+        clientsDeleted: recovered.clientsDeleted,
+        detail: joinDetail("empty_manifest_not_absent", recovered),
+      };
+    }
+  }
   return {
     status: pass ? "pass" : "fail",
     usersDeleted: users.deleted,
@@ -463,6 +483,32 @@ async function adminRequest(
   }
 }
 
+/**
+ * True only after an empty manifest's nonce lookups all returned not_found.
+ * Zero deletions without those lookups are not proof.
+ */
+export function emptyHostedResources(result: CleanupExecution): boolean {
+  return (
+    result.status === "pass" &&
+    result.usersDeleted === 0 &&
+    result.clientsDeleted === 0 &&
+    result.detail === "verified_run_resources_removed"
+  );
+}
+
+/**
+ * Records the empty-manifest result for the accept gate. The value is the
+ * constant `none`. A manifest that listed a user or client writes nothing,
+ * so the following workflow step stays skipped.
+ */
+export function writeHostedResourcesOutput(
+  result: CleanupExecution,
+  outputPath: string | undefined,
+): void {
+  if (!emptyHostedResources(result) || !outputPath) return;
+  appendFileSync(outputPath, "hosted_resources=none\n");
+}
+
 export function formatCleanupExecution(result: CleanupExecution): string {
   return [
     `cleanup_result=${result.status}`,
@@ -520,6 +566,7 @@ async function main(): Promise<number> {
     }),
   );
   console.log(formatCleanupExecution(result));
+  writeHostedResourcesOutput(result, process.env.GITHUB_OUTPUT);
   return result.status === "pass" ? 0 : 1;
 }
 
