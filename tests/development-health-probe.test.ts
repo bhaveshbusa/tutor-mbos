@@ -10,8 +10,11 @@ const other = "b".repeat(40);
 const secret = "synthetic-bypass-do-not-print";
 const site = siteOriginFor("development");
 
-function healthDocument(overrides: Record<string, unknown> = {}): string {
-  return JSON.stringify({
+function healthDocument(
+  overrides: Record<string, unknown> = {},
+  omit: readonly string[] = [],
+): string {
+  const body: Record<string, unknown> = {
     apiVersion: "v1",
     service: "tutor-mbos",
     status: "ok",
@@ -22,6 +25,19 @@ function healthDocument(overrides: Record<string, unknown> = {}): string {
     supabaseProjectRef: ENVIRONMENT_BINDINGS.development.supabaseProjectRef,
     syntheticDataOnly: true,
     ...overrides,
+  };
+  for (const key of omit) delete body[key];
+  return JSON.stringify(body);
+}
+
+async function probeBody(
+  status: number,
+  body: string,
+): Promise<{ ok: true } | { ok: false; detail: string }> {
+  return probeDevelopmentHealth({
+    commit,
+    bypass: secret,
+    fetchImpl: async () => response(status, body),
   });
 }
 
@@ -94,8 +110,65 @@ describe("probeDevelopmentHealth", () => {
       bypass: secret,
       fetchImpl: async () => response(200, healthDocument({ commit: other })),
     });
+    expect(other).toMatch(/^[0-9a-f]{40}$/);
+    expect(other).not.toBe(commit);
     expect(sha).toEqual({ ok: false, detail: "http_200 commit=mismatch" });
     expect(JSON.stringify(sha)).not.toContain(secret);
+  });
+
+  it("rejects a matching health document on a non-200 status", async () => {
+    expect(await probeBody(401, healthDocument())).toEqual({
+      ok: false,
+      detail: "http_401 commit=match",
+    });
+    expect(await probeBody(503, healthDocument())).toEqual({
+      ok: false,
+      detail: "http_503 commit=match",
+    });
+  });
+
+  it("rejects a 200 document whose status is not ok", async () => {
+    expect(
+      await probeBody(200, healthDocument({ status: "misconfigured" })),
+    ).toEqual({ ok: false, detail: "http_200 commit=match" });
+    expect(await probeBody(200, healthDocument({}, ["status"]))).toEqual({
+      ok: false,
+      detail: "http_200 commit=match",
+    });
+  });
+
+  it("rejects a wrong or missing service on its own", async () => {
+    expect(
+      await probeBody(200, healthDocument({ service: "other-service" })),
+    ).toEqual({ ok: false, detail: "health_shape" });
+    expect(await probeBody(200, healthDocument({}, ["service"]))).toEqual({
+      ok: false,
+      detail: "health_shape",
+    });
+  });
+
+  it("rejects syntheticDataOnly false or missing on its own", async () => {
+    expect(
+      await probeBody(200, healthDocument({ syntheticDataOnly: false })),
+    ).toEqual({ ok: false, detail: "health_shape" });
+    expect(
+      await probeBody(200, healthDocument({}, ["syntheticDataOnly"])),
+    ).toEqual({ ok: false, detail: "health_shape" });
+  });
+
+  it("classifies a null, missing, or empty 200 commit as absent", async () => {
+    expect(await probeBody(200, healthDocument({ commit: null }))).toEqual({
+      ok: false,
+      detail: "http_200 commit=absent",
+    });
+    expect(await probeBody(200, healthDocument({}, ["commit"]))).toEqual({
+      ok: false,
+      detail: "http_200 commit=absent",
+    });
+    expect(await probeBody(200, healthDocument({ commit: "" }))).toEqual({
+      ok: false,
+      detail: "http_200 commit=absent",
+    });
   });
 
   it("does not fetch when the bypass is missing and does not trim a present value", async () => {

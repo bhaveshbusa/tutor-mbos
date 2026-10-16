@@ -85,8 +85,8 @@ export async function probeDevelopmentHealth(
     if (body.service !== SERVICE_NAME || body.syntheticDataOnly !== true) {
       return { ok: false, detail: "health_shape" };
     }
-    if (commit !== input.commit) {
-      return { ok: false, detail: "http_200 commit=mismatch" };
+    if (commitState !== "match") {
+      return { ok: false, detail: `http_200 commit=${commitState}` };
     }
     return { ok: true };
   } catch (error) {

@@ -696,6 +696,7 @@ describe("hosted acceptance harness", () => {
           environment?: string;
           outputs?: Record<string, string>;
           permissions?: Record<string, string>;
+          "continue-on-error"?: boolean;
           steps: {
             id?: string;
             name?: string;
@@ -852,12 +853,18 @@ describe("hosted acceptance harness", () => {
     expect(health?.run).toBe("pnpm accept:development:health");
     expect(health?.run).not.toContain("${{");
     expect(health?.id).toBeUndefined();
-    expect(health?.["continue-on-error"] ?? false).toBe(false);
+    expect(health?.if).toBeUndefined();
+    expect(health?.["continue-on-error"]).toBeUndefined();
+    expect(preflight["continue-on-error"]).toBeUndefined();
+    const healthAt = preflight.steps.indexOf(health!);
+    for (const step of preflight.steps.slice(healthAt + 1)) {
+      expect(step.if).toBeUndefined();
+      expect(step["continue-on-error"]).toBeUndefined();
+    }
     expect(health?.env).toEqual({
       VERCEL_AUTOMATION_BYPASS_SECRET:
         "${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}",
     });
-    const healthAt = preflight.steps.indexOf(health!);
     expect(healthAt).toBeGreaterThan(preflight.steps.indexOf(presence!));
     expect(identityAt).toBeGreaterThan(healthAt);
     expect(
