@@ -289,7 +289,12 @@ export async function runHostedAcceptance(
     init: RequestInit & { redirect?: RequestRedirect } = {},
   ): Promise<Reply> => {
     const headers = new Headers(init.headers);
-    const onSite = url.startsWith(target.site);
+    let onSite = false;
+    try {
+      onSite = new URL(url).origin === target.site;
+    } catch {
+      onSite = false;
+    }
     if (onSite && input.bypass) {
       headers.set("x-vercel-protection-bypass", input.bypass);
     }
@@ -361,7 +366,7 @@ export async function runHostedAcceptance(
         : !startedReady
           ? "started_at_absent"
           : "";
-    if (input.bypass === null) {
+    if (!input.bypass) {
       openingOk = false;
       results.push(
         acceptanceCase(
