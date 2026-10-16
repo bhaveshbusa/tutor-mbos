@@ -220,6 +220,9 @@ describe("deployment protection bypass", () => {
     await expect(resolveProtectionBypass({}, unused.impl)).resolves.toEqual({
       source: "none",
     });
+    await expect(
+      resolveProtectionBypass({ VERCEL_AUTOMATION_BYPASS_SECRET: "" }),
+    ).resolves.toEqual({ source: "none" });
     expect(unused.calls).toHaveLength(0);
   });
 });

@@ -215,6 +215,15 @@ function usableSecret(value: string | undefined): string | null {
   return value;
 }
 
+function commitEvidence(
+  actual: string,
+  expected: string,
+): "absent" | "match" | "mismatch" {
+  if (actual.length === 0) return "absent";
+  if (actual === expected) return "match";
+  return "mismatch";
+}
+
 function developmentTarget(): {
   site: string;
   supabaseUrl: string;
@@ -342,42 +351,55 @@ export async function runHostedAcceptance(
     [...tenant.jar].map(([name, value]) => `${name}=${value}`).join("; ");
 
   try {
-    const health = await request(`${target.site}/api/v1/health`, {
-      headers: { accept: "application/json" },
-    });
-    const healthBody = json(health) as {
-      status?: unknown;
-      environment?: unknown;
-      supabaseProjectRef?: unknown;
-      commit?: unknown;
-    };
-    deployedCommit =
-      typeof healthBody?.commit === "string" ? healthBody.commit : "";
-    const healthPass =
-      health.status === 200 &&
-      healthBody?.status === "ok" &&
-      healthBody.environment === "development" &&
-      healthBody.supabaseProjectRef === target.ref &&
-      deployedCommit === input.commit;
     const nonceReady = /^[a-f0-9]{32}$/.test(nonce);
     const attemptReady = /^[0-9]+$/.test(input.runAttempt);
     const startedReady = Number.isFinite(Date.parse(input.startedAt));
-    openingOk = healthPass && nonceReady && attemptReady && startedReady;
-    results.push(
-      acceptanceCase(
-        "health",
-        openingOk ? "pass" : "fail",
-        openingOk
-          ? "development_commit_match"
-          : !nonceReady
-            ? "run_nonce_absent"
-            : !attemptReady
-              ? "run_attempt_absent"
-              : !startedReady
-                ? "started_at_absent"
-                : `http_${health.status} commit=${deployedCommit === input.commit ? "match" : "mismatch"}`,
-      ),
-    );
+    const localDetail = !nonceReady
+      ? "run_nonce_absent"
+      : !attemptReady
+        ? "run_attempt_absent"
+        : !startedReady
+          ? "started_at_absent"
+          : "";
+    if (input.bypass === null) {
+      openingOk = false;
+      results.push(
+        acceptanceCase(
+          "health",
+          "fail",
+          localDetail || "protection_bypass_absent",
+        ),
+      );
+    } else {
+      const health = await request(`${target.site}/api/v1/health`, {
+        headers: { accept: "application/json" },
+      });
+      const healthBody = json(health) as {
+        status?: unknown;
+        environment?: unknown;
+        supabaseProjectRef?: unknown;
+        commit?: unknown;
+      };
+      deployedCommit =
+        typeof healthBody?.commit === "string" ? healthBody.commit : "";
+      const healthPass =
+        health.status === 200 &&
+        healthBody?.status === "ok" &&
+        healthBody.environment === "development" &&
+        healthBody.supabaseProjectRef === target.ref &&
+        deployedCommit === input.commit;
+      openingOk = healthPass && nonceReady && attemptReady && startedReady;
+      results.push(
+        acceptanceCase(
+          "health",
+          openingOk ? "pass" : "fail",
+          openingOk
+            ? "development_commit_match"
+            : localDetail ||
+                `http_${health.status} commit=${commitEvidence(deployedCommit, input.commit)}`,
+        ),
+      );
+    }
 
     if (!openingOk) {
       publishManifest();
@@ -1968,6 +1990,11 @@ async function main(): Promise<number> {
   const bypass = await resolveProtectionBypass(process.env);
   mask(bypass.value);
   console.log(`Deployment protection bypass: ${bypass.source}.`);
+  if (bypass.source === "none") {
+    console.error(
+      "::error::VERCEL_AUTOMATION_BYPASS_SECRET is absent. Copy the project's existing Protection Bypass for Automation value to GitHub → Settings → Environments → development → Secrets. The business job does not receive VERCEL_TOKEN. Do not generate a new bypass and do not disable Deployment Protection.",
+    );
+  }
   const preflightCases =
     decodePreflightCases(process.env.ACCEPTANCE_PREFLIGHT_CASES ?? "") ??
     blockedCases(MANAGEMENT_CASE_IDS, "preflight_cases_absent");

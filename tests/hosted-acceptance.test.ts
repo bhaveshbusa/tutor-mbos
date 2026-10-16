@@ -877,6 +877,12 @@ describe("hosted acceptance harness", () => {
       false,
     );
     const script = readFileSync("scripts/hosted-acceptance.ts", "utf8");
+    expect(script).toContain("bypass: bypass.value ?? null");
+    expect(script).toContain("input.bypass === null");
+    expect(script).toContain("protection_bypass_absent");
+    expect(script).toContain(
+      "VERCEL_AUTOMATION_BYPASS_SECRET is absent. Copy the project's existing Protection Bypass for Automation value to GitHub → Settings → Environments → development → Secrets.",
+    );
     expect(script).toContain("mask(runNonce)");
     expect(script).toContain("probeDirectTenants");
     expect(script).toContain(
@@ -962,6 +968,95 @@ describe("hosted acceptance harness", () => {
       doubled.urls.some((url) => url.includes("/api/oauth/decision")),
     ).toBe(false);
     expect(probed).toBe(false);
+  });
+
+  it("does not request the site when the automation bypass is absent", async () => {
+    let called = false;
+    const bodies: string[] = [];
+    const report = await runHostedAcceptance(
+      input(
+        async () => {
+          called = true;
+          throw new Error("protected site must not be called");
+        },
+        {
+          bypass: null,
+          writeManifest: (body) => {
+            bodies.push(body);
+          },
+        },
+      ),
+    );
+    expect(called).toBe(false);
+    expect(report.deployedCommit).toBe("");
+    expect(report.results.find((row) => row.id === "health")?.detail).toBe(
+      "protection_bypass_absent",
+    );
+    expect(
+      report.results.find((row) => row.id === "signup.tenant_a")?.detail,
+    ).toBe("not_executed");
+    expect(
+      report.results.find((row) => row.id === "cleanup.manifest")?.detail,
+    ).toBe("no_hosted_users");
+    expect(bodies).toHaveLength(2);
+    expect(JSON.parse(bodies[0]!).users).toEqual([]);
+  });
+
+  it("records a protection page with no health commit as commit absent", async () => {
+    const seen: string[] = [];
+    const report = await runHostedAcceptance(
+      input(
+        async (_url, init) => {
+          seen.push(
+            new Headers(init?.headers).get("x-vercel-protection-bypass") ?? "",
+          );
+          return new Response("<html>Authentication Required</html>", {
+            status: 401,
+            headers: { "content-type": "text/html" },
+          });
+        },
+        { bypass: "synthetic-bypass" },
+      ),
+    );
+    expect(seen).toEqual(["synthetic-bypass"]);
+    expect(report.deployedCommit).toBe("");
+    expect(report.results.find((row) => row.id === "health")?.detail).toBe(
+      "http_401 commit=absent",
+    );
+    expect(
+      report.results.find((row) => row.id === "signup.tenant_a")?.detail,
+    ).toBe("not_executed");
+    expect(formatAcceptanceReport(report)).toContain("deployed_commit=absent");
+  });
+
+  it("records a different health commit as a mismatch after the bypass is sent", async () => {
+    const other = "b".repeat(40);
+    const report = await runHostedAcceptance(
+      input(
+        async () =>
+          new Response(
+            JSON.stringify({
+              status: "ok",
+              environment: "development",
+              supabaseProjectRef:
+                ENVIRONMENT_BINDINGS.development.supabaseProjectRef,
+              commit: other,
+            }),
+            {
+              status: 401,
+              headers: { "content-type": "application/json" },
+            },
+          ),
+        { bypass: "synthetic-bypass" },
+      ),
+    );
+    expect(report.deployedCommit).toBe(other);
+    expect(report.results.find((row) => row.id === "health")?.detail).toBe(
+      "http_401 commit=mismatch",
+    );
+    expect(
+      report.results.find((row) => row.id === "signup.tenant_a")?.detail,
+    ).toBe("not_executed");
   });
 
   it("fails when the closing health commit differs from the source", async () => {
