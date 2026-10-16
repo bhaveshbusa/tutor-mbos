@@ -630,6 +630,9 @@ describe("hosted acceptance harness", () => {
     );
     expect(text).toContain("github.actor_id == 3823973");
     expect(text).toContain("acceptance-ignore-");
+    expect(text).toContain(
+      "startsWith(github.event.comment.body, '/tutor-mbos accept-development ')",
+    );
     expect(text).toContain("queue: max");
     expect(text).not.toContain("development-acceptance");
     expect(text).toContain(
@@ -683,6 +686,10 @@ describe("hosted acceptance harness", () => {
     expect(authorize.environment).toBeUndefined();
     expect(authorize.if).toContain("github.event_name == 'issue_comment'");
     expect(authorize.if).toContain("github.actor_id == 3823973");
+    expect(authorize.if).toContain("github.run_attempt == 1");
+    expect(authorize.if).toContain(
+      "startsWith(github.event.comment.body, '/tutor-mbos accept-development ')",
+    );
     expect(authorize.permissions).toEqual({
       contents: "read",
       "pull-requests": "read",
@@ -705,14 +712,23 @@ describe("hosted acceptance harness", () => {
     expect(preflight.needs).toBe("authorize");
     expect(preflight.if).toContain("github.event_name == 'workflow_dispatch'");
     expect(preflight.if).toContain("needs.authorize.result == 'success'");
-    expect(preflight.if).toContain("always()");
+    expect(preflight.if).toContain("!cancelled()");
+    expect(preflight.if).toContain("github.run_attempt == 1");
+    expect(preflight.if).not.toContain("always()");
     expect(preflight.environment).toBe("development");
     expect(accept.environment).toBe("development");
     expect(cleanup.environment).toBe("development");
     expect(accept.needs).toBe("preflight");
+    expect(accept.if).toContain("!cancelled()");
+    expect(accept.if).toContain("needs.preflight.result == 'success'");
+    expect(accept.if).toContain("github.event_name == 'workflow_dispatch'");
+    expect(accept.if).toContain("github.run_attempt == 1");
+    expect(accept.if).not.toContain("always()");
+    expect(accept.if).not.toContain("needs.authorize.outputs");
     expect(cleanup.needs).toEqual(["preflight", "accept"]);
     expect(cleanup.if).toContain("always()");
     expect(cleanup.if).toContain("needs.preflight.result == 'success'");
+    expect(cleanup.if).not.toContain("run_attempt");
     expect(preflight["timeout-minutes"]).toBe(5);
     expect(accept["timeout-minutes"]).toBe(15);
     expect(cleanup["timeout-minutes"]).toBe(5);
@@ -730,6 +746,16 @@ describe("hosted acceptance harness", () => {
     const candidate = preflight.steps.find((step) =>
       step.run?.includes("assert-acceptance-candidate.mjs"),
     );
+    const preflightAttempt = preflight.steps.find((step) =>
+      step.run?.includes("assert-acceptance-attempt.mjs"),
+    );
+    expect(preflightAttempt?.if).toBe("github.event_name == 'issue_comment'");
+    expect(preflightAttempt?.env?.ACCEPTANCE_RUN_ATTEMPT).toBe(
+      "${{ github.run_attempt }}",
+    );
+    expect(preflightAttempt?.env?.ACCEPTANCE_EVENT_NAME).toBe(
+      "${{ github.event_name }}",
+    );
     expect(candidate?.if).toBe("github.event_name == 'issue_comment'");
     expect(candidate?.run).toBe("node scripts/assert-acceptance-candidate.mjs");
     expect(candidate?.run).not.toContain("${{");
@@ -737,13 +763,15 @@ describe("hosted acceptance harness", () => {
       "${{ needs.authorize.outputs.candidate }}",
     );
     const candidateAt = preflight.steps.indexOf(candidate!);
+    const preflightAttemptAt = preflight.steps.indexOf(preflightAttempt!);
     const preflightCheckoutAt = preflight.steps.findIndex((step) =>
       step.uses?.startsWith("actions/checkout@"),
     );
     const secretAt = preflight.steps.findIndex((step) =>
       step.run?.includes("accept:development:preflight"),
     );
-    expect(candidateAt).toBeGreaterThan(preflightCheckoutAt);
+    expect(preflightAttemptAt).toBeGreaterThan(preflightCheckoutAt);
+    expect(candidateAt).toBeGreaterThan(preflightAttemptAt);
     expect(secretAt).toBeGreaterThan(candidateAt);
     const identityAt = preflight.steps.findIndex(
       (step) => step.run === "pnpm accept:development:preflight",
@@ -778,6 +806,21 @@ describe("hosted acceptance harness", () => {
     const acceptRun = accept.steps.find(
       (step) => step.run === "pnpm accept:development",
     );
+    const acceptAttempt = accept.steps.find((step) =>
+      step.run?.includes("assert-acceptance-attempt.mjs"),
+    );
+    expect(acceptAttempt?.if).toBe("github.event_name == 'issue_comment'");
+    expect(acceptAttempt?.env?.ACCEPTANCE_RUN_ATTEMPT).toBe(
+      "${{ github.run_attempt }}",
+    );
+    expect(accept.steps.indexOf(acceptAttempt!)).toBeLessThan(
+      accept.steps.indexOf(acceptRun!),
+    );
+    expect(
+      cleanup.steps.some((step) =>
+        step.run?.includes("assert-acceptance-attempt.mjs"),
+      ),
+    ).toBe(false);
     expect(acceptRun?.["timeout-minutes"]).toBe(12);
     expect(acceptRun?.env).toEqual({
       VERCEL_AUTOMATION_BYPASS_SECRET:
