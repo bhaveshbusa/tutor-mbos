@@ -7,6 +7,7 @@ import {
   resolveAcceptanceMaterial,
   runHostedAcceptance,
 } from "../scripts/hosted-acceptance.ts";
+import { DEVELOPMENT_HEALTH_STEP_NAME } from "../scripts/probe-development-health.ts";
 import {
   APP_DATABASE_URL_SECRET,
   MANAGEMENT_TOKEN_SECRET,
@@ -695,6 +696,7 @@ describe("hosted acceptance harness", () => {
           environment?: string;
           outputs?: Record<string, string>;
           permissions?: Record<string, string>;
+          "continue-on-error"?: boolean;
           steps: {
             id?: string;
             name?: string;
@@ -845,6 +847,46 @@ describe("hosted acceptance harness", () => {
       TUTOR_MBOS_APP_DATABASE_URL: "${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}",
     });
     expect(preflight.steps.indexOf(presence!)).toBeLessThan(identityAt);
+    const health = preflight.steps.find(
+      (step) => step.name === DEVELOPMENT_HEALTH_STEP_NAME,
+    );
+    expect(health?.run).toBe("pnpm accept:development:health");
+    expect(health?.run).not.toContain("${{");
+    expect(health?.id).toBeUndefined();
+    expect(health?.if).toBeUndefined();
+    expect(health?.["continue-on-error"]).toBeUndefined();
+    expect(preflight["continue-on-error"]).toBeUndefined();
+    const healthAt = preflight.steps.indexOf(health!);
+    for (const step of preflight.steps.slice(healthAt + 1)) {
+      expect(step.if).toBeUndefined();
+      expect(step["continue-on-error"]).toBeUndefined();
+    }
+    expect(health?.env).toEqual({
+      VERCEL_AUTOMATION_BYPASS_SECRET:
+        "${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}",
+    });
+    expect(healthAt).toBeGreaterThan(preflight.steps.indexOf(presence!));
+    expect(identityAt).toBeGreaterThan(healthAt);
+    expect(
+      accept.steps.some((step) =>
+        step.run?.includes("accept:development:health"),
+      ),
+    ).toBe(false);
+    expect(
+      cleanup.steps.some((step) =>
+        step.run?.includes("accept:development:health"),
+      ),
+    ).toBe(false);
+    const probeSource = readFileSync(
+      "scripts/probe-development-health.ts",
+      "utf8",
+    );
+    expect(probeSource).not.toContain("VERCEL_TOKEN");
+    expect(probeSource).not.toContain("api.vercel.com");
+    expect(probeSource).not.toContain("TUTOR_MBOS_APP_DATABASE_URL");
+    expect(probeSource).not.toContain("GITHUB_OUTPUT");
+    expect(probeSource).not.toContain("NEXT_PUBLIC_SUPABASE");
+    expect(probeSource).toContain('redirect: "manual"');
     const inheritedNames = [
       "VERCEL_AUTOMATION_BYPASS_SECRET",
       "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
@@ -876,11 +918,16 @@ describe("hosted acceptance harness", () => {
       "TUTOR_MBOS_APP_DATABASE_URL",
     ];
     for (const step of preflight.steps) {
-      if (step === presence) continue;
+      if (step === presence || step === health) continue;
       for (const name of businessSecretNames) {
         expect(step.env ?? {}).not.toHaveProperty(name);
       }
     }
+    expect(health?.env ?? {}).not.toHaveProperty(
+      "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
+    );
+    expect(health?.env ?? {}).not.toHaveProperty("TUTOR_MBOS_APP_DATABASE_URL");
+    expect(health?.env ?? {}).not.toHaveProperty("VERCEL_TOKEN");
     expect(preflight.steps[identityAt]?.env).toEqual({
       SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY:
         "${{ secrets.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY }}",

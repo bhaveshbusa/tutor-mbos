@@ -23,6 +23,7 @@ import {
   type WorkflowRunList,
 } from "@/server/application/acceptance-request";
 import { authorizeAcceptanceComment } from "../scripts/hosted-acceptance-authorize.ts";
+import { DEVELOPMENT_HEALTH_STEP_NAME } from "../scripts/probe-development-health.ts";
 
 const sha = "a".repeat(40);
 const other = "b".repeat(40);
@@ -1127,7 +1128,7 @@ describe("acceptance comment authorization", () => {
             ...preResourceSteps(),
             {
               name: "Archive results",
-              number: 12,
+              number: 30,
               status: "completed",
               conclusion: "skipped",
             },
@@ -1194,6 +1195,79 @@ describe("acceptance comment authorization", () => {
       }),
     });
     expect(duplicate).toEqual({ ok: false, reason: "acceptance_lookup" });
+  });
+
+  it("proves recovery when the health probe fails before capability", async () => {
+    const steps = preResourceSteps();
+    const probe = steps.find(
+      (step) => step.name === DEVELOPMENT_HEALTH_STEP_NAME,
+    );
+    const capability = steps.find((step) => step.name === CAPABILITY_STEP_NAME);
+    expect(probe?.number).toBeLessThan(capability?.number ?? 0);
+    expect(probe?.conclusion).toBe("skipped");
+    const probeFailure = steps.map((step) => {
+      if (
+        step.name === "Require Auth admin cleanup credential" ||
+        step.name === "Report acceptance credentials" ||
+        step.name === "Require business acceptance secrets"
+      ) {
+        return { ...step, conclusion: "success" };
+      }
+      if (step.name === DEVELOPMENT_HEALTH_STEP_NAME) {
+        return { ...step, conclusion: "failure" };
+      }
+      return step;
+    });
+    const recoverEnv = env({
+      ACCEPTANCE_RUN_ID: "200",
+      ACCEPTANCE_COMMENT_BODY: `/tutor-mbos recover-development ${sha}`,
+    });
+    const calls: string[] = [];
+    const proven = await authorizeAcceptanceComment({
+      env: recoverEnv,
+      fetchImpl: async (input) => {
+        const url = String(input);
+        calls.push(url);
+        return recoveryApi(url, realisticPreflightJobs(probeFailure));
+      },
+    });
+    expect(proven).toEqual({ ok: true, candidate: sha });
+    expect(calls.some((url) => url.includes("filter=all"))).toBe(true);
+    const businessStarted = await authorizeAcceptanceComment({
+      env: recoverEnv,
+      fetchImpl: async (input) =>
+        recoveryApi(String(input), [
+          ...realisticPreflightJobs(probeFailure).slice(0, -1),
+          {
+            id: 8,
+            name: ACCEPT_JOB_NAME,
+            status: "completed",
+            conclusion: "failure",
+            steps: [],
+          },
+        ]),
+    });
+    expect(businessStarted).toEqual({ ok: false, reason: "recovery_denied" });
+    const afterBoundary = await authorizeAcceptanceComment({
+      env: recoverEnv,
+      fetchImpl: async (input) =>
+        recoveryApi(
+          String(input),
+          realisticPreflightJobs([
+            ...preResourceSteps(),
+            {
+              name: DEVELOPMENT_HEALTH_STEP_NAME,
+              number: 24,
+              status: "completed",
+              conclusion: "success",
+            },
+          ]),
+        ),
+    });
+    expect(afterBoundary).toEqual({
+      ok: false,
+      reason: "acceptance_evidence_unknown",
+    });
   });
 
   it("checks the authorized candidate without executing it", () => {
@@ -1327,20 +1401,32 @@ function preResourceSteps(): AcceptanceJobSnapshot["steps"] {
       conclusion: "skipped",
     },
     {
-      name: CAPABILITY_STEP_NAME,
+      name: "Require business acceptance secrets",
       number: 9,
       status: "completed",
       conclusion: "skipped",
     },
     {
-      name: POST_BOUNDARY_STEP_NAMES[0],
+      name: DEVELOPMENT_HEALTH_STEP_NAME,
       number: 10,
       status: "completed",
       conclusion: "skipped",
     },
     {
-      name: POST_BOUNDARY_STEP_NAMES[1],
+      name: CAPABILITY_STEP_NAME,
       number: 11,
+      status: "completed",
+      conclusion: "skipped",
+    },
+    {
+      name: POST_BOUNDARY_STEP_NAMES[0],
+      number: 12,
+      status: "completed",
+      conclusion: "skipped",
+    },
+    {
+      name: POST_BOUNDARY_STEP_NAMES[1],
+      number: 13,
       status: "completed",
       conclusion: "skipped",
     },
