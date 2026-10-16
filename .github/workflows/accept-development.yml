@@ -2,11 +2,16 @@ name: Accept development
 
 # Manual hosted acceptance for tutor-mbos-dev. It does not deploy, migrate,
 # change Auth settings, or run on pull requests. Dispatch it from main after
-# the development promotion for that commit. The workflow-level
-# development-delivery group, with queue: max, covers preflight, business
-# tests, and cleanup together. It waits behind an in-progress delivery and a
-# later delivery waits behind the whole acceptance run. Neither cancels the
-# other. Coding CI stays secretless.
+# the development promotion for that commit, or post the exact comment
+# command on the merged pull request. The workflow-level concurrency group,
+# with queue: max, covers an authorized run. workflow_dispatch and a new
+# comment from actor 3823973 whose body starts with the command prefix use
+# development-delivery, so that acceptance waits behind an in-progress
+# delivery and a later delivery waits behind the acceptance run. An ordinary
+# owner comment, a foreign comment, and a comment rerun use a per-run group
+# and do not enter that queue. Neither cancels the other. A comment run is
+# authorized only on attempt 1. workflow_dispatch is the manual path and is
+# not rejected for a later attempt. Coding CI stays secretless.
 #
 # Privileged steps are separate jobs. Each job checks out this workflow SHA
 # and installs from the lockfile with the shared pnpm cache disabled. The
@@ -24,21 +29,64 @@ name: Accept development
 # Accept and cleanup mask it when they read it. It is not a credential.
 # The admin capability step runs before pnpm dlx vercel, so that unlocked
 # package cannot change the environment of a step that holds the admin key
-# or the Management API token. The workflow contents permission is enough.
+# or the Management API token. Protected jobs keep the workflow contents
+# permission. The comment gate adds read access for pull requests and
+# Actions run history, and it does not receive the development environment.
 on:
   workflow_dispatch:
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: read
 
 concurrency:
-  group: development-delivery
+  group: ${{ github.event_name == 'workflow_dispatch' && 'development-delivery' || (github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor_id == 3823973 && github.run_attempt == 1 && startsWith(github.event.comment.body, '/tutor-mbos accept-development ') && 'development-delivery' || format('acceptance-ignore-{0}', github.run_id)) }}
   cancel-in-progress: false
   queue: max
 
 jobs:
+  authorize:
+    name: Authorize acceptance comment
+    if: github.event_name == 'issue_comment' && github.event.action == 'created' && github.repository == 'bhaveshbusa/tutor-mbos' && github.actor_id == 3823973 && github.run_attempt == 1 && startsWith(github.event.comment.body, '/tutor-mbos accept-development ')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      candidate: ${{ steps.gate.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          pnpm-cache: "false"
+      - name: Authorize acceptance comment
+        id: gate
+        env:
+          ACCEPTANCE_EVENT_NAME: ${{ github.event_name }}
+          ACCEPTANCE_EVENT_ACTION: ${{ github.event.action }}
+          ACCEPTANCE_REPOSITORY: ${{ github.repository }}
+          ACCEPTANCE_ACTOR_ID: ${{ github.actor_id }}
+          ACCEPTANCE_ACTOR_LOGIN: ${{ github.actor }}
+          ACCEPTANCE_COMMENT_BODY: ${{ github.event.comment.body }}
+          ACCEPTANCE_COMMENT_ID: ${{ github.event.comment.id }}
+          ACCEPTANCE_ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ACCEPTANCE_PULL_REQUEST_URL: ${{ github.event.issue.pull_request.url }}
+          ACCEPTANCE_GITHUB_SHA: ${{ github.sha }}
+          ACCEPTANCE_RUN_ID: ${{ github.run_id }}
+          ACCEPTANCE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: pnpm accept:development:authorize
+
   preflight:
     name: Preflight tutor-mbos-dev
+    needs: authorize
+    if: "${{ !cancelled() && (github.event_name == 'workflow_dispatch' || (github.event_name == 'issue_comment' && github.run_attempt == 1 && needs.authorize.result == 'success')) }}"
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     environment: development
@@ -63,6 +111,17 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Reject comment rerun
+        if: github.event_name == 'issue_comment'
+        env:
+          ACCEPTANCE_EVENT_NAME: ${{ github.event_name }}
+          ACCEPTANCE_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: node scripts/assert-acceptance-attempt.mjs
+      - name: Require authorized candidate
+        if: github.event_name == 'issue_comment'
+        env:
+          ACCEPTANCE_CANDIDATE: ${{ needs.authorize.outputs.candidate }}
+        run: node scripts/assert-acceptance-candidate.mjs
       - uses: ./.github/actions/setup
         with:
           pnpm-cache: "false"
@@ -112,6 +171,7 @@ jobs:
   accept:
     name: Accept tutor-mbos-dev
     needs: preflight
+    if: "${{ !cancelled() && needs.preflight.result == 'success' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'issue_comment' && github.run_attempt == 1)) }}"
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: development
@@ -135,6 +195,12 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           pnpm-cache: "false"
+      - name: Reject comment rerun
+        if: github.event_name == 'issue_comment'
+        env:
+          ACCEPTANCE_EVENT_NAME: ${{ github.event_name }}
+          ACCEPTANCE_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: node scripts/assert-acceptance-attempt.mjs
       - name: Run hosted acceptance
         id: acceptance
         timeout-minutes: 12
