@@ -2,6 +2,8 @@ import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import {
   ACCEPT_JOB_NAME,
+  CLEANUP_JOB_NAME,
+  EMPTY_RESOURCES_STEP_NAME,
   ACCEPTANCE_ACTOR_ID,
   ACCEPTANCE_ACTOR_LOGIN,
   ACCEPTANCE_JOB_RESULT_BOUND,
@@ -929,6 +931,122 @@ describe("acceptance comment authorization", () => {
     expect(ACCEPTANCE_JOB_RESULT_BOUND).toBe(1_000);
   });
 
+  it("allows another accept after a failed business run with an empty manifest", () => {
+    const history = acceptance([emptyManifestFailure()]);
+    expect(review({ runId: "200" }, { acceptance: history })).toEqual({
+      ok: true,
+      candidate: sha,
+    });
+    expect(
+      review(
+        { runId: "200", commentBody: `/tutor-mbos recover-development ${sha}` },
+        { acceptance: history },
+      ),
+    ).toEqual({ ok: false, reason: "recovery_denied" });
+    expect(
+      review(
+        { runId: "200" },
+        {
+          acceptance: acceptance([
+            emptyManifestFailure({
+              jobs: [
+                job(AUTHORIZE_JOB_NAME, "completed", "success"),
+                job(ACCEPT_JOB_NAME, "completed", "success"),
+                job(
+                  CLEANUP_JOB_NAME,
+                  "completed",
+                  "success",
+                  [emptyResourcesStep()],
+                  true,
+                ),
+              ],
+            }),
+          ]),
+        },
+      ),
+    ).toEqual({ ok: false, reason: "duplicate_request" });
+    expect(
+      review(
+        { runId: "200" },
+        {
+          acceptance: acceptance([
+            emptyManifestFailure({
+              jobs: [
+                job(AUTHORIZE_JOB_NAME, "completed", "success"),
+                job(ACCEPT_JOB_NAME, "completed", "failure"),
+                job(CLEANUP_JOB_NAME, "completed", "failure", [], false),
+              ],
+            }),
+          ]),
+        },
+      ),
+    ).toEqual({ ok: false, reason: "duplicate_request" });
+    expect(
+      review(
+        { runId: "200" },
+        {
+          acceptance: acceptance([
+            emptyManifestFailure({
+              jobs: [
+                job(AUTHORIZE_JOB_NAME, "completed", "success"),
+                job(ACCEPT_JOB_NAME, "completed", "failure"),
+                job(
+                  CLEANUP_JOB_NAME,
+                  "completed",
+                  "success",
+                  [
+                    {
+                      name: EMPTY_RESOURCES_STEP_NAME,
+                      number: 4,
+                      status: "completed",
+                      conclusion: "skipped",
+                    },
+                  ],
+                  true,
+                ),
+              ],
+            }),
+          ]),
+        },
+      ),
+    ).toEqual({ ok: false, reason: "duplicate_request" });
+    expect(
+      review(
+        { runId: "200" },
+        {
+          acceptance: acceptance([
+            emptyManifestFailure(),
+            acceptanceRun({ id: "90" }),
+          ]),
+        },
+      ),
+    ).toEqual({ ok: false, reason: "duplicate_request" });
+    expect(
+      review(
+        { runId: "200" },
+        {
+          acceptance: acceptance([
+            emptyManifestFailure({
+              jobs: [
+                job(AUTHORIZE_JOB_NAME, "completed", "skipped"),
+                job(AUTHORIZE_JOB_NAME, "completed", "success"),
+                job(ACCEPT_JOB_NAME, "completed", "failure"),
+                job(ACCEPT_JOB_NAME, "completed", "skipped"),
+                job(
+                  CLEANUP_JOB_NAME,
+                  "completed",
+                  "success",
+                  [emptyResourcesStep()],
+                  true,
+                ),
+              ],
+            }),
+          ]),
+        },
+      ),
+    ).toEqual({ ok: false, reason: "duplicate_request" });
+  });
+
   it("allows one recover command only after a pre-resource preflight failure", () => {
     const history = acceptance([provenPreflightFailure()]);
     expect(
@@ -1449,6 +1567,38 @@ function preResourceSteps(): AcceptanceJobSnapshot["steps"] {
       conclusion: "success",
     },
   ];
+}
+
+function emptyResourcesStep(): AcceptanceJobSnapshot["steps"][number] {
+  return {
+    name: EMPTY_RESOURCES_STEP_NAME,
+    number: 4,
+    status: "completed",
+    conclusion: "success",
+  };
+}
+
+function emptyManifestFailure(
+  overrides: Partial<AcceptanceRunSnapshot> = {},
+): AcceptanceRunSnapshot {
+  return acceptanceRun({
+    id: "100",
+    status: "completed",
+    conclusion: "failure",
+    jobs: [
+      job(AUTHORIZE_JOB_NAME, "completed", "success"),
+      job(PREFLIGHT_JOB_NAME, "completed", "success"),
+      job(ACCEPT_JOB_NAME, "completed", "failure"),
+      job(
+        CLEANUP_JOB_NAME,
+        "completed",
+        "success",
+        [emptyResourcesStep()],
+        true,
+      ),
+    ],
+    ...overrides,
+  });
 }
 
 function provenPreflightFailure(

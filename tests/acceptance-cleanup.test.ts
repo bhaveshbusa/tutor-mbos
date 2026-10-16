@@ -25,10 +25,12 @@ import {
   type CleanupManifest,
 } from "@/server/application/acceptance-cleanup";
 import {
+  emptyHostedResources,
   formatCleanupExecution,
   readCleanupManifestText,
   runAcceptanceCleanup,
   withManifestReadDetail,
+  writeHostedResourcesOutput,
 } from "../scripts/hosted-acceptance-cleanup.ts";
 import { runAcceptancePreflight } from "../scripts/hosted-acceptance-preflight.ts";
 import { ENVIRONMENT_BINDINGS } from "@/server/config/environments";
@@ -432,6 +434,40 @@ describe("auth admin cleanup execution", () => {
         (call) => call === `DELETE /auth/v1/admin/oauth/clients/${clientA}`,
       ),
     ).toBe(true);
+  });
+
+  it("records an empty manifest and does not record a deleted user", async () => {
+    const doubled = adminDouble();
+    const result = await run(
+      JSON.stringify(manifest({ users: [], clients: [] })),
+      doubled,
+    );
+    expect(result).toMatchObject({
+      status: "pass",
+      usersDeleted: 0,
+      clientsDeleted: 0,
+      detail: "verified_run_resources_removed",
+    });
+    expect(emptyHostedResources(result)).toBe(true);
+    expect(doubled.calls.some((call) => call.startsWith("DELETE"))).toBe(false);
+    const removed = {
+      status: "pass" as const,
+      usersDeleted: 1,
+      clientsDeleted: 0,
+      detail: "verified_run_resources_removed",
+    };
+    expect(emptyHostedResources(removed)).toBe(false);
+    const dir = mkdtempSync(join(tmpdir(), "hosted-resources-"));
+    const output = join(dir, "github-output");
+    writeFileSync(output, "");
+    try {
+      writeHostedResourcesOutput(result, output);
+      writeHostedResourcesOutput(removed, output);
+      writeHostedResourcesOutput(result, undefined);
+      expect(readFileSync(output, "utf8")).toBe("hosted_resources=none\n");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("accepts a regular manifest job output and deletes only the verified ids", async () => {

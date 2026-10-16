@@ -1034,11 +1034,23 @@ describe("hosted acceptance harness", () => {
     expect(cleanupRun?.run).toBe("pnpm accept:development:cleanup");
     expect(cleanupRun?.run).not.toContain("${{");
     expect(cleanupRun?.["working-directory"]).toBeUndefined();
+    expect(cleanupRun?.id).toBe("cleanup");
     expect(cleanupRun?.env).toEqual({
       SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY:
         "${{ secrets.SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY }}",
       ACCEPTANCE_MANIFEST: "${{ needs.accept.outputs.manifest }}",
     });
+    const emptyResources = cleanup.steps.find(
+      (step) => step.name === "Record empty acceptance resources",
+    );
+    expect(emptyResources?.if).toBe(
+      "steps.cleanup.outputs.hosted_resources == 'none'",
+    );
+    expect(emptyResources?.run).toBe("echo hosted_resources=none");
+    expect(emptyResources?.env).toBeUndefined();
+    expect(cleanup.steps.indexOf(emptyResources!)).toBe(
+      cleanup.steps.indexOf(cleanupRun!) + 1,
+    );
     expect(cleanup.env?.ACCEPTANCE_RUN_NONCE).toBe(
       "${{ needs.preflight.outputs.nonce }}",
     );

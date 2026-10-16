@@ -11,6 +11,7 @@
  * derived from the trusted nonce, the redirect, and a created_at inside
  * this run's window.
  */
+import { appendFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import {
   AUTH_ADMIN_KEY_SECRET,
@@ -463,6 +464,29 @@ async function adminRequest(
   }
 }
 
+/** True only when cleanup verified a manifest with no users and no clients. */
+export function emptyHostedResources(result: CleanupExecution): boolean {
+  return (
+    result.status === "pass" &&
+    result.usersDeleted === 0 &&
+    result.clientsDeleted === 0 &&
+    result.detail === "verified_run_resources_removed"
+  );
+}
+
+/**
+ * Records the empty-manifest result for the accept gate. The value is the
+ * constant `none`. A manifest that listed a user or client writes nothing,
+ * so the following workflow step stays skipped.
+ */
+export function writeHostedResourcesOutput(
+  result: CleanupExecution,
+  outputPath: string | undefined,
+): void {
+  if (!emptyHostedResources(result) || !outputPath) return;
+  appendFileSync(outputPath, "hosted_resources=none\n");
+}
+
 export function formatCleanupExecution(result: CleanupExecution): string {
   return [
     `cleanup_result=${result.status}`,
@@ -520,6 +544,7 @@ async function main(): Promise<number> {
     }),
   );
   console.log(formatCleanupExecution(result));
+  writeHostedResourcesOutput(result, process.env.GITHUB_OUTPUT);
   return result.status === "pass" ? 0 : 1;
 }
 
