@@ -9,7 +9,8 @@ name: Accept development
 # development-delivery, so that acceptance waits behind an in-progress
 # delivery and a later delivery waits behind the acceptance run. An ordinary
 # owner comment, a foreign comment, and a comment rerun use a per-run group
-# and do not enter that queue. Neither cancels the other. A comment run is
+# and do not enter that queue. A recover-development comment from that actor
+# on attempt 1 uses the same delivery queue. Neither cancels the other. A comment run is
 # authorized only on attempt 1. workflow_dispatch is the manual path and is
 # not rejected for a later attempt. Coding CI stays secretless.
 #
@@ -41,14 +42,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.event_name == 'workflow_dispatch' && 'development-delivery' || (github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor_id == 3823973 && github.run_attempt == 1 && startsWith(github.event.comment.body, '/tutor-mbos accept-development ') && 'development-delivery' || format('acceptance-ignore-{0}', github.run_id)) }}
+  group: ${{ github.event_name == 'workflow_dispatch' && 'development-delivery' || (github.event_name == 'issue_comment' && github.event.action == 'created' && github.actor_id == 3823973 && github.run_attempt == 1 && (startsWith(github.event.comment.body, '/tutor-mbos accept-development ') || startsWith(github.event.comment.body, '/tutor-mbos recover-development ')) && 'development-delivery' || format('acceptance-ignore-{0}', github.run_id)) }}
   cancel-in-progress: false
   queue: max
 
 jobs:
   authorize:
     name: Authorize acceptance comment
-    if: github.event_name == 'issue_comment' && github.event.action == 'created' && github.repository == 'bhaveshbusa/tutor-mbos' && github.actor_id == 3823973 && github.run_attempt == 1 && startsWith(github.event.comment.body, '/tutor-mbos accept-development ')
+    if: github.event_name == 'issue_comment' && github.event.action == 'created' && github.repository == 'bhaveshbusa/tutor-mbos' && github.actor_id == 3823973 && github.run_attempt == 1 && (startsWith(github.event.comment.body, '/tutor-mbos accept-development ') || startsWith(github.event.comment.body, '/tutor-mbos recover-development '))
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

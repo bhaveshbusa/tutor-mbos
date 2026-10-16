@@ -10,6 +10,7 @@ import {
   ACCEPT_WORKFLOW_FILE,
   ACCEPTANCE_ACTOR_ID,
   ACCEPTANCE_ACTOR_LOGIN,
+  ACCEPTANCE_JOB_RESULT_BOUND,
   ACCEPTANCE_REPOSITORY,
   ACCEPTANCE_RUN_PAGE_SIZE,
   ACCEPTANCE_RUN_RESULT_BOUND,
@@ -20,6 +21,7 @@ import {
   type AcceptanceRequestReason,
   type AcceptanceRunList,
   type AcceptanceRunSnapshot,
+  type AcceptanceStepSnapshot,
   type PullRequestSnapshot,
   type WorkflowRunList,
   type WorkflowRunSnapshot,
@@ -57,6 +59,8 @@ const REASONS = new Set<AcceptanceRequestReason>([
   "acceptance_lookup_truncated",
   "acceptance_evidence_unknown",
   "duplicate_request",
+  "recovery_not_proven",
+  "recovery_denied",
   "rerun",
 ]);
 
@@ -354,7 +358,7 @@ async function getJobs(
   const jobs: AcceptanceJobSnapshot[] = [];
   const seen = new Set<string>();
   let totalCount = 0;
-  const pageCount = ACCEPTANCE_RUN_RESULT_BOUND / ACCEPTANCE_RUN_PAGE_SIZE;
+  const pageCount = ACCEPTANCE_JOB_RESULT_BOUND / ACCEPTANCE_RUN_PAGE_SIZE;
   for (let page = 1; page <= pageCount; page += 1) {
     const query = new URLSearchParams({
       filter: "all",
@@ -370,7 +374,7 @@ async function getJobs(
     const parsed = parseJobs(loaded.body);
     if (!parsed) return { ok: false };
     totalCount = parsed.totalCount;
-    if (totalCount > ACCEPTANCE_RUN_RESULT_BOUND) return { ok: false };
+    if (totalCount > ACCEPTANCE_JOB_RESULT_BOUND) return { ok: false };
     for (const job of parsed.jobs) {
       if (seen.has(job.id)) return { ok: false };
       seen.add(job.id);
@@ -570,14 +574,46 @@ function parseJobs(body: unknown): {
     }
     if (job.conclusion !== null && typeof job.conclusion !== "string")
       return null;
+    const steps = parseSteps(job.steps);
+    if (!steps) return null;
     jobs.push({
       id: String(job.id),
       name: job.name,
       status: job.status,
       conclusion: typeof job.conclusion === "string" ? job.conclusion : null,
+      steps: steps.steps,
+      stepsComplete: steps.complete,
     });
   }
   return { totalCount, jobs };
+}
+
+function parseSteps(
+  value: unknown,
+): { complete: boolean; steps: AcceptanceStepSnapshot[] } | null {
+  if (value === undefined) return { complete: false, steps: [] };
+  if (!Array.isArray(value)) return null;
+  const steps: AcceptanceStepSnapshot[] = [];
+  for (const entry of value) {
+    const step = asRecord(entry);
+    if (!step) return null;
+    const number = step.number;
+    if (typeof number !== "number" || !Number.isSafeInteger(number))
+      return null;
+    if (typeof step.name !== "string" || typeof step.status !== "string") {
+      return null;
+    }
+    if (step.conclusion !== null && typeof step.conclusion !== "string") {
+      return null;
+    }
+    steps.push({
+      name: step.name,
+      number,
+      status: step.status,
+      conclusion: typeof step.conclusion === "string" ? step.conclusion : null,
+    });
+  }
+  return { complete: true, steps };
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

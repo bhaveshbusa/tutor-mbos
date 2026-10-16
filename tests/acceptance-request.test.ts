@@ -4,9 +4,11 @@ import {
   ACCEPT_JOB_NAME,
   ACCEPTANCE_ACTOR_ID,
   ACCEPTANCE_ACTOR_LOGIN,
+  ACCEPTANCE_JOB_RESULT_BOUND,
   ACCEPTANCE_REPOSITORY,
   ACCEPTANCE_RUN_RESULT_BOUND,
   AUTHORIZE_JOB_NAME,
+  CAPABILITY_STEP_NAME,
   PREFLIGHT_JOB_NAME,
   reviewAcceptanceComment,
   type AcceptanceCommentRequest,
@@ -72,8 +74,10 @@ function job(
   name: string,
   status: string,
   conclusion: string | null,
+  steps: AcceptanceJobSnapshot["steps"] = [],
+  stepsComplete = false,
 ): AcceptanceJobSnapshot {
-  return { name, status, conclusion };
+  return { name, status, conclusion, steps, stepsComplete };
 }
 
 function acceptanceRun(
@@ -778,6 +782,253 @@ describe("acceptance comment authorization", () => {
     ).toBe(false);
   });
 
+  it("blocks when a skipped attempt is listed before an earlier success", () => {
+    expect(
+      review(
+        { runId: "200" },
+        {
+          acceptance: acceptance([
+            acceptanceRun({
+              id: "100",
+              jobs: [
+                job(AUTHORIZE_JOB_NAME, "completed", "skipped"),
+                job(AUTHORIZE_JOB_NAME, "completed", "success"),
+              ],
+            }),
+          ]),
+        },
+      ),
+    ).toEqual({ ok: false, reason: "duplicate_request" });
+    expect(
+      review(
+        { runId: "200" },
+        {
+          acceptance: acceptance([
+            acceptanceRun({
+              id: "100",
+              event: "workflow_dispatch",
+              actorId: null,
+              actorLogin: null,
+              jobs: [
+                job(PREFLIGHT_JOB_NAME, "completed", "skipped"),
+                job(PREFLIGHT_JOB_NAME, "completed", "success"),
+                job(ACCEPT_JOB_NAME, "completed", "skipped"),
+                job(ACCEPT_JOB_NAME, "completed", "failure"),
+              ],
+            }),
+          ]),
+        },
+      ),
+    ).toEqual({ ok: false, reason: "duplicate_request" });
+  });
+
+  it("asks for every attempt and ignores a latest-only skipped list", async () => {
+    const decision = await authorizeAcceptanceComment({
+      env: env({ ACCEPTANCE_RUN_ID: "200" }),
+      fetchImpl: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/pulls/8")) return pullResponse();
+        if (url.includes("/workflows/deploy-development.yml/")) {
+          return Response.json({
+            total_count: 1,
+            workflow_runs: [deliveryRun()],
+          });
+        }
+        if (url.includes("event=workflow_dispatch")) {
+          return Response.json({ total_count: 0, workflow_runs: [] });
+        }
+        if (url.includes("event=issue_comment")) {
+          return Response.json({
+            total_count: 1,
+            workflow_runs: [githubRun({ id: 100 })],
+          });
+        }
+        if (!url.includes("filter=all")) {
+          return Response.json({
+            total_count: 1,
+            jobs: [
+              {
+                id: 2,
+                name: AUTHORIZE_JOB_NAME,
+                status: "completed",
+                conclusion: "skipped",
+              },
+            ],
+          });
+        }
+        return Response.json({
+          total_count: 2,
+          jobs: [
+            {
+              id: 2,
+              name: AUTHORIZE_JOB_NAME,
+              status: "completed",
+              conclusion: "skipped",
+            },
+            {
+              id: 1,
+              name: AUTHORIZE_JOB_NAME,
+              status: "completed",
+              conclusion: "success",
+            },
+          ],
+        });
+      },
+    });
+    expect(decision).toEqual({ ok: false, reason: "duplicate_request" });
+  });
+
+  it("fails closed on duplicate job ids and an over-count page", async () => {
+    const duplicate = await authorizeAcceptanceComment({
+      env: env({ ACCEPTANCE_RUN_ID: "200" }),
+      fetchImpl: jobsResponse({
+        total_count: 2,
+        jobs: [
+          {
+            id: 7,
+            name: AUTHORIZE_JOB_NAME,
+            status: "completed",
+            conclusion: "success",
+          },
+          {
+            id: 7,
+            name: AUTHORIZE_JOB_NAME,
+            status: "completed",
+            conclusion: "skipped",
+          },
+        ],
+      }),
+    });
+    expect(duplicate).toEqual({ ok: false, reason: "acceptance_lookup" });
+    const overCount = await authorizeAcceptanceComment({
+      env: env({ ACCEPTANCE_RUN_ID: "200" }),
+      fetchImpl: jobsResponse({
+        total_count: 1,
+        jobs: [
+          {
+            id: 1,
+            name: AUTHORIZE_JOB_NAME,
+            status: "completed",
+            conclusion: "success",
+          },
+          {
+            id: 2,
+            name: AUTHORIZE_JOB_NAME,
+            status: "completed",
+            conclusion: "skipped",
+          },
+        ],
+      }),
+    });
+    expect(overCount).toEqual({ ok: false, reason: "acceptance_lookup" });
+    expect(ACCEPTANCE_JOB_RESULT_BOUND).toBe(1_000);
+  });
+
+  it("allows one recover command only after a pre-resource preflight failure", () => {
+    const history = acceptance([provenPreflightFailure()]);
+    expect(
+      review(
+        { runId: "200", commentBody: `/tutor-mbos recover-development ${sha}` },
+        { acceptance: history },
+      ),
+    ).toEqual({ ok: true, candidate: sha });
+    expect(review({ runId: "200" }, { acceptance: history })).toEqual({
+      ok: false,
+      reason: "duplicate_request",
+    });
+    expect(
+      review(
+        { runId: "200", commentBody: `/tutor-mbos recover-development ${sha}` },
+        { acceptance: acceptance([]) },
+      ),
+    ).toEqual({ ok: false, reason: "recovery_not_proven" });
+    expect(
+      review(
+        { runId: "200", commentBody: `/tutor-mbos recover-development ${sha}` },
+        {
+          acceptance: acceptance([
+            provenPreflightFailure({
+              jobs: [
+                job(AUTHORIZE_JOB_NAME, "completed", "success"),
+                job(
+                  PREFLIGHT_JOB_NAME,
+                  "completed",
+                  "failure",
+                  [
+                    ...preResourceSteps().slice(0, 2),
+                    {
+                      name: CAPABILITY_STEP_NAME,
+                      number: 8,
+                      status: "completed",
+                      conclusion: "failure",
+                    },
+                  ],
+                  true,
+                ),
+                job(ACCEPT_JOB_NAME, "completed", "skipped"),
+              ],
+            }),
+          ]),
+        },
+      ),
+    ).toEqual({ ok: false, reason: "recovery_denied" });
+    expect(
+      review(
+        { runId: "200", commentBody: `/tutor-mbos recover-development ${sha}` },
+        {
+          acceptance: acceptance([
+            provenPreflightFailure({
+              jobs: [
+                job(AUTHORIZE_JOB_NAME, "completed", "success"),
+                job(PREFLIGHT_JOB_NAME, "completed", "failure", [], false),
+                job(ACCEPT_JOB_NAME, "completed", "skipped"),
+              ],
+            }),
+          ]),
+        },
+      ),
+    ).toEqual({ ok: false, reason: "acceptance_evidence_unknown" });
+    expect(
+      review(
+        { runId: "200", commentBody: `/tutor-mbos recover-development ${sha}` },
+        {
+          acceptance: acceptance([
+            provenPreflightFailure(),
+            acceptanceRun({
+              id: "90",
+              event: "workflow_dispatch",
+              actorId: null,
+              actorLogin: null,
+              jobs: [job(PREFLIGHT_JOB_NAME, "in_progress", null)],
+            }),
+          ]),
+        },
+      ),
+    ).toEqual({ ok: false, reason: "recovery_denied" });
+    expect(
+      review(
+        { runId: "200", commentBody: `/tutor-mbos recover-development ${sha}` },
+        {
+          acceptance: acceptance([
+            provenPreflightFailure({
+              jobs: [
+                job(AUTHORIZE_JOB_NAME, "completed", "success"),
+                job(
+                  PREFLIGHT_JOB_NAME,
+                  "completed",
+                  "failure",
+                  preResourceSteps(),
+                  true,
+                ),
+                job(ACCEPT_JOB_NAME, "completed", "failure"),
+              ],
+            }),
+          ]),
+        },
+      ),
+    ).toEqual({ ok: false, reason: "recovery_denied" });
+  });
+
   it("checks the authorized candidate without executing it", () => {
     expect(
       execFileSync("node", ["scripts/assert-acceptance-candidate.mjs"], {
@@ -853,6 +1104,78 @@ function githubRun(
     conclusion: "skipped",
     actor: { id: Number(ACCEPTANCE_ACTOR_ID), login: ACCEPTANCE_ACTOR_LOGIN },
     ...overrides,
+  };
+}
+
+function preResourceSteps(): AcceptanceJobSnapshot["steps"] {
+  return [
+    {
+      name: "Require main",
+      number: 1,
+      status: "completed",
+      conclusion: "success",
+    },
+    {
+      name: "Require Auth admin cleanup credential",
+      number: 6,
+      status: "completed",
+      conclusion: "failure",
+    },
+    {
+      name: CAPABILITY_STEP_NAME,
+      number: 8,
+      status: "completed",
+      conclusion: "skipped",
+    },
+    {
+      name: "Pull Vercel project settings and environment",
+      number: 9,
+      status: "completed",
+      conclusion: "skipped",
+    },
+  ];
+}
+
+function provenPreflightFailure(
+  overrides: Partial<AcceptanceRunSnapshot> = {},
+): AcceptanceRunSnapshot {
+  return acceptanceRun({
+    id: "100",
+    jobs: [
+      job(AUTHORIZE_JOB_NAME, "completed", "skipped"),
+      job(AUTHORIZE_JOB_NAME, "completed", "success"),
+      job(PREFLIGHT_JOB_NAME, "completed", "skipped"),
+      job(PREFLIGHT_JOB_NAME, "completed", "failure", preResourceSteps(), true),
+      job(ACCEPT_JOB_NAME, "completed", "skipped"),
+      job(ACCEPT_JOB_NAME, "completed", "skipped"),
+    ],
+    ...overrides,
+  });
+}
+
+function jobsResponse(jobsBody: {
+  total_count: number;
+  jobs: Record<string, unknown>[];
+}): typeof fetch {
+  return async (input) => {
+    const url = String(input);
+    if (url.endsWith("/pulls/8")) return pullResponse();
+    if (url.includes("/workflows/deploy-development.yml/")) {
+      return Response.json({
+        total_count: 1,
+        workflow_runs: [deliveryRun()],
+      });
+    }
+    if (url.includes("event=workflow_dispatch")) {
+      return Response.json({ total_count: 0, workflow_runs: [] });
+    }
+    if (url.includes("event=issue_comment")) {
+      return Response.json({
+        total_count: 1,
+        workflow_runs: [githubRun({ id: 100 })],
+      });
+    }
+    return Response.json(jobsBody);
   };
 }
 
