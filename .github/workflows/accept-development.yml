@@ -172,7 +172,9 @@ jobs:
         env:
           VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
           NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
-          TUTOR_MBOS_APP_DATABASE_URL: ${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}
+          APP_RUNTIME_PASSWORD: ${{ secrets.APP_RUNTIME_PASSWORD }}
+          TUTOR_MBOS_APP_DATABASE_HOST: ${{ vars.TUTOR_MBOS_APP_DATABASE_HOST }}
+          TUTOR_MBOS_APP_DATABASE_PORT: ${{ vars.TUTOR_MBOS_APP_DATABASE_PORT }}
         run: node scripts/assert-business-acceptance-secrets.mjs
       - name: Verify development protection and health
         env:
@@ -262,7 +264,9 @@ jobs:
         env:
           ACCEPTANCE_PHASE: finish
           VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
-          TUTOR_MBOS_APP_DATABASE_URL: ${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}
+          APP_RUNTIME_PASSWORD: ${{ secrets.APP_RUNTIME_PASSWORD }}
+          TUTOR_MBOS_APP_DATABASE_HOST: ${{ vars.TUTOR_MBOS_APP_DATABASE_HOST }}
+          TUTOR_MBOS_APP_DATABASE_PORT: ${{ vars.TUTOR_MBOS_APP_DATABASE_PORT }}
           NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
         run: pnpm accept:development
 

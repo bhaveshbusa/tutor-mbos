@@ -33,7 +33,6 @@ import {
   readSessionTokens,
 } from "../src/server/application/acceptance-mail.ts";
 import {
-  APP_DATABASE_URL_SECRET,
   EXPECTED_AUTHORIZATION_PATH,
   MANAGEMENT_CASE_IDS,
   MANAGEMENT_TOKEN_SECRET,
@@ -60,9 +59,10 @@ import {
   type DirectProbe,
   type DirectProbeInput,
 } from "../src/server/application/hosted-acceptance.ts";
-import { pgConnection } from "../src/server/application/pg-connection.ts";
+import { pgAppRuntimeConnection } from "../src/server/application/pg-connection.ts";
 import {
   inspectAppDatabaseUrl,
+  resolveAppDatabaseUrl,
   resourceUrl,
   siteOriginFor,
 } from "../src/server/config/access.ts";
@@ -217,15 +217,14 @@ export function resolveAcceptanceMaterial(
     usableKey(env[PUBLISHABLE_KEY_NAME]) ??
     usableKey(pulled[PUBLISHABLE_KEY_NAME]);
   const management = usableSecret(env[MANAGEMENT_TOKEN_SECRET]);
-  const fromEnv = env[APP_DATABASE_URL_SECRET];
-  const database =
-    fromEnv && fromEnv !== "[SENSITIVE]"
-      ? fromEnv
-      : usableSecret(pulled[APP_DATABASE_URL_SECRET]);
+  const constructed = resolveAppDatabaseUrl(env, "development");
   return {
     publishableKey: key,
     managementToken: management,
-    appDatabaseUrl: database,
+    appDatabaseUrl:
+      constructed.ok && constructed.source === "password"
+        ? constructed.url
+        : null,
   };
 }
 
@@ -2158,7 +2157,7 @@ export async function runHostedAcceptance(
       "direct.cleanup",
     ];
     if (!input.appDatabaseUrl) {
-      results.push(...blockedCases(ids, secretName(APP_DATABASE_URL_SECRET)));
+      results.push(...blockedCases(ids, "app_runtime_password=absent"));
       return;
     }
     const inspected = inspectAppDatabaseUrl(
@@ -2217,7 +2216,7 @@ export async function runHostedAcceptance(
   async function probeWithPg(
     probeInputs: readonly DirectProbeInput[],
   ): Promise<DirectProbe[]> {
-    const connection = pgConnection(input.appDatabaseUrl ?? "");
+    const connection = pgAppRuntimeConnection(input.appDatabaseUrl ?? "");
     try {
       return await probeDirectTenants(connection, probeInputs);
     } finally {

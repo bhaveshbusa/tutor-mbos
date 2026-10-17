@@ -1,6 +1,6 @@
 import { hashSql } from "./migration-runner";
 import { scramSha256Verifier } from "./scram-password";
-import type { Sql } from "./sql";
+import type { Sql, SqlConnection } from "./sql";
 
 /**
  * Provisions the request login used by the running app.
@@ -21,7 +21,10 @@ import type { Sql } from "./sql";
  * grant, any other effective membership, a privileged or login-capable
  * app_request, another role reachable through app_request, or an
  * app_runtime ownership or direct ACL dependency fails closed before the
- * password and before the ready log. app_request's reviewed grants on
+ * password and before the ready log. Ordinary provisioning sets the
+ * password only when this call creates the role. An existing role keeps
+ * its password. Rotation is a separate call and is not part of ordinary
+ * provisioning. app_request's reviewed grants on
  * schema app, its tables, and its functions stay in place, including
  * execute on the migration-owned auth wrappers. Those grants are not
  * app_runtime dependencies. Refusal still prints the role flags.
@@ -74,6 +77,8 @@ export interface RuntimePrivilegeEvidence {
   requestRole: RequestRoleFlags;
   requestMembers: readonly string[];
   ownedOrAcl: number;
+  /** created: this call set the password. unchanged: an existing password was left alone. rotated: the explicit rotation call set it. */
+  passwordAction: "created" | "unchanged" | "rotated";
 }
 
 export interface SchemaLedgerEntry {
@@ -181,6 +186,7 @@ export function formatRuntimePrivilegeEvidence(
     formatRequestRole(evidence.requestRole),
     `app_request_member_of=${evidence.requestMembers.join(",") || "none"}`,
     `owned_or_acl=${evidence.ownedOrAcl}`,
+    `password_action=${evidence.passwordAction}`,
   ].join(" ");
 }
 
@@ -460,10 +466,19 @@ async function readOwnedOrAcl(db: Sql): Promise<number> {
   throw new Error(notReady("ownership metadata was not readable"));
 }
 
-export async function provisionAppRuntime(
+interface PreparedRuntime {
+  role: RuntimeRoleState;
+  effectiveMembers: string[];
+  requestRole: RequestRoleFlags;
+  requestMembers: string[];
+  ownedOrAcl: number;
+  created: boolean;
+}
+
+async function prepareAppRuntime(
   db: Sql,
-  password: string,
-): Promise<RuntimePrivilegeEvidence> {
+  create: boolean,
+): Promise<PreparedRuntime> {
   const requestRole = await readRequestRole(db);
   const requestMembers = await readEffectiveMembers(db, "app_request");
   let role = await readRuntimeRole(db);
@@ -475,12 +490,15 @@ export async function provisionAppRuntime(
   ) {
     throw requestRefusal(role, requestRole, requestMembers);
   }
+  let created = false;
   if (!role) {
+    if (!create) throw refuse("rotate", role);
     try {
       await db.exec(CREATE_APP_RUNTIME_SQL);
     } catch (error) {
       throw refuse("create", role, undefined, error);
     }
+    created = true;
     role = await requireRole(db);
   }
   assertSafe(role);
@@ -524,7 +542,22 @@ export async function provisionAppRuntime(
       effectiveMembers.length > 0 ? effectiveMembers.join(",") : "none";
     throw refuse("effective", role, `effective_member_of=${listed}`);
   }
+  return {
+    role,
+    effectiveMembers,
+    requestRole,
+    requestMembers,
+    ownedOrAcl,
+    created,
+  };
+}
 
+async function assignAppRuntimePassword(
+  db: Sql,
+  password: string,
+  role: RuntimeRoleState,
+): Promise<void> {
+  if (!password || /[\r\n]/.test(password)) throw refuse("password", role);
   const verifier = scramSha256Verifier(password);
   const quoted = await db.query<{ statement: unknown }>(
     "select format('alter role app_runtime password %L', $1::text) as statement",
@@ -542,12 +575,51 @@ export async function provisionAppRuntime(
   } catch (error) {
     throw refuse("password", role, undefined, error);
   }
+}
+
+/**
+ * Ordinary provisioning. A missing role is created, checked, and given its
+ * password in one transaction. A failure rolls that role back. An existing
+ * role is aligned and granted, and its password is not read or changed.
+ * password_action=unchanged does not mean the stored password matches.
+ */
+export async function provisionAppRuntime(
+  db: SqlConnection,
+  password: string,
+): Promise<RuntimePrivilegeEvidence> {
+  return db.transaction(async (tx) => {
+    const prepared = await prepareAppRuntime(tx, true);
+    if (prepared.created) {
+      await assignAppRuntimePassword(tx, password, prepared.role);
+    }
+    return {
+      role: prepared.role,
+      effectiveMembers: prepared.effectiveMembers,
+      requestRole: prepared.requestRole,
+      requestMembers: prepared.requestMembers,
+      ownedOrAcl: prepared.ownedOrAcl,
+      passwordAction: prepared.created ? "created" : "unchanged",
+    };
+  });
+}
+
+/**
+ * Explicit password rotation. The role must already exist. This does not
+ * create it and is not called by ordinary migration.
+ */
+export async function rotateAppRuntimePassword(
+  db: Sql,
+  password: string,
+): Promise<RuntimePrivilegeEvidence> {
+  const prepared = await prepareAppRuntime(db, false);
+  await assignAppRuntimePassword(db, password, prepared.role);
   return {
-    role,
-    effectiveMembers,
-    requestRole,
-    requestMembers,
-    ownedOrAcl,
+    role: prepared.role,
+    effectiveMembers: prepared.effectiveMembers,
+    requestRole: prepared.requestRole,
+    requestMembers: prepared.requestMembers,
+    ownedOrAcl: prepared.ownedOrAcl,
+    passwordAction: "rotated",
   };
 }
 

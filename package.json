@@ -18,6 +18,7 @@
     "test": "vitest run",
     "hygiene": "node scripts/check-repo-hygiene.ts",
     "migrate:development": "tsx scripts/apply-migrations.ts",
+    "rotate:app-runtime-password": "tsx scripts/rotate-app-runtime-password.ts",
     "accept:development": "tsx scripts/hosted-acceptance.ts",
     "accept:development:mail": "tsx scripts/hosted-acceptance-mail.ts",
     "accept:development:preflight": "tsx scripts/hosted-acceptance-preflight.ts",

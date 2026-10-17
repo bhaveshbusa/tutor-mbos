@@ -155,6 +155,78 @@ export function inspectAppDatabaseUrl(
   return { ok: true };
 }
 
+export const APP_RUNTIME_PASSWORD_ENV = "APP_RUNTIME_PASSWORD";
+export const APP_DATABASE_HOST_ENV = "TUTOR_MBOS_APP_DATABASE_HOST";
+export const APP_DATABASE_PORT_ENV = "TUTOR_MBOS_APP_DATABASE_PORT";
+
+export type AppDatabaseSource = "password" | "url";
+
+export type AppDatabaseResolution =
+  | { ok: true; url: string; source: AppDatabaseSource }
+  | { ok: false; code: string };
+
+/**
+ * Builds the app_runtime URL from the one password and the non-secret
+ * host and port. The username is app_runtime plus the reviewed project
+ * ref. The password is encoded. The result is accepted only when it
+ * passes the runtime URL guard. Failures return a code and not the
+ * password, host, or URL.
+ */
+export function appRuntimeDatabaseUrl(input: {
+  environment: DeploymentEnvironment;
+  password: string;
+  host: string;
+  port: string;
+}): AppDatabaseResolution {
+  if (!input.password.trim() || /[\r\n]/.test(input.password)) {
+    return { ok: false, code: "password_absent" };
+  }
+  if (!/^[A-Za-z0-9.-]+$/.test(input.host) || input.host.includes("..")) {
+    return { ok: false, code: "host_invalid" };
+  }
+  if (!/^[0-9]{2,5}$/.test(input.port)) {
+    return { ok: false, code: "port_invalid" };
+  }
+  const url = new URL("postgresql://localhost/postgres");
+  url.username = `app_runtime.${projectRefOf(input.environment)}`;
+  // The WHATWG password setter leaves "%" unchanged. pg-connection-string
+  // then decodes percent sequences, so a raw "%" must be encoded first.
+  url.password = encodeURIComponent(input.password);
+  url.hostname = input.host;
+  url.port = input.port;
+  const inspected = inspectAppDatabaseUrl(url.href, input.environment);
+  if (!inspected.ok) return inspected;
+  return { ok: true, url: url.href, source: "password" };
+}
+
+/**
+ * Password, host, and port together are the runtime credential. A partial
+ * set does not fall back to a stored URL. The stored URL is used only when
+ * none of those three names is set, so a current deployment keeps working
+ * until the operator switches it.
+ */
+export function resolveAppDatabaseUrl(
+  env: Readonly<Record<string, string | undefined>>,
+  environment: DeploymentEnvironment,
+): AppDatabaseResolution {
+  const password = env[APP_RUNTIME_PASSWORD_ENV];
+  const host = env[APP_DATABASE_HOST_ENV]?.trim();
+  const port = env[APP_DATABASE_PORT_ENV]?.trim();
+  if (password !== undefined || host || port) {
+    return appRuntimeDatabaseUrl({
+      environment,
+      password: password ?? "",
+      host: host ?? "",
+      port: port ?? "",
+    });
+  }
+  const legacy = env.TUTOR_MBOS_APP_DATABASE_URL;
+  if (!legacy) return { ok: false, code: "absent" };
+  const inspected = inspectAppDatabaseUrl(legacy, environment);
+  if (!inspected.ok) return inspected;
+  return { ok: true, url: legacy, source: "url" };
+}
+
 /**
  * Migration workflow only. Development project, DDL-capable login, never the
  * request role and never the production project.

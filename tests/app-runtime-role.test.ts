@@ -17,6 +17,7 @@ import {
   formatRuntimeRoleEvidence,
   formatSchemaLedgerLine,
   provisionAppRuntime,
+  rotateAppRuntimePassword,
   readRuntimeRole,
   readSchemaLedger,
   restrictedRuntimeAttributes,
@@ -72,19 +73,32 @@ const ready: RuntimePrivilegeEvidence = {
   requestRole: safeRequest,
   requestMembers: ["app_request"],
   ownedOrAcl: 0,
+  passwordAction: "created",
 };
 
-function recording(connection: Sql): { sql: Sql; statements: string[] } {
+const unchanged: RuntimePrivilegeEvidence = {
+  ...ready,
+  passwordAction: "unchanged",
+};
+
+function recording(connection: SqlConnection): {
+  sql: SqlConnection;
+  statements: string[];
+} {
   const statements: string[] = [];
-  const sql: Sql = {
+  const wrap = (inner: Sql): Sql => ({
     async query(text, params) {
       statements.push(text);
-      return connection.query(text, params);
+      return inner.query(text, params);
     },
     async exec(text) {
       statements.push(text);
-      await connection.exec(text);
+      await inner.exec(text);
     },
+  });
+  const sql: SqlConnection = {
+    ...wrap(connection),
+    transaction: (fn) => connection.transaction(async (tx) => fn(wrap(tx))),
   };
   return { sql, statements };
 }
@@ -134,6 +148,13 @@ function expectVerifierOnly(statements: readonly string[]): void {
   const sql = statements.join("\n");
   expect(sql).toContain("SCRAM-SHA-256$");
   expect(sql).not.toContain(password);
+}
+
+function expectNoPassword(statements: readonly string[]): void {
+  const sql = statements.join("\n");
+  expect(sql).not.toContain("password");
+  expect(sql).not.toContain(password);
+  expect(sql).not.toContain("SCRAM-SHA-256$");
 }
 
 async function rejection(
@@ -329,10 +350,10 @@ describe("app runtime role provisioning", () => {
     await connection.exec("set session authorization migration_login");
     const recorded = recording(connection);
     const evidence = await provisionAppRuntime(recorded.sql, password);
-    expect(evidence).toEqual(ready);
+    expect(evidence).toEqual(unchanged);
     expectOrdinarySql(recorded.statements);
     expect(recorded.statements).toContain(ALIGN_APP_RUNTIME_SQL);
-    expectVerifierOnly(recorded.statements);
+    expectNoPassword(recorded.statements);
   });
 
   it("revokes an existing admin option on the same grant", async () => {
@@ -356,11 +377,11 @@ describe("app runtime role provisioning", () => {
     );
     const recorded = recording(connection);
     const evidence = await provisionAppRuntime(recorded.sql, password);
-    expect(evidence).toEqual(ready);
+    expect(evidence).toEqual(unchanged);
     expect(recorded.statements).toContain(GRANT_APP_REQUEST_SQL);
     expect(recorded.statements).toContain(REVOKE_APP_REQUEST_ADMIN_SQL);
     expectOrdinarySql(recorded.statements);
-    expectVerifierOnly(recorded.statements);
+    expectNoPassword(recorded.statements);
   });
 
   it("reprovisions an existing safe role without altering restricted attributes", async () => {
@@ -380,15 +401,109 @@ describe("app runtime role provisioning", () => {
     );
     await connection.exec("set session authorization migration_login");
     const first = recording(connection);
-    expect(await provisionAppRuntime(first.sql, password)).toEqual(ready);
+    expect(await provisionAppRuntime(first.sql, password)).toEqual(unchanged);
     const second = recording(connection);
-    expect(await provisionAppRuntime(second.sql, password)).toEqual(ready);
+    expect(await provisionAppRuntime(second.sql, "other-secret")).toEqual(
+      unchanged,
+    );
     expectOrdinarySql(first.statements);
     expectOrdinarySql(second.statements);
-    expectVerifierOnly(second.statements);
+    expectNoPassword(first.statements);
+    expectNoPassword(second.statements);
     expect(second.statements.join("\n")).not.toContain("create role");
     expect(second.statements.join("\n")).not.toContain(ALIGN_APP_RUNTIME_SQL);
     expect(await readRuntimeRole(connection)).toEqual(safeRole);
+  });
+
+  it("leaves an existing password in place until explicit rotation", async () => {
+    const connection = await migrated();
+    await connection.exec(`
+      create role migration_login
+        nosuperuser createrole nobypassrls nocreatedb noreplication noinherit
+    `);
+    await connection.exec(
+      "grant app_request to migration_login with admin true, inherit false, set false",
+    );
+    await connection.exec(`
+      create function public.test_runtime_secret() returns text
+      language sql security definer
+      set search_path = pg_catalog
+      as $$ select rolpassword from pg_authid where rolname = 'app_runtime' $$
+    `);
+    await connection.exec(
+      "grant execute on function public.test_runtime_secret() to migration_login",
+    );
+    await connection.exec("set session authorization migration_login");
+    const created = await provisionAppRuntime(connection, password);
+    expect(created.passwordAction).toBe("created");
+    const readSecret = async () => {
+      const stored = await connection.query<{ test_runtime_secret: unknown }>(
+        "select public.test_runtime_secret()",
+      );
+      const secret = stored.rows[0]?.test_runtime_secret;
+      if (typeof secret !== "string") throw new Error("stored secret");
+      return secret;
+    };
+    const original = await readSecret();
+    expect(scramSha256Accepts(original, password)).toBe(true);
+    expect(original).not.toContain(password);
+    const again = await provisionAppRuntime(connection, "other-secret");
+    expect(again.passwordAction).toBe("unchanged");
+    expect(await readSecret()).toBe(original);
+    expect(scramSha256Accepts(original, "other-secret")).toBe(false);
+    const rotated = await rotateAppRuntimePassword(connection, "other-secret");
+    expect(rotated.passwordAction).toBe("rotated");
+    const next = await readSecret();
+    expect(next).not.toBe(original);
+    expect(next).not.toContain("other-secret");
+    expect(scramSha256Accepts(next, "other-secret")).toBe(true);
+    expect(scramSha256Accepts(next, password)).toBe(false);
+    expect(formatRuntimePrivilegeEvidence(rotated)).toContain(
+      "password_action=rotated",
+    );
+    expect(formatRuntimePrivilegeEvidence(rotated)).not.toContain(password);
+    expect(formatRuntimePrivilegeEvidence(rotated)).not.toContain(
+      "other-secret",
+    );
+  });
+
+  it("rolls a new role back when the password phase fails, then retries", async () => {
+    const connection = await migrated();
+    await useMigrationLogin(connection);
+    let denied = false;
+    const failing: SqlConnection = {
+      query: (text, params) => connection.query(text, params),
+      exec: (text) => connection.exec(text),
+      transaction: (fn) =>
+        connection.transaction(async (tx) =>
+          fn({
+            query: (text, params) => tx.query(text, params),
+            exec: async (text) => {
+              if (text.startsWith("alter role app_runtime password ")) {
+                denied = true;
+                const error = new Error("password denied");
+                Object.assign(error, { code: "42501" });
+                throw error;
+              }
+              await tx.exec(text);
+            },
+          }),
+        ),
+    };
+    await expect(provisionAppRuntime(failing, password)).rejects.toThrow(
+      /phase=password/,
+    );
+    expect(denied).toBe(true);
+    const present = async () => {
+      const result = await connection.query<{ present: boolean }>(
+        "select exists(select 1 from pg_roles where rolname = 'app_runtime') as present",
+      );
+      return result.rows[0]?.present;
+    };
+    expect(await present()).toBe(false);
+    const retried = await provisionAppRuntime(connection, password);
+    expect(retried.passwordAction).toBe("created");
+    expect(await present()).toBe(true);
   });
 
   it("rejects an existing bypassrls role before it can serve requests", async () => {
@@ -582,7 +697,14 @@ describe("app runtime role provisioning", () => {
       "create role app_runtime login noinherit nosuperuser nobypassrls",
     );
     await useMigrationLogin(connection);
-    const { message, statements } = await rejection(connection, password);
+    const recorded = recording(connection);
+    let message = "";
+    try {
+      await rotateAppRuntimePassword(recorded.sql, password);
+    } catch (error) {
+      message = error instanceof Error ? error.message : "";
+    }
+    const statements = recorded.statements;
     expect(message).toContain("phase=password");
     expect(message).toContain("sqlstate=42501");
     expect(message).toContain("login=true");
@@ -633,7 +755,8 @@ describe("app runtime role provisioning", () => {
     const first = recording(connection);
     expect(await provisionAppRuntime(first.sql, password)).toEqual(ready);
     const second = recording(connection);
-    expect(await provisionAppRuntime(second.sql, password)).toEqual(ready);
+    expect(await provisionAppRuntime(second.sql, password)).toEqual(unchanged);
+    expectNoPassword(second.statements);
     expect(first.statements.join("\n")).not.toContain("alter role app_request");
     expect(second.statements.join("\n")).not.toContain("drop role");
   });
@@ -713,6 +836,9 @@ describe("app runtime role provisioning", () => {
     expect(ledgerCheck).toBeGreaterThan(0);
     expect(provision).toBeGreaterThan(ledgerCheck);
     expect(readyLog).toBeGreaterThan(provision);
+    expect(script).toContain(
+      "app_runtime privileges are ready. The existing password was not changed.",
+    );
     expect(script).not.toContain("nosuperuser");
     expect(script).not.toContain("nobypassrls");
     const source = readFileSync(
