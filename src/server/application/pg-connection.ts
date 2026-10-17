@@ -1,15 +1,22 @@
 import pg from "pg";
+import { appRuntimeTls } from "@/server/config/supabase-prod-ca";
 import type { Sql, SqlConnection } from "./sql";
 
 export interface ClosableConnection extends SqlConnection {
   close(): Promise<void>;
 }
 
+type ClientTls = ReturnType<typeof appRuntimeTls>;
+
 /** One non-pooled client. Connects on the first query and never logs the URL. */
-export function pgConnection(connectionString: string): ClosableConnection {
+export function pgConnection(
+  connectionString: string,
+  ssl?: ClientTls,
+): ClosableConnection {
   const client = new pg.Client({
     connectionString,
     connectionTimeoutMillis: 5_000,
+    ...(ssl ? { ssl } : {}),
   });
   let connecting: Promise<void> | null = null;
   const ready = () => {
@@ -43,4 +50,14 @@ export function pgConnection(connectionString: string): ClosableConnection {
       if (connecting) await client.end();
     },
   };
+}
+
+/**
+ * Constructed app_runtime connection. Trusts the bundled Supabase prod CA
+ * and checks the hostname. Migration and stored-URL clients do not use this.
+ */
+export function pgAppRuntimeConnection(
+  connectionString: string,
+): ClosableConnection {
+  return pgConnection(connectionString, appRuntimeTls());
 }

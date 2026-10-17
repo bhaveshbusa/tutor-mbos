@@ -59,7 +59,7 @@ import {
   type DirectProbe,
   type DirectProbeInput,
 } from "../src/server/application/hosted-acceptance.ts";
-import { pgConnection } from "../src/server/application/pg-connection.ts";
+import { pgAppRuntimeConnection } from "../src/server/application/pg-connection.ts";
 import {
   inspectAppDatabaseUrl,
   resolveAppDatabaseUrl,
@@ -2216,7 +2216,7 @@ export async function runHostedAcceptance(
   async function probeWithPg(
     probeInputs: readonly DirectProbeInput[],
   ): Promise<DirectProbe[]> {
-    const connection = pgConnection(input.appDatabaseUrl ?? "");
+    const connection = pgAppRuntimeConnection(input.appDatabaseUrl ?? "");
     try {
       return await probeDirectTenants(connection, probeInputs);
     } finally {

@@ -15,7 +15,7 @@ import {
   formatHistoricalAppRowReport,
   type HistoricalAppRowReport,
 } from "@/server/application/cleanup-run-38954838195";
-import { pgConnection } from "@/server/application/pg-connection";
+import { pgAppRuntimeConnection } from "@/server/application/pg-connection";
 import { databaseSqlState } from "@/server/application/hosted-acceptance";
 import { resolveAppDatabaseUrl } from "@/server/config/access";
 
@@ -40,7 +40,7 @@ async function main(): Promise<number> {
   }
   const databaseUrl = inspected.url;
   mask(databaseUrl);
-  const connection = pgConnection(databaseUrl);
+  const connection = pgAppRuntimeConnection(databaseUrl);
   let report: HistoricalAppRowReport | null = null;
   let failed: unknown = null;
   try {

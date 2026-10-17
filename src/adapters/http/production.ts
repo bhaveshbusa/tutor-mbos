@@ -19,7 +19,10 @@ import {
 import { applySetCookies, serializeAuthCookie } from "./auth-cookies";
 import { revokeSupabaseOauthGrant } from "./consent";
 import { createPgAccessStore } from "@/server/application/access-store";
-import { pgConnection } from "@/server/application/pg-connection";
+import {
+  pgAppRuntimeConnection,
+  pgConnection,
+} from "@/server/application/pg-connection";
 import type { AccessDeps } from "./access";
 import { problemResponse } from "./problem";
 
@@ -137,9 +140,12 @@ export async function withAccess(
       "The business database connection is not the app runtime role for this environment.",
     );
   }
-  const databaseUrl = database.ok ? database.url : undefined;
   const siteOrigin = siteOriginFor(runtime.config.environment);
-  const connection = databaseUrl ? pgConnection(databaseUrl) : null;
+  const connection = database.ok
+    ? database.source === "password"
+      ? pgAppRuntimeConnection(database.url)
+      : pgConnection(database.url)
+    : null;
   const refreshedCookies: string[] = [];
   const deps: AccessDeps = {
     siteOrigin,

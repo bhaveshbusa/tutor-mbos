@@ -102,8 +102,10 @@ describe("database connection guards", () => {
     const parsed = parsedConnection(built.url);
     expect(parsed.password).toBe(secret);
     expect(parsed.user).toBe(`app_runtime.${devRef}`);
-    expect(parsed.ssl).toEqual({});
-    expect(built.url).toContain("sslmode=verify-full");
+    // No sslmode leaves pg's default, which is TLS off. The app client
+    // supplies the CA separately so a URL sslmode cannot replace it.
+    expect(parsed.ssl).toBe(false);
+    expect(built.url).not.toContain("sslmode=");
     expect(built.url).not.toContain(secret);
     expect(JSON.stringify(built)).not.toContain(secret);
     for (const roundTrip of [
@@ -122,7 +124,7 @@ describe("database connection guards", () => {
       expect(encoded.ok, roundTrip).toBe(true);
       if (!encoded.ok) continue;
       expect(parsedConnection(encoded.url).password, roundTrip).toBe(roundTrip);
-      expect(encoded.url).toContain("sslmode=verify-full");
+      expect(encoded.url).not.toContain("sslmode=");
     }
     const legacy = `postgresql://app_runtime.${devRef}:<decoy>@aws-0-eu-west-2.pooler.supabase.com:6543/postgres`;
     const preferred = resolveAppDatabaseUrl(
