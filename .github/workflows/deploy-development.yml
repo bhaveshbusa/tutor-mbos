@@ -109,14 +109,8 @@ jobs:
           set +e
           git diff --quiet "$base" "$GITHUB_SHA" -- \
             supabase/migrations \
-            scripts/apply-migrations.ts \
-            src/server/application/app-runtime-role.ts \
-            src/server/application/migration-runner.ts \
-            src/server/application/pg-connection.ts \
-            src/server/application/scram-password.ts \
-            src/server/application/sql.ts \
-            src/server/config/access.ts \
-            src/server/config/environments.ts \
+            scripts \
+            src \
             .github/workflows/apply-development-migrations.yml \
             .github/actions/setup \
             package.json \

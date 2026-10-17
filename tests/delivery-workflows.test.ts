@@ -1,6 +1,5 @@
 import { execFileSync } from "node:child_process";
 import {
-  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -66,33 +65,6 @@ function migrationInputPaths(script: string): string[] {
     .split("\n")
     .map((line) => line.trim().replace(/\\$/, "").trim())
     .filter((line) => line.length > 0 && line !== "--" && !line.includes("$"));
-}
-
-function localImportClosure(entry: string): string[] {
-  const seen = new Set<string>();
-  const visit = (file: string) => {
-    if (seen.has(file) || !existsSync(file)) return;
-    seen.add(file);
-    const text = readFileSync(file, "utf8");
-    for (const match of text.matchAll(/from\s+["'](\.[^"']+)["']/g)) {
-      visit(resolveLocalImport(file, match[1]!));
-    }
-  };
-  visit(entry);
-  return [...seen];
-}
-
-function resolveLocalImport(fromFile: string, specifier: string): string {
-  const base = join(dirname(fromFile), specifier);
-  for (const candidate of [
-    base,
-    `${base}.ts`,
-    `${base}.tsx`,
-    join(base, "index.ts"),
-  ]) {
-    if (existsSync(candidate)) return candidate.split("\\").join("/");
-  }
-  return base;
 }
 
 interface DetectRepo {
@@ -185,6 +157,7 @@ function runDetect(
     cwd: repo.dir,
     env: {
       PATH: `${bin}:${process.env.PATH ?? ""}`,
+      NODE_ENV: "test",
       EVENT_NAME: options.event,
       GITHUB_SHA: options.sha,
       GITHUB_OUTPUT: output,
@@ -302,14 +275,8 @@ describe("development deployment", () => {
     expect(script).not.toContain("github.event.before");
     expect(migrationInputPaths(script)).toEqual([
       "supabase/migrations",
-      "scripts/apply-migrations.ts",
-      "src/server/application/app-runtime-role.ts",
-      "src/server/application/migration-runner.ts",
-      "src/server/application/pg-connection.ts",
-      "src/server/application/scram-password.ts",
-      "src/server/application/sql.ts",
-      "src/server/config/access.ts",
-      "src/server/config/environments.ts",
+      "scripts",
+      "src",
       ".github/workflows/apply-development-migrations.yml",
       ".github/actions/setup",
       "package.json",
@@ -375,18 +342,6 @@ describe("development deployment", () => {
       ).toBe("true");
     }
   }, 60_000);
-
-  it("covers every local import reached from the migration script", () => {
-    const inputs = migrationInputPaths(detectScript(workflow));
-    const reached = localImportClosure("scripts/apply-migrations.ts");
-    expect(reached.length).toBeGreaterThan(1);
-    for (const file of reached) {
-      expect(
-        inputs.some((input) => file === input || file.startsWith(`${input}/`)),
-        file,
-      ).toBe(true);
-    }
-  });
 
   it("targets the development binding through the development environment", () => {
     const deploy = workflow.jobs.deploy!;
