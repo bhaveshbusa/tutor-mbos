@@ -5,6 +5,7 @@
  * read credentials, or accept a caller-supplied owner or client id.
  */
 import {
+  databaseSqlState,
   probeDirectTenants,
   readVisibleBusinessIds,
   type DirectProbe,
@@ -39,7 +40,22 @@ export interface HistoricalAppRowReport {
   phase: "read" | "cleanup";
   owners: OwnerVisibility[];
   probes: DirectProbe[];
-  outcome: "removed" | "aborted_visibility" | "aborted_count" | "partial";
+  outcome:
+    | "removed"
+    | "aborted_visibility"
+    | "aborted_count"
+    | "partial"
+    | "uncertain";
+}
+
+export interface DiagnoseReport {
+  runId: typeof CLEANUP_RUN_38954838195.runId;
+  phase: "connect" | "owner_read";
+  outcome: "read" | "failed";
+  sqlstate: string;
+  closeSqlstate: string | null;
+  writes: "not_started";
+  owners: OwnerVisibility[];
 }
 
 export function cleanupRunGuard(
@@ -49,12 +65,83 @@ export function cleanupRunGuard(
     env.TUTOR_MBOS_ACCEPTANCE !== "development" ||
     env.GITHUB_ACTIONS !== "true"
   ) {
-    return "Historical app-row cleanup runs only from the protected development workflow.";
+    return "Historical app-row read runs only from the protected development workflow.";
   }
   if (env.GITHUB_REF && env.GITHUB_REF !== "refs/heads/main") {
-    return "Historical app-row cleanup runs from main only.";
+    return "Historical app-row read runs from main only.";
   }
   return null;
+}
+
+/**
+ * Read-only check for the two manifest owners. Workflow run 38992665029
+ * failed before a report, so this function does not call `probeDirectTenants`
+ * and does not delete. `select 1` is the connect phase. Each later read is
+ * that owner's claims. A database error returns its allowlisted SQLSTATE.
+ */
+export async function diagnoseRun38954838195(
+  db: SqlConnection,
+): Promise<DiagnoseReport> {
+  const base = {
+    runId: CLEANUP_RUN_38954838195.runId,
+    closeSqlstate: null,
+    writes: "not_started" as const,
+  };
+  try {
+    await db.query("select 1");
+  } catch (error) {
+    return {
+      ...base,
+      phase: "connect",
+      outcome: "failed",
+      sqlstate: databaseSqlState(error),
+      owners: [],
+    };
+  }
+  const owners: OwnerVisibility[] = [];
+  for (const user of CLEANUP_RUN_38954838195.users) {
+    try {
+      const ids = await readVisibleBusinessIds(db, user.id);
+      owners.push({
+        label: user.label,
+        businessId: ids.length === 1 ? (ids[0] ?? null) : null,
+        visible: ids.length,
+      });
+    } catch (error) {
+      return {
+        ...base,
+        phase: "owner_read",
+        outcome: "failed",
+        sqlstate: databaseSqlState(error),
+        owners,
+      };
+    }
+  }
+  return {
+    ...base,
+    phase: "owner_read",
+    outcome: "read",
+    sqlstate: "absent",
+    owners,
+  };
+}
+
+export function formatDiagnoseReport(report: DiagnoseReport): string {
+  const close =
+    report.closeSqlstate === null
+      ? ""
+      : ` close_sqlstate=${report.closeSqlstate}`;
+  const lines = [
+    `historical_app_rows run=${report.runId} phase=${report.phase} outcome=${report.outcome} sqlstate=${report.sqlstate} writes=${report.writes}${close}`,
+  ];
+  for (const owner of report.owners) {
+    lines.push(
+      owner.businessId
+        ? `owner=${owner.label} visible=${owner.visible} business=${owner.businessId}`
+        : `owner=${owner.label} visible=${owner.visible}`,
+    );
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -65,6 +152,10 @@ export function cleanupRunGuard(
  * do not cascade into app rows. An uncertain read returns before
  * `probeDirectTenants`. That probe still re-reads both owners, rolls a bad
  * row count back, and does not start the second owner after the first aborts.
+ * A confirmation read that throws after the delete transaction returns is
+ * `uncertain`: the caller cannot treat that owner as cleanly removed.
+ * The protected command does not call this function while run 38992665029
+ * has no visibility report.
  */
 export async function cleanupRun38954838195(
   db: SqlConnection,
@@ -112,13 +203,16 @@ export async function cleanupRun38954838195(
   ]);
   const deleted = probes.length > 0 && probes.every((probe) => probe.deleted);
   const anyDeleted = probes.some((probe) => probe.deleted);
+  const confirm = probes.some((probe) => probe.abortReason === "confirm");
   const outcome = deleted
     ? "removed"
-    : anyDeleted
-      ? "partial"
-      : probes.some((probe) => probe.abortReason === "count")
-        ? "aborted_count"
-        : "aborted_visibility";
+    : confirm
+      ? "uncertain"
+      : anyDeleted
+        ? "partial"
+        : probes.some((probe) => probe.abortReason === "count")
+          ? "aborted_count"
+          : "aborted_visibility";
   return {
     runId: CLEANUP_RUN_38954838195.runId,
     phase: "cleanup",
@@ -143,8 +237,12 @@ export function formatHistoricalAppRowReport(
   }
   report.probes.forEach((probe, index) => {
     const label = report.owners[index]?.label ?? "unknown";
+    const confirm =
+      probe.abortReason === "confirm"
+        ? ` delete_committed=${probe.deleteCommitted === true} confirm_sqlstate=${probe.confirmSqlstate ?? "absent"}`
+        : "";
     lines.push(
-      `probe=${label} deleted=${probe.deleted} abort=${probe.abortReason ?? "none"} other_visible=${probe.otherVisible}`,
+      `probe=${label} deleted=${probe.deleted} abort=${probe.abortReason ?? "none"} other_visible=${probe.otherVisible}${confirm}`,
     );
   });
   return lines.join("\n");
