@@ -2410,7 +2410,7 @@ function orphanRowsGap(): AcceptanceCase {
   return acceptanceCase(
     "direct.orphan_rows",
     "gap",
-    "Auth user deletion does not cascade into app.businesses, app.business_creation_keys, or app.oauth_consents. Scoped cleanup did not finish, so those rows may remain. This workflow will not send unqualified SQL or an elevated business request. A reviewed follow-up deletes the remaining rows by primary key as a role this business job does not have.",
+    "Auth user deletion does not cascade into app.businesses, app.business_creation_keys, or app.oauth_consents. Scoped cleanup did not finish, so those rows may remain. This workflow will not send unqualified SQL or an elevated business request. The reviewed follow-up for run 38954838195 reads each manifest owner's business under that owner's claims and then uses this same scoped cleanup. It does not delete by name or prefix.",
   );
 }
 

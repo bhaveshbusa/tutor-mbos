@@ -454,6 +454,17 @@ async function visibleIds(tx: Sql): Promise<string[]> {
 }
 
 /**
+ * Businesses visible to one owner. The claims are the session JWT, not a
+ * lookup in auth.users, so a deleted Auth user does not hide or remove the row.
+ */
+export async function readVisibleBusinessIds(
+  db: SqlConnection,
+  userId: string,
+): Promise<string[]> {
+  return asRequest(db, userId, visibleIds);
+}
+
+/**
  * Direct database bypass for one synthetic owner. The connection must already
  * be the app_runtime login. Mutations name that owner's business, user, and
  * client ids. Unexpected visibility returns before any write. Creation keys
@@ -726,7 +737,7 @@ export function classifyDirectProbes(
       acceptanceCase(
         "direct.orphan_rows",
         "gap",
-        "Auth user deletion does not cascade into app.businesses, app.business_creation_keys, or app.oauth_consents. Scoped cleanup aborted, so those rows may remain for one or both synthetic owners. This workflow will not send unqualified SQL or an elevated business request. A reviewed follow-up deletes the remaining rows by primary key as a role this business job does not have.",
+        "Auth user deletion does not cascade into app.businesses, app.business_creation_keys, or app.oauth_consents. Scoped cleanup aborted, so those rows may remain for one or both synthetic owners. This workflow will not send unqualified SQL or an elevated business request. The reviewed follow-up for run 38954838195 reads each manifest owner's business under that owner's claims and then uses this same scoped cleanup. It does not delete by name or prefix.",
       ),
     );
   }
