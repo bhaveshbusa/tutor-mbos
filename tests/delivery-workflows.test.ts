@@ -1,4 +1,13 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import { ENVIRONMENT_BINDINGS } from "@/server/config/environments";
@@ -11,8 +20,10 @@ interface Step {
 interface Job {
   uses?: string;
   needs?: string | string[];
+  if?: string;
   environment?: string | { name: string };
   env?: Record<string, string>;
+  outputs?: Record<string, string>;
   steps?: Step[];
   permissions?: Record<string, string>;
   secrets?: Record<string, string> | string;
@@ -38,6 +49,129 @@ const workflowFiles = readdirSync(WORKFLOW_DIR).map(
   (f) => `${WORKFLOW_DIR}/${f}`,
 );
 const actionFiles = [".github/actions/setup/action.yml"];
+
+function detectScript(workflow: Workflow): string {
+  const changes = workflow.jobs.changes;
+  const detect = (changes?.steps ?? []).find((step) =>
+    (step.run ?? "").includes("git diff --quiet"),
+  );
+  return detect?.run ?? "";
+}
+
+function migrationInputPaths(script: string): string[] {
+  const block =
+    script.split("git diff --quiet")[1]?.split("diff_status")[0] ?? "";
+  return block
+    .split("\n")
+    .map((line) => line.trim().replace(/\\$/, "").trim())
+    .filter((line) => line.length > 0 && line !== "--" && !line.includes("$"));
+}
+
+interface DetectRepo {
+  dir: string;
+  base: string;
+  side: string;
+}
+
+function git(cwd: string, args: string[]): string {
+  return execFileSync(
+    "git",
+    [
+      "-c",
+      "advice.detachedHead=false",
+      "-c",
+      "init.defaultBranch=main",
+      ...args,
+    ],
+    {
+      cwd,
+      stdio: ["ignore", "pipe", "ignore"],
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "detect-test",
+        GIT_AUTHOR_EMAIL: "detect-test@example.com",
+        GIT_COMMITTER_NAME: "detect-test",
+        GIT_COMMITTER_EMAIL: "detect-test@example.com",
+      },
+    },
+  )
+    .toString()
+    .trim();
+}
+
+function initDetectRepo(inputs: string[]): DetectRepo {
+  const dir = mkdtempSync(join(tmpdir(), "migrate-detect-"));
+  git(dir, ["init"]);
+  for (const path of inputs) writeRepoFile(dir, touchedFile(path), "base\n");
+  writeRepoFile(dir, "README.md", "docs\n");
+  git(dir, ["add", "."]);
+  git(dir, ["commit", "-m", "base"]);
+  const base = git(dir, ["rev-parse", "HEAD"]);
+  git(dir, ["checkout", "--orphan", "side"]);
+  git(dir, ["commit", "--allow-empty", "-m", "side"]);
+  const side = git(dir, ["rev-parse", "HEAD"]);
+  git(dir, ["checkout", base]);
+  return { dir, base, side };
+}
+
+function touchedFile(path: string): string {
+  return path.split("/").pop()?.includes(".") ? path : join(path, "keep");
+}
+
+function writeRepoFile(dir: string, path: string, contents: string): void {
+  const full = join(dir, path);
+  mkdirSync(dirname(full), { recursive: true });
+  writeFileSync(full, contents);
+}
+
+function commitFile(
+  repo: DetectRepo,
+  base: string,
+  path: string,
+  contents: string,
+): string {
+  git(repo.dir, ["checkout", base]);
+  writeRepoFile(repo.dir, path, contents);
+  git(repo.dir, ["add", path]);
+  git(repo.dir, ["commit", "-m", path]);
+  return git(repo.dir, ["rev-parse", "HEAD"]);
+}
+
+function runDetect(
+  repo: DetectRepo,
+  script: string,
+  options: { event: string; sha: string; stub?: string; stubExit?: number },
+): string {
+  const bin = join(repo.dir, "bin");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(
+    join(bin, "gh"),
+    '#!/bin/sh\nif [ "${GH_STUB_EXIT:-0}" != "0" ]; then exit "$GH_STUB_EXIT"; fi\nprintf \'%s\' "${GH_STUB_OUT-}"\n',
+  );
+  execFileSync("chmod", ["755", join(bin, "gh")]);
+  const output = join(repo.dir, "github-output");
+  writeFileSync(output, "");
+  const scriptPath = join(repo.dir, "detect.sh");
+  writeFileSync(scriptPath, script);
+  execFileSync("bash", ["-e", scriptPath], {
+    cwd: repo.dir,
+    env: {
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      NODE_ENV: "test",
+      EVENT_NAME: options.event,
+      GITHUB_SHA: options.sha,
+      GITHUB_OUTPUT: output,
+      GITHUB_REPOSITORY: "example/repo",
+      GH_STUB_OUT: options.stub ?? "",
+      GH_STUB_EXIT: String(options.stubExit ?? 0),
+      HOME: repo.dir,
+    },
+  });
+  const recorded = readFileSync(output, "utf8").match(
+    /^migrate=(true|false)$/m,
+  );
+  return recorded?.[1] ?? "";
+}
 
 describe("CI workflow", () => {
   const ci = load("ci.yml");
@@ -82,11 +216,21 @@ describe("development deployment", () => {
     expect(workflow.jobs.checks?.uses).toBe("./.github/workflows/ci.yml");
     expect(workflow.jobs.preflight?.needs).toBe("checks");
     expect(environmentOf(workflow.jobs.preflight!)).toBe("development");
-    expect(workflow.jobs.migrate?.needs).toBe("preflight");
+    expect(workflow.jobs.migrate?.needs).toEqual(["preflight", "changes"]);
+    expect(workflow.jobs.migrate?.if).toBe(
+      "needs.changes.outputs.migrate == 'true'",
+    );
     expect(workflow.jobs.migrate?.uses).toBe(
       "./.github/workflows/apply-development-migrations.yml",
     );
-    expect(workflow.jobs.deploy?.needs).toBe("migrate");
+    expect(workflow.jobs.deploy?.needs).toEqual([
+      "preflight",
+      "changes",
+      "migrate",
+    ]);
+    expect(workflow.jobs.deploy?.if).toBe(
+      "${{ !cancelled() && needs.changes.result == 'success' && needs.preflight.result == 'success' && (needs.migrate.result == 'success' || (needs.migrate.result == 'skipped' && needs.changes.outputs.migrate == 'false')) }}",
+    );
     expect(workflow.concurrency).toEqual({
       group: "development-delivery",
       "cancel-in-progress": false,
@@ -101,6 +245,103 @@ describe("development deployment", () => {
     expect(preflightRuns).not.toContain("migrate:development");
     expect(preflightRuns).not.toMatch(/\bdeploy\s+--prebuilt/);
   });
+
+  it("runs migrations only when migration inputs changed since the last successful delivery", () => {
+    const changes = workflow.jobs.changes!;
+    expect(environmentOf(changes)).toBeUndefined();
+    expect(changes.permissions).toEqual({
+      contents: "read",
+      actions: "read",
+    });
+    expect(changes.outputs?.migrate).toBe(
+      "${{ steps.detect.outputs.migrate }}",
+    );
+    expect(JSON.stringify(changes)).not.toMatch(/secrets\./);
+    const detect = (changes.steps ?? []).find((step) =>
+      (step.run ?? "").includes("git diff --quiet"),
+    );
+    expect(detect?.env?.GH_TOKEN).toBe("${{ github.token }}");
+    expect(detect?.env?.EVENT_NAME).toBe("${{ github.event_name }}");
+    const script = detect?.run ?? "";
+    expect(script).toContain(
+      'if [ "$EVENT_NAME" = "workflow_dispatch" ]; then',
+    );
+    expect(script).toContain(
+      "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-development.yml/runs?branch=main&status=success&per_page=1",
+    );
+    expect(script).toContain(
+      'git merge-base --is-ancestor "$base" "$GITHUB_SHA"',
+    );
+    expect(script).not.toContain("github.event.before");
+    expect(migrationInputPaths(script)).toEqual([
+      "supabase/migrations",
+      "scripts",
+      "src",
+      ".github/workflows/apply-development-migrations.yml",
+      ".github/actions/setup",
+      "package.json",
+      "pnpm-lock.yaml",
+      ".nvmrc",
+    ]);
+    expect(raw(`${WORKFLOW_DIR}/deploy-development.yml`)).not.toContain(
+      "paths-ignore",
+    );
+    expect(raw(`${WORKFLOW_DIR}/migrate-development.yml`)).not.toContain(
+      "needs.changes.outputs.migrate",
+    );
+  });
+
+  it("decides migrate from the workflow script", () => {
+    const script = detectScript(workflow);
+    const inputs = migrationInputPaths(script);
+    const repo = initDetectRepo(inputs);
+    const docs = commitFile(repo, repo.base, "README.md", "changed docs\n");
+    expect(
+      runDetect(repo, script, { event: "push", sha: docs, stub: repo.base }),
+    ).toBe("false");
+    expect(
+      runDetect(repo, script, {
+        event: "workflow_dispatch",
+        sha: docs,
+        stub: repo.base,
+      }),
+    ).toBe("true");
+    expect(
+      runDetect(repo, script, { event: "push", sha: docs, stubExit: 1 }),
+    ).toBe("true");
+    expect(
+      runDetect(repo, script, { event: "push", sha: docs, stub: "" }),
+    ).toBe("true");
+    expect(
+      runDetect(repo, script, { event: "push", sha: docs, stub: "not-a-sha" }),
+    ).toBe("true");
+    expect(
+      runDetect(repo, script, {
+        event: "push",
+        sha: docs,
+        stub: "a".repeat(40),
+      }),
+    ).toBe("true");
+    expect(
+      runDetect(repo, script, { event: "push", sha: docs, stub: repo.side }),
+    ).toBe("true");
+    for (const path of inputs) {
+      const changed = commitFile(
+        repo,
+        repo.base,
+        touchedFile(path),
+        "changed\n",
+      );
+      expect(
+        runDetect(repo, script, {
+          event: "push",
+          sha: changed,
+          stub: repo.base,
+        }),
+        path,
+      ).toBe("true");
+    }
+  }, 60_000);
 
   it("targets the development binding through the development environment", () => {
     const deploy = workflow.jobs.deploy!;

@@ -1,10 +1,12 @@
 name: Deploy development
 
 # Every push to main runs CI, then a name-only Vercel preflight, then
-# development migrations and privilege checks, then a prebuilt deploy that
-# is smoke tested before promotion. Credentials come from the protected
-# development environment only. Pull requests do not run this workflow.
-# queue: max keeps a pending delivery when a recovery run is dispatched.
+# development migrations when reviewed migration inputs changed since the
+# last successful development delivery, then a prebuilt deploy that is
+# smoke tested before promotion. Manual dispatch always runs migrations.
+# Credentials come from the protected development environment only. Pull
+# requests do not run this workflow. queue: max keeps a pending delivery
+# when a recovery run is dispatched.
 on:
   push:
     branches: [main]
@@ -62,9 +64,70 @@ jobs:
       - name: Verify deployment target binding
         run: node scripts/assert-deploy-target.ts "$DEPLOY_ENVIRONMENT"
 
+  changes:
+    name: Detect migration inputs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      migrate: ${{ steps.detect.outputs.migrate }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Compare migration inputs with the last successful delivery
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          write_migrate() {
+            echo "migrate=$1" >> "$GITHUB_OUTPUT"
+          }
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            write_migrate true
+            exit 0
+          fi
+          base="$(gh api --jq '.workflow_runs[0].head_sha // ""' \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-development.yml/runs?branch=main&status=success&per_page=1" || true)"
+          if ! printf '%s' "$base" | grep -Eq '^[0-9a-f]{40}$'; then
+            write_migrate true
+            exit 0
+          fi
+          if ! git cat-file -e "${base}^{commit}" >/dev/null 2>&1; then
+            write_migrate true
+            exit 0
+          fi
+          if ! git merge-base --is-ancestor "$base" "$GITHUB_SHA"; then
+            write_migrate true
+            exit 0
+          fi
+          set +e
+          git diff --quiet "$base" "$GITHUB_SHA" -- \
+            supabase/migrations \
+            scripts \
+            src \
+            .github/workflows/apply-development-migrations.yml \
+            .github/actions/setup \
+            package.json \
+            pnpm-lock.yaml \
+            .nvmrc
+          diff_status=$?
+          set -e
+          if [ "$diff_status" -eq 0 ]; then
+            write_migrate false
+          else
+            write_migrate true
+          fi
+
   migrate:
     name: Migrate tutor-mbos-dev
-    needs: preflight
+    needs: [preflight, changes]
+    if: needs.changes.outputs.migrate == 'true'
     uses: ./.github/workflows/apply-development-migrations.yml
     secrets:
       SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
@@ -72,7 +135,8 @@ jobs:
 
   deploy:
     name: Deploy to tutor-mbos-dev
-    needs: migrate
+    needs: [preflight, changes, migrate]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.preflight.result == 'success' && (needs.migrate.result == 'success' || (needs.migrate.result == 'skipped' && needs.changes.outputs.migrate == 'false')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment:
