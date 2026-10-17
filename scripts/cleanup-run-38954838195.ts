@@ -1,17 +1,23 @@
 /**
- * Protected entry for run 38954838195 app-row cleanup. The owner and client
+ * Protected read for run 38954838195. Workflow run 38992665029 failed
+ * before a report, so this process does not delete. The owner and client
  * ids are compiled into the reviewed module. This process does not read a
  * manifest, an admin key, or a caller-supplied id. It receives only the
  * development app_runtime URL.
  */
 import { pathToFileURL } from "node:url";
 import {
-  cleanupRun38954838195,
+  CLEANUP_RUN_38954838195,
   cleanupRunGuard,
-  formatHistoricalAppRowReport,
+  diagnoseRun38954838195,
+  formatDiagnoseReport,
+  type DiagnoseReport,
 } from "@/server/application/cleanup-run-38954838195";
 import { pgConnection } from "@/server/application/pg-connection";
-import { APP_DATABASE_URL_SECRET } from "@/server/application/hosted-acceptance";
+import {
+  APP_DATABASE_URL_SECRET,
+  databaseSqlState,
+} from "@/server/application/hosted-acceptance";
 import { inspectAppDatabaseUrl } from "@/server/config/access";
 
 function mask(value: string | null | undefined): void {
@@ -34,16 +40,34 @@ async function main(): Promise<number> {
     return 1;
   }
   const connection = pgConnection(databaseUrl);
+  let report: DiagnoseReport | null = null;
+  let failed: unknown = null;
   try {
-    const report = await cleanupRun38954838195(connection);
-    console.log(formatHistoricalAppRowReport(report));
-    return report.outcome === "removed" ? 0 : 1;
+    report = await diagnoseRun38954838195(connection);
   } catch (error) {
-    console.error(`::error::${error instanceof Error ? error.name : "Error"}`);
-    return 1;
-  } finally {
-    await connection.close();
+    failed = error;
   }
+  let closeSqlstate: string | null = null;
+  try {
+    await connection.close();
+  } catch (error) {
+    closeSqlstate = databaseSqlState(error);
+  }
+  if (report) {
+    console.log(
+      formatDiagnoseReport(
+        closeSqlstate ? { ...report, closeSqlstate } : report,
+      ),
+    );
+    return report.outcome === "read" ? 0 : 1;
+  }
+  const sqlstate = databaseSqlState(failed);
+  const close =
+    closeSqlstate === null ? "" : ` close_sqlstate=${closeSqlstate}`;
+  console.error(
+    `::error::historical_app_rows run=${CLEANUP_RUN_38954838195.runId} phase=script outcome=failed sqlstate=${sqlstate} writes=not_started${close}`,
+  );
+  return 1;
 }
 
 if (

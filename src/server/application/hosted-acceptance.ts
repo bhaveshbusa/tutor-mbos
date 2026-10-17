@@ -397,7 +397,10 @@ export interface DirectProbe {
   otherVisible: boolean;
   deleted: boolean;
   aborted: boolean;
-  abortReason: "visibility" | "count" | null;
+  abortReason: "visibility" | "count" | "confirm" | null;
+  /** Set when the post-delete read throws after the delete transaction returns. */
+  deleteCommitted?: boolean;
+  confirmSqlstate?: string | null;
 }
 
 export interface DirectProbeInput {
@@ -412,6 +415,17 @@ class CleanupCountError extends Error {
     super("cleanup_count");
     this.name = "cleanup_count";
   }
+}
+
+/** Five-character SQLSTATE only. Messages, constraints, and tables stay out. */
+export function databaseSqlState(error: unknown): string {
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return "absent";
+  }
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && /^[0-9A-Z]{5}$/.test(code)
+    ? code
+    : "absent";
 }
 
 function permissionDenied(error: unknown): boolean {
@@ -465,6 +479,31 @@ export async function readVisibleBusinessIds(
 }
 
 /**
+ * The delete transaction has already committed or rolled back. A throw here
+ * must not escape: the caller would lose that fact and might start the
+ * other owner. The SQLSTATE is allowlisted; the message is dropped.
+ */
+async function confirmedVisible(
+  db: SqlConnection,
+  userId: string,
+): Promise<{ ids: string[] | null; failed: boolean; sqlstate: string | null }> {
+  try {
+    return {
+      ids: await asRequest(db, userId, visibleIds),
+      failed: false,
+      sqlstate: null,
+    };
+  } catch (error) {
+    const sqlstate = databaseSqlState(error);
+    return {
+      ids: null,
+      failed: true,
+      sqlstate: sqlstate === "absent" ? null : sqlstate,
+    };
+  }
+}
+
+/**
  * Direct database bypass for one synthetic owner. The connection must already
  * be the app_runtime login. Mutations name that owner's business, user, and
  * client ids. Unexpected visibility returns before any write. Creation keys
@@ -508,18 +547,23 @@ export async function probeDirectTenantAccess(
   } catch {
     removed = false;
   }
-  const remaining = await asRequest(db, input.userId, visibleIds);
+  const confirmed = await confirmedVisible(db, input.userId);
   const deleted =
     removed &&
-    !remaining.includes(input.ownBusinessId) &&
-    !remaining.includes(input.otherBusinessId);
+    !confirmed.failed &&
+    confirmed.ids !== null &&
+    !confirmed.ids.includes(input.ownBusinessId) &&
+    !confirmed.ids.includes(input.otherBusinessId);
   return {
     runtimeReadDenied,
     ownVisible,
     otherVisible,
     deleted,
     aborted: !deleted,
-    abortReason: deleted ? null : "count",
+    abortReason: deleted ? null : confirmed.failed ? "confirm" : "count",
+    ...(confirmed.failed
+      ? { deleteCommitted: removed, confirmSqlstate: confirmed.sqlstate }
+      : {}),
   };
 }
 
@@ -593,11 +637,13 @@ export async function probeDirectTenants(
     } catch {
       removed = false;
     }
-    const remaining = await asRequest(db, view.input.userId, visibleIds);
+    const confirmed = await confirmedVisible(db, view.input.userId);
     const deleted =
       removed &&
-      !remaining.includes(view.input.ownBusinessId) &&
-      !remaining.includes(view.input.otherBusinessId);
+      !confirmed.failed &&
+      confirmed.ids !== null &&
+      !confirmed.ids.includes(view.input.ownBusinessId) &&
+      !confirmed.ids.includes(view.input.otherBusinessId);
     if (!deleted) stopped = true;
     probes.push({
       runtimeReadDenied,
@@ -605,7 +651,10 @@ export async function probeDirectTenants(
       otherVisible: view.otherVisible,
       deleted,
       aborted: !deleted,
-      abortReason: deleted ? null : "count",
+      abortReason: deleted ? null : confirmed.failed ? "confirm" : "count",
+      ...(confirmed.failed
+        ? { deleteCommitted: removed, confirmSqlstate: confirmed.sqlstate }
+        : {}),
     });
   }
   return probes;
@@ -701,6 +750,7 @@ export function classifyDirectProbes(
     probes.length > 0 &&
     probes.every((probe) => probe.ownVisible && !probe.otherVisible);
   const deleted = probes.length > 0 && probes.every((probe) => probe.deleted);
+  const confirmAbort = probes.some((probe) => probe.abortReason === "confirm");
   const countAbort = probes.some((probe) => probe.abortReason === "count");
   const visibilityAbort = probes.some(
     (probe) => probe.abortReason === "visibility",
@@ -725,11 +775,13 @@ export function classifyDirectProbes(
       deleted ? "pass" : "fail",
       deleted
         ? "own_rows_removed"
-        : countAbort
-          ? "aborted_row_count"
-          : visibilityAbort
-            ? "aborted_unexpected_visibility"
-            : "own_rows_remain",
+        : confirmAbort
+          ? "aborted_confirm"
+          : countAbort
+            ? "aborted_row_count"
+            : visibilityAbort
+              ? "aborted_unexpected_visibility"
+              : "own_rows_remain",
     ),
   ];
   if (probes.some((probe) => probe.aborted || !probe.deleted)) {
@@ -737,7 +789,7 @@ export function classifyDirectProbes(
       acceptanceCase(
         "direct.orphan_rows",
         "gap",
-        "Auth user deletion does not cascade into app.businesses, app.business_creation_keys, or app.oauth_consents. Scoped cleanup aborted, so those rows may remain for one or both synthetic owners. This workflow will not send unqualified SQL or an elevated business request. The reviewed follow-up for run 38954838195 reads each manifest owner's business under that owner's claims and then uses this same scoped cleanup. It does not delete by name or prefix.",
+        "Auth user deletion does not cascade into app.businesses, app.business_creation_keys, or app.oauth_consents. Scoped cleanup aborted, so those rows may remain for one or both synthetic owners. This workflow will not send unqualified SQL or an elevated business request. The reviewed follow-up for run 38954838195 reads each manifest owner's business under that owner's claims and prints the phase and SQLSTATE. It does not delete until that read is reviewed, and it does not delete by name or prefix.",
       ),
     );
   }
