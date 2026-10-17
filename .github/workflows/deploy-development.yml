@@ -111,7 +111,17 @@ jobs:
             supabase/migrations \
             scripts/apply-migrations.ts \
             src/server/application/app-runtime-role.ts \
-            .github/workflows/apply-development-migrations.yml
+            src/server/application/migration-runner.ts \
+            src/server/application/pg-connection.ts \
+            src/server/application/scram-password.ts \
+            src/server/application/sql.ts \
+            src/server/config/access.ts \
+            src/server/config/environments.ts \
+            .github/workflows/apply-development-migrations.yml \
+            .github/actions/setup \
+            package.json \
+            pnpm-lock.yaml \
+            .nvmrc
           diff_status=$?
           set -e
           if [ "$diff_status" -eq 0 ]; then
