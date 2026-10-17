@@ -456,9 +456,10 @@ async function visibleIds(tx: Sql): Promise<string[]> {
 /**
  * Direct database bypass for one synthetic owner. The connection must already
  * be the app_runtime login. Mutations name that owner's business, user, and
- * client ids. Unexpected visibility returns before any write. A row count
- * other than the scoped expectation throws, and the transaction rolls back.
- * The function never prints SQL errors.
+ * client ids. Unexpected visibility returns before any write. Creation keys
+ * for that owner and business must come back as one to four rows. Any other
+ * count throws, and the transaction rolls back. The function never prints
+ * SQL errors.
  */
 export async function probeDirectTenantAccess(
   db: SqlConnection,
@@ -599,6 +600,14 @@ export async function probeDirectTenants(
   return probes;
 }
 
+/**
+ * The business job writes the create key, the forged-id retry key, and the
+ * MCP key for one owner and business. One extra key on that same business
+ * is still this run. A wider set is not this cleanup.
+ */
+const MIN_OWNED_CREATION_KEYS = 1;
+const MAX_OWNED_CREATION_KEYS = 4;
+
 async function deleteOwnedRows(
   tx: Sql,
   input: DirectProbeInput,
@@ -610,7 +619,13 @@ async function deleteOwnedRows(
      returning business_id::text`,
     [input.ownBusinessId, input.userId],
   );
-  if (keys.rows.length !== 1) throw new CleanupCountError();
+  if (
+    keys.rows.length < MIN_OWNED_CREATION_KEYS ||
+    keys.rows.length > MAX_OWNED_CREATION_KEYS ||
+    keys.rows.some((row) => row.business_id !== input.ownBusinessId)
+  ) {
+    throw new CleanupCountError();
+  }
   if (clientIds.length > 0) {
     const consents = await tx.query<{ oauth_client_id: string }>(
       `delete from app.oauth_consents

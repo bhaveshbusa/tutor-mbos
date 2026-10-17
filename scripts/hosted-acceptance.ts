@@ -1016,7 +1016,28 @@ export async function runHostedAcceptance(
           exchanged ? "confirmed" : "callback_rejected",
         ),
       );
+      if (exchanged) recordCompletedSignup(tenant);
     }
+  }
+
+  /**
+   * The initial signup row keeps its HTTP and confirmation_required text.
+   * A later successful callback marks that same row passed. A rejected
+   * callback or an HTTP failure stays the original failure.
+   */
+  function recordCompletedSignup(tenant: Tenant): void {
+    const id = `signup.${tenant.label.replace("tenant-", "tenant_")}`;
+    const existing = results.find((row) => row.id === id);
+    if (
+      !existing ||
+      existing.status !== "fail" ||
+      !existing.detail.includes("confirmation_required") ||
+      existing.detail.endsWith(" confirmed")
+    ) {
+      return;
+    }
+    existing.status = "pass";
+    existing.detail = `${existing.detail} confirmed`;
   }
 
   async function completeRecovery(tenant: Tenant): Promise<boolean> {
@@ -2076,12 +2097,24 @@ export async function runHostedAcceptance(
       body: JSON.stringify({ clientId: client.clientId }),
     });
     const after = await bearerBusiness(tenant, null);
-    const revokedPass = revoked.status === 200 && after.status === 403;
+    // 401 is GET /user failing after the Supabase grant is deleted.
+    // 403 is the app grant with no business.read. Either denial must
+    // return no business id. The revoke status alone is not a pass.
+    const nextDenied =
+      (after.status === 401 || after.status === 403) && after.id === null;
+    const revokedPass = revoked.status === 200 && nextDenied;
+    const detail = revokedPass
+      ? "next_request_denied"
+      : revoked.status !== 200
+        ? `revoke_http_${revoked.status}`
+        : after.id !== null
+          ? "business_still_visible"
+          : `next_request_http_${after.status}`;
     results.push(
       acceptanceCase(
         "generic_client.revocation",
         revokedPass ? "pass" : "fail",
-        revokedPass ? "next_request_denied" : `http_${revoked.status}`,
+        detail,
       ),
     );
     const mixed = await request(`${target.site}/api/v1/business`, {

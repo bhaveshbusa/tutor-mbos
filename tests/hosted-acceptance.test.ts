@@ -74,6 +74,8 @@ interface DoubleOptions {
   dataApi?: { status: number; code: string };
   openApi?: { status: number; body: unknown };
   signupStatus?: number;
+  postRevoke?: { status: number; business?: boolean };
+  revokeStatus?: number;
 }
 
 function developmentDouble(options: DoubleOptions = {}) {
@@ -284,7 +286,16 @@ function developmentDouble(options: DoubleOptions = {}) {
           return json(401, { title: "Unauthorized" });
         }
         const key = `${String(claims.sub)}:${claims.client_id}`;
-        if (revoked.has(key)) return json(403, { title: "Forbidden" });
+        if (revoked.has(key)) {
+          const denial = options.postRevoke ?? { status: 403 };
+          if (denial.business) {
+            const own = businessFor(String(claims.sub));
+            return json(denial.status, {
+              business: { id: own, displayName: "Synthetic" },
+            });
+          }
+          return json(denial.status, { title: "Forbidden" });
+        }
         const perms = clientPerms.get(claims.client_id) ?? [];
         if (!perms.includes("business.read")) {
           return json(403, { title: "Forbidden" });
@@ -428,6 +439,9 @@ function developmentDouble(options: DoubleOptions = {}) {
       });
     }
     if (url.pathname === "/api/v1/grants/revoke") {
+      if (options.revokeStatus && options.revokeStatus !== 200) {
+        return json(options.revokeStatus, { title: "Bad gateway" });
+      }
       const clientId = String(jsonBody().clientId ?? "");
       const email = emailFromCookie(header("cookie"));
       const user = users.get(email);
@@ -508,6 +522,9 @@ describe("hosted acceptance harness", () => {
     const report = await runHostedAcceptance(input(doubled.fetchImpl));
     const failed = report.results.filter((row) => row.status === "fail");
     expect(failed.map((row) => `${row.id} ${row.detail}`)).toEqual([]);
+    expect(
+      report.results.find((row) => row.id === "generic_client.revocation"),
+    ).toMatchObject({ status: "pass", detail: "next_request_denied" });
     const ids = report.results.map((row) => row.id);
     expect(new Set(ids).size).toBe(ids.length);
     expect(acceptanceTally(report.results).result).toBe("incomplete");
@@ -779,8 +796,23 @@ describe("hosted acceptance harness", () => {
       expect(
         continued.results.find(
           (row) => row.id === "signup.confirmation.tenant_a",
-        )?.status,
-      ).toBe("pass");
+        ),
+      ).toMatchObject({ status: "pass", detail: "confirmed" });
+      expect(
+        continued.results.find((row) => row.id === "signup.tenant_a"),
+      ).toMatchObject({
+        status: "pass",
+        detail: "http_200 confirmation_required confirmed",
+      });
+      expect(
+        continued.results.find((row) => row.id === "signup.tenant_b"),
+      ).toMatchObject({
+        status: "pass",
+        detail: "http_200 confirmation_required confirmed",
+      });
+      expect(
+        continued.results.filter((row) => row.id === "signup.tenant_a"),
+      ).toHaveLength(1);
       const callback = seen.find((call) => call.url.includes("/auth/callback"));
       expect(callback?.cookie).toContain("-code-verifier=");
       expect(callback?.authorization).toBe("");
@@ -833,6 +865,17 @@ describe("hosted acceptance harness", () => {
       expect(
         finished.results.find((row) => row.id === "ui.tenant_b_page")?.status,
       ).toBe("pass");
+      expect(
+        finished.results.find((row) => row.id === "signup.tenant_a"),
+      ).toMatchObject({
+        status: "pass",
+        detail: "http_200 confirmation_required confirmed",
+      });
+      expect(
+        finished.results.find(
+          (row) => row.id === "signup.confirmation.tenant_a",
+        ),
+      ).toMatchObject({ status: "pass", detail: "confirmed" });
       const refreshes = seen
         .filter((call) => call.url.includes("/auth/v1/token"))
         .map((call) => call.refresh);
@@ -1751,6 +1794,50 @@ describe("hosted acceptance harness", () => {
     expect(text).toContain(`closing_commit=${"c".repeat(40)}`);
   });
 
+  it("accepts a 401 next request after revocation when no business is returned", async () => {
+    const doubled = developmentDouble({ postRevoke: { status: 401 } });
+    const report = await runHostedAcceptance(input(doubled.fetchImpl));
+    expect(
+      report.results.find((row) => row.id === "generic_client.revocation"),
+    ).toMatchObject({ status: "pass", detail: "next_request_denied" });
+    expect(
+      report.results.find(
+        (row) => row.id === "generic_client.bearer_not_upgraded",
+      ),
+    ).toMatchObject({ status: "pass", detail: "http_401" });
+    expect(
+      report.results.find((row) => row.id === "generic_client.reconnection")
+        ?.status,
+    ).toBe("pass");
+    expect(report.results.filter((row) => row.status === "fail")).toEqual([]);
+  });
+
+  it("fails revocation when the next request still returns the business", async () => {
+    const doubled = developmentDouble({
+      postRevoke: { status: 200, business: true },
+    });
+    const report = await runHostedAcceptance(input(doubled.fetchImpl));
+    expect(
+      report.results.find((row) => row.id === "generic_client.revocation"),
+    ).toMatchObject({ status: "fail", detail: "business_still_visible" });
+  });
+
+  it("does not pass revocation from the revoke status alone", async () => {
+    const doubled = developmentDouble({ revokeStatus: 502 });
+    const report = await runHostedAcceptance(input(doubled.fetchImpl));
+    expect(
+      report.results.find((row) => row.id === "generic_client.revocation"),
+    ).toMatchObject({ status: "fail", detail: "revoke_http_502" });
+  });
+
+  it("does not treat an auth outage after revocation as a denial", async () => {
+    const doubled = developmentDouble({ postRevoke: { status: 503 } });
+    const report = await runHostedAcceptance(input(doubled.fetchImpl));
+    expect(
+      report.results.find((row) => row.id === "generic_client.revocation"),
+    ).toMatchObject({ status: "fail", detail: "next_request_http_503" });
+  });
+
   it("rejects an OAuth denial that is only a redirect", async () => {
     const doubled = developmentDouble({ denyLocation: `${site}/business` });
     const report = await runHostedAcceptance(input(doubled.fetchImpl));
@@ -1941,6 +2028,23 @@ describe("acceptance classifiers", () => {
     expect(material.managementToken).toBeNull();
   });
 });
+
+async function addCreationKeys(
+  connection: {
+    query: (text: string, params: readonly unknown[]) => Promise<unknown>;
+  },
+  ownerUserId: string,
+  businessId: string,
+  count: number,
+): Promise<void> {
+  for (let index = 0; index < count; index += 1) {
+    await connection.query(
+      `insert into app.business_creation_keys (owner_user_id, idempotency_key, business_id)
+       values ($1::uuid, $2, $3::uuid)`,
+      [ownerUserId, `extra-${ownerUserId.slice(0, 8)}-${index}`, businessId],
+    );
+  }
+}
 
 describe("direct tenant probe", () => {
   it("lets app_runtime read only the caller's business and then delete it", async () => {
@@ -2206,7 +2310,7 @@ describe("direct tenant probe", () => {
     await db.close();
   });
 
-  it("rolls back when the scoped creation-key count is not exactly one", async () => {
+  it("deletes three or four creation keys for one business and leaves the other tenant", async () => {
     const { db, connection, store } = await migratedDatabase();
     const userA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
     const userB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2";
@@ -2223,11 +2327,73 @@ describe("direct tenant probe", () => {
       displayName: "Synthetic B",
       idempotencyKey: "tos3-b",
     });
-    await connection.query(
-      `insert into app.business_creation_keys (owner_user_id, idempotency_key, business_id)
-       values ($1::uuid, 'extra', $2::uuid)`,
-      [userA, createdA.business.id],
+    await addCreationKeys(connection, userA, createdA.business.id, 2);
+    await addCreationKeys(connection, userB, createdB.business.id, 3);
+    await connection.exec("create role app_runtime login noinherit");
+    await connection.exec(
+      "grant app_request to app_runtime with inherit false, set true",
     );
+    await connection.exec("set session authorization app_runtime");
+    const probe = await probeDirectTenantAccess(connection, {
+      userId: userA,
+      ownBusinessId: createdA.business.id,
+      otherBusinessId: createdB.business.id,
+      clientIds: [],
+    });
+    expect(probe.deleted).toBe(true);
+    expect(probe.abortReason).toBeNull();
+    await connection.exec("reset session authorization");
+    expect(await store.readBusiness(actor(userA))).toBeNull();
+    expect((await store.readBusiness(actor(userB)))?.id).toBe(
+      createdB.business.id,
+    );
+    const visibleKeys = async (userId: string) => {
+      const claims = JSON.stringify({
+        sub: userId,
+        role: "authenticated",
+        aud: "authenticated",
+      });
+      return connection.transaction(async (tx) => {
+        await tx.query("select set_config('request.jwt.claims', $1, true)", [
+          claims,
+        ]);
+        await tx.query("select set_config('request.jwt.claim.sub', $1, true)", [
+          userId,
+        ]);
+        await tx.exec("set local role app_request");
+        return tx.query<{ business_id: string }>(
+          "select business_id::text as business_id from app.business_creation_keys",
+        );
+      });
+    };
+    expect((await visibleKeys(userA)).rows).toEqual([]);
+    expect((await visibleKeys(userB)).rows).toEqual([
+      { business_id: createdB.business.id },
+      { business_id: createdB.business.id },
+      { business_id: createdB.business.id },
+      { business_id: createdB.business.id },
+    ]);
+    await db.close();
+  });
+
+  it("rolls back when the scoped creation-key count is above four", async () => {
+    const { db, connection, store } = await migratedDatabase();
+    const userA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
+    const userB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2";
+    const actor = (userId: string) => ({
+      path: "ui-session" as const,
+      userId,
+      clientId: null,
+    });
+    const createdA = await store.createBusiness(actor(userA), {
+      displayName: "Synthetic A",
+      idempotencyKey: "tos3-a",
+    });
+    const createdB = await store.createBusiness(actor(userB), {
+      displayName: "Synthetic B",
+      idempotencyKey: "tos3-b",
+    });
+    await addCreationKeys(connection, userA, createdA.business.id, 4);
     await connection.exec("create role app_runtime login noinherit");
     await connection.exec(
       "grant app_request to app_runtime with inherit false, set true",
@@ -2268,11 +2434,7 @@ describe("direct tenant probe", () => {
       displayName: "Synthetic B",
       idempotencyKey: "tos3-b",
     });
-    await connection.query(
-      `insert into app.business_creation_keys (owner_user_id, idempotency_key, business_id)
-       values ($1::uuid, 'extra', $2::uuid)`,
-      [userA, createdA.business.id],
-    );
+    await addCreationKeys(connection, userA, createdA.business.id, 4);
     await connection.exec("create role app_runtime login noinherit");
     await connection.exec(
       "grant app_request to app_runtime with inherit false, set true",
