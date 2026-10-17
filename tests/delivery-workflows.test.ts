@@ -11,8 +11,10 @@ interface Step {
 interface Job {
   uses?: string;
   needs?: string | string[];
+  if?: string;
   environment?: string | { name: string };
   env?: Record<string, string>;
+  outputs?: Record<string, string>;
   steps?: Step[];
   permissions?: Record<string, string>;
   secrets?: Record<string, string> | string;
@@ -82,11 +84,21 @@ describe("development deployment", () => {
     expect(workflow.jobs.checks?.uses).toBe("./.github/workflows/ci.yml");
     expect(workflow.jobs.preflight?.needs).toBe("checks");
     expect(environmentOf(workflow.jobs.preflight!)).toBe("development");
-    expect(workflow.jobs.migrate?.needs).toBe("preflight");
+    expect(workflow.jobs.migrate?.needs).toEqual(["preflight", "changes"]);
+    expect(workflow.jobs.migrate?.if).toBe(
+      "needs.changes.outputs.migrate == 'true'",
+    );
     expect(workflow.jobs.migrate?.uses).toBe(
       "./.github/workflows/apply-development-migrations.yml",
     );
-    expect(workflow.jobs.deploy?.needs).toBe("migrate");
+    expect(workflow.jobs.deploy?.needs).toEqual([
+      "preflight",
+      "changes",
+      "migrate",
+    ]);
+    expect(workflow.jobs.deploy?.if).toBe(
+      "${{ !cancelled() && needs.changes.result == 'success' && needs.preflight.result == 'success' && (needs.migrate.result == 'success' || (needs.migrate.result == 'skipped' && needs.changes.outputs.migrate == 'false')) }}",
+    );
     expect(workflow.concurrency).toEqual({
       group: "development-delivery",
       "cancel-in-progress": false,
@@ -100,6 +112,49 @@ describe("development deployment", () => {
     );
     expect(preflightRuns).not.toContain("migrate:development");
     expect(preflightRuns).not.toMatch(/\bdeploy\s+--prebuilt/);
+  });
+
+  it("runs migrations only when migration inputs changed since the last successful delivery", () => {
+    const changes = workflow.jobs.changes!;
+    expect(environmentOf(changes)).toBeUndefined();
+    expect(changes.permissions).toEqual({
+      contents: "read",
+      actions: "read",
+    });
+    expect(changes.outputs?.migrate).toBe(
+      "${{ steps.detect.outputs.migrate }}",
+    );
+    expect(JSON.stringify(changes)).not.toMatch(/secrets\./);
+    const detect = (changes.steps ?? []).find((step) =>
+      (step.run ?? "").includes("git diff --quiet"),
+    );
+    expect(detect?.env?.GH_TOKEN).toBe("${{ github.token }}");
+    expect(detect?.env?.EVENT_NAME).toBe("${{ github.event_name }}");
+    const script = detect?.run ?? "";
+    expect(script).toContain(
+      'if [ "$EVENT_NAME" = "workflow_dispatch" ]; then',
+    );
+    expect(script).toContain(
+      "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-development.yml/runs?branch=main&status=success&per_page=1",
+    );
+    expect(script).toContain(
+      'git merge-base --is-ancestor "$base" "$GITHUB_SHA"',
+    );
+    expect(script).not.toContain("github.event.before");
+    for (const path of [
+      "supabase/migrations",
+      "scripts/apply-migrations.ts",
+      "src/server/application/app-runtime-role.ts",
+      ".github/workflows/apply-development-migrations.yml",
+    ]) {
+      expect(script).toContain(path);
+    }
+    expect(raw(`${WORKFLOW_DIR}/deploy-development.yml`)).not.toContain(
+      "paths-ignore",
+    );
+    expect(raw(`${WORKFLOW_DIR}/migrate-development.yml`)).not.toContain(
+      "needs.changes.outputs.migrate",
+    );
   });
 
   it("targets the development binding through the development environment", () => {

@@ -94,13 +94,14 @@ The Vercel projects and Supabase projects already exist. Do not recreate them.
 
 1. Reusable CI (all checks above).
 2. Name-only preflight on project `prj_ysIJHdIKYk2MQwvOKermUvIMuGVa`: require `VERCEL_TOKEN`, `vercel pull`, then `scripts/assert-deploy-target.ts development`. The linked team and project must match the development binding, and `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` and `TUTOR_MBOS_APP_DATABASE_URL` must be present by name. A Secret-type value is pulled as `[SENSITIVE]`, so this step does not read the database username. If the token or either name is absent, the workflow stops before migrations, build, deploy and promotion and names the setup location.
-3. Development migrations through `.github/workflows/apply-development-migrations.yml`: ledger drift check, privilege check, then pending SQL. The caller passes `SUPABASE_MIGRATION_DATABASE_URL` and `APP_RUNTIME_PASSWORD` by name from GitHub → Settings → Environments → `development` → Secrets. The migration job reports each secret as present or absent. If either is absent, the workflow stops before SQL and does not promote.
-4. `vercel pull` again, then the same target check, so the build uses the reviewed project settings.
-5. `vercel build --prod` in CI (no `VERCEL_TOKEN`), then a secret scan of `.vercel/output`.
-6. `vercel deploy --prebuilt --prod --skip-domain` to `tutor-mbos-dev`. This creates the deployment without moving traffic. Development uses that project's main target because the project only ever holds synthetic data.
-7. `scripts/smoke-health.ts` against that deployment URL: `/api/v1/health` must return `200`, `environment: development`, the development Supabase project ref and the deployed commit.
-8. `vercel promote` only after the smoke test passes.
-9. If `SMOKE_ALIAS_URL` is set, the promoted alias is smoke tested again.
+3. A read-only check compares migration inputs with the last successful *Deploy development* commit. The inputs and the fail-closed cases are in `docs/release.md`. Manual dispatch always runs migrations. The check uses the workflow token and no deployment environment.
+4. Development migrations, only when that check requests them, through `.github/workflows/apply-development-migrations.yml`: ledger drift check, privilege check, then pending SQL, then runtime provisioning. The caller passes `SUPABASE_MIGRATION_DATABASE_URL` and `APP_RUNTIME_PASSWORD` by name from GitHub → Settings → Environments → `development` → Secrets. The migration job reports each secret as present or absent. If either is absent, the workflow stops before SQL and does not promote. A failed migration does not deploy.
+5. `vercel pull` again, then the same target check, so the build uses the reviewed project settings.
+6. `vercel build --prod` in CI (no `VERCEL_TOKEN`), then a secret scan of `.vercel/output`.
+7. `vercel deploy --prebuilt --prod --skip-domain` to `tutor-mbos-dev`. This creates the deployment without moving traffic. Development uses that project's main target because the project only ever holds synthetic data.
+8. `scripts/smoke-health.ts` against that deployment URL: `/api/v1/health` must return `200`, `environment: development`, the development Supabase project ref and the deployed commit.
+9. `vercel promote` only after the smoke test passes.
+10. If `SMOKE_ALIAS_URL` is set, the promoted alias is smoke tested again.
 
 *Migrate development* (`.github/workflows/migrate-development.yml`) remains a manual recovery entry for the same migration job. It uses the same concurrency group and queue, so it waits for an in-progress development delivery instead of overlapping it, and it does not cancel a delivery that is already pending. Routine pushes do not need that dispatch. Recovery does not run the Vercel preflight; it applies reviewed SQL only.
 
@@ -112,21 +113,17 @@ To rerun the whole sequence: GitHub → Actions → *Deploy development* → *Ru
 
 ## Unattended delivery
 
-Observed on 17 October 2026 from Cursor session [bc-7f9763bf-b962-4d6d-b7b5-fc2bc6f1ae06](https://cursor.com/agents/bc-7f9763bf-b962-4d6d-b7b5-fc2bc6f1ae06), started by a Linear delegation on TOS-28. No user message was sent between that delegation and this session. This is the implementation owner for this milestone. The independent reviewer is Devin through the existing GitHub app `devin-ai-integration`, which has submitted reviews on this repository. Codex remains the transition coordinator and the only review dispatcher until one review of this milestone's pull request is observed without a second dispatch. Ownership of later issues transfers only after that loop finishes.
+Observed on 17 October 2026 from Cursor session [bc-7f9763bf-b962-4d6d-b7b5-fc2bc6f1ae06](https://cursor.com/agents/bc-7f9763bf-b962-4d6d-b7b5-fc2bc6f1ae06), started by a Linear delegation on TOS-28. Cursor is the implementation owner for this milestone. Codex is the transition coordinator and the only review dispatcher. Codex posts through the Linear account `albeit.thalen` and the GitHub account `bhaveshbusa`. Those posts are coordination. A user status relay is a separate kind of message. Devin, through `devin-ai-integration`, is the independent reviewer.
 
-| Step | What is supported | Limit |
+| Step | What was observed | Limit |
 | --- | --- | --- |
-| Implementation | Linear's agent delegation starts an authenticated Cursor cloud session on this repository. | Linear's tools expose no webhook discovery, automation trigger, or session-control call. A saved prompt or an assignment without a running session is not execution. |
-| CI | `.github/workflows/ci.yml` runs on every pull request with a read-only token and no deployment secrets. `main` requires Format and lint, Typecheck, Tests and repository hygiene, Production build, and Dependency audit, enforced for everyone. | This session's token cannot edit branch protection. The rules API returned no extra rules. |
-| Review | Devin's GitHub app has reviewed pull requests in this repository, including approvals on pull requests 16 and 19. | This session cannot start Devin or another Cursor session. It does not open a review issue or mention the reviewer, so only one dispatcher fires. |
-| Fixes | The same Cursor session can continue when GitHub reports CI or review activity on its pull request. | There is no separate fix scheduler. |
-| Development | A push to `main` runs *Deploy development*: CI, name-only preflight, migrations, smoke, then promotion. Run [39021652199](https://github.com/bhaveshbusa/tutor-mbos/actions/runs/39021652199) succeeded for merge `74737aa`. | Pull requests do not deploy. On current `main`, the migration job always runs `provisionAppRuntime`, which sets the `app_runtime` password. This policy candidate must not merge or be dispatched through that job. |
+| Implementation | Linear delegation started this Cursor session. | Linear's tools expose no webhook discovery, automation trigger, or session-control call. A saved prompt or an assignment without a running session is not execution. |
+| CI | `.github/workflows/ci.yml` runs on every pull request with a read-only token and no deployment secrets. `main` requires the five CI checks for everyone. | This session's token cannot edit branch protection. The rules API returned no rules. An approving review is not one of the visible required checks. The setup action is in `docs/release.md`. |
+| Review | Pull request 21 was reviewed after Codex created TOS-30 and delegated it to Devin. Pull requests 16 and 19 were reviewed the same way. | An open pull request did not start the review by itself. This session does not open a second dispatch. |
+| Fixes | Devin review [5558933972](https://github.com/bhaveshbusa/tutor-mbos/pull/21#pullrequestreview-5558933972) arrived as a GitHub notification and this session continued on the same branch. | There is no separate fix scheduler. |
+| Development | A push to `main` runs *Deploy development*. Migrations run only when the migration inputs changed since the last successful delivery. The deploy still smoke-tests and promotes that commit. | Pull requests do not deploy. *Migrate development* remains the manual recovery entry and always applies. |
 | Production | `.github/workflows/release-production.yml` is manual `workflow_dispatch` only. | The GitHub `production` environment was absent on 17 October 2026. Do not create it or set `PRODUCTION_RELEASES_ENABLED`. |
 | Fallback | No schedule exists in this repository. This environment listed no automation-sourced cloud agent. | Do not add an hourly job. An existing external hourly monitor must not dispatch work this owner already has. |
-
-The missing native piece, if the independent review does not arrive through the single dispatcher, is a provider trigger from a ready pull request to that reviewer. Do not add a relay, a paid service, or a second scheduler to fill that gap.
-
-Development integration of this policy commit is blocked on current `main` `74737aad42d4b8c71da4221d8df5dfecce6d3917`. `.github/workflows/deploy-development.yml` has no input and no path filter: every push and every manual dispatch calls `.github/workflows/apply-development-migrations.yml`. `scripts/apply-migrations.ts` calls `provisionAppRuntime` after the ledger check, including when it logs that migrations are already applied. `provisionAppRuntime` grants `app_request` to `app_runtime`, revokes the admin option, and runs `ALTER ROLE app_runtime PASSWORD`. Pull request CI uses a read-only token and does not run that script. This session cannot edit branch protection or disable the workflow for one commit. The safe native path is the open pull request, its required CI, and one independent review. Pull request 20, still draft at `ba273a439a413e8939b602a87ed73d1752068b49`, is the held lifecycle proposal and is not merged or reimplemented here. Applied migration files stay unchanged. Production stays manual.
 
 ## Production release
 
