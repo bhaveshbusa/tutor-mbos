@@ -20,6 +20,8 @@ Every pull request answers five questions: the current product need; the standar
 
 TOS-3 is superseded. Do not resume its cloud session, auth or schema work, hosted acceptance, historical cleanup, or pull request 20. The replacement foundation starts only after this delivery milestone, on its own branch.
 
+Do not merge to `main`, and do not dispatch development deployment, when that run would change credentials or the database and the issue excludes those changes. The workflow on current `main` provisions `app_runtime` and sets its password on every development delivery, including when no migration is pending.
+
 Include automated tests that would catch a meaningful product or security regression. A policy or template change does not add a checker that freezes the template text.
 
 Use Supabase-managed authentication and supported SDK verification, explicit client authorization, user-scoped business data access and tenant RLS. No token bypass, user-editable authorization claims or privileged business-request clients. Test isolation on direct API and database paths, reports, exports and caches.

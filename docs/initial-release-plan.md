@@ -103,7 +103,7 @@ Linear is the delivery source of truth. Each issue has scope, exclusions, accept
 
 CI gates: formatting, lint, typecheck, build, domain tests, database and RLS isolation tests, API and MCP contract tests, browser end-to-end tests where the change has a browser flow, policy-calculation fixtures, concurrency and idempotency tests, fresh and populated migration tests when migrations change, and secret and dependency scans. Lock dependencies and runner versions. Security-critical skips block readiness. Public and fork pull request workflows run without deployment secrets.
 
-Every pull request answers the five questions in `.github/pull_request_template.md` and includes tests that cover its behavior. Required CI and independent review gate integration to `main`. A push to `main` is the ordinary development deployment. Production release stays separately gated on the user's sign-off for that candidate and migration set. The user chooses sign-off testing.
+Every pull request answers the five questions in `.github/pull_request_template.md` and includes tests that cover its behavior. Required CI and independent review come before integration to `main`. A push to `main` is the ordinary development deployment only when that workflow will not change hosted credentials or the database. The workflow on current `main` sets the development `app_runtime` password on every run, so a change that excludes credential and database work stays on its pull request. Production release stays separately gated on the user's sign-off for that candidate and migration set. The user chooses sign-off testing.
 
 ## Delivery increments and acceptance
 

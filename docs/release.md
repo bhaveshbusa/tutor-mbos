@@ -1,6 +1,8 @@
 # Release and migration policy
 
-This policy applies to every change, including the initial release and everything after it. Plan approval is not production approval. Ordinary delivery is a pull request, required CI, one independent review, and a merge to `main`. That merge runs development deployment. Production stays on the manual gate below.
+This policy applies to every change, including the initial release and everything after it. Plan approval is not production approval. Ordinary delivery is a pull request, required CI, and one independent review. A merge to `main` runs development deployment only when that push does not change hosted credentials or the database. Production stays on the manual gate below.
+
+At `74737aad42d4b8c71da4221d8df5dfecce6d3917`, `.github/workflows/deploy-development.yml` always runs `.github/workflows/apply-development-migrations.yml`. `scripts/apply-migrations.ts` then calls `provisionAppRuntime` even when no migration is pending. That call grants and aligns `app_runtime` and sets its password. No workflow input skips the step. While an issue excludes credential and database changes, do not merge its commit and do not dispatch *Deploy development* or *Migrate development*. Pull request 20 remains the held proposal for that lifecycle. Do not merge it from another issue.
 
 The implementation owner records the pull request, HEAD, CI and deployment links on the Linear issue. One component dispatches the review. Do not add a coordinator, webhook relay or second scheduler. Do not resume superseded hosted acceptance, historical cleanup, or pull request 20.
 
