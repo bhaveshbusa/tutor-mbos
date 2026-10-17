@@ -5,7 +5,11 @@ import {
   revokeSupabaseOauthGrant,
 } from "@/adapters/http/consent";
 import { authenticateMaterial } from "@/server/application/authenticate";
-import { verifyAccessToken } from "@/server/application/access-token";
+import { verifySupabaseAccessToken } from "@/server/application/verify-supabase-token";
+import {
+  ENVIRONMENT_BINDINGS,
+  supabaseUrlFor,
+} from "@/server/config/environments";
 import {
   acceptedAudiences,
   protectedResourceMetadataUrl,
@@ -25,6 +29,11 @@ import {
   signingKey,
 } from "./helpers/tokens";
 
+const supabaseUrl = supabaseUrlFor(
+  ENVIRONMENT_BINDINGS.development.supabaseProjectRef,
+);
+const publishableKey = `sb_${"publishable"}_ci`;
+
 async function world() {
   const keys = await signingKey();
   const { store } = await migratedDatabase();
@@ -33,15 +42,16 @@ async function world() {
     siteOrigin: DEV_ORIGIN,
     resourceMetadataUrl: protectedResourceMetadataUrl(DEV_ORIGIN),
     now: () => NOW,
-    store,
-    async verify(token) {
-      return verifyAccessToken(token, {
-        jwks: [keys.jwk],
+    storeFor: () => store,
+    verify: (token) =>
+      verifySupabaseAccessToken({
+        token,
+        supabaseUrl,
+        publishableKey,
         issuer: ISSUER,
         audiences: acceptedAudiences(DEV_ORIGIN),
-        now: NOW,
-      });
-    },
+        jwks: { keys: [keys.jwk] },
+      }),
     authServer: {
       async getUser(token) {
         const userId = users.get(token);
@@ -592,9 +602,9 @@ describe("HTTP API access", () => {
   });
 
   it("revokes the app grant when Supabase already has no OAuth grant", async () => {
-    const { handlers, mint, deps } = await world();
+    const { handlers, mint, deps, store } = await world();
     const owner = await mint(TENANT_A.userId);
-    await deps.store!.recordConsent(
+    await store.recordConsent(
       { path: "ui-session", userId: TENANT_A.userId, clientId: null },
       {
         oauthClientId: API_CLIENT,
@@ -627,9 +637,9 @@ describe("HTTP API access", () => {
   });
 
   it("leaves the app grant when Supabase reports the OAuth server disabled", async () => {
-    const { handlers, mint, deps } = await world();
+    const { handlers, mint, deps, store } = await world();
     const owner = await mint(TENANT_A.userId);
-    await deps.store!.recordConsent(
+    await store.recordConsent(
       { path: "ui-session", userId: TENANT_A.userId, clientId: null },
       {
         oauthClientId: API_CLIENT,
@@ -672,9 +682,9 @@ describe("HTTP API access", () => {
   });
 
   it("does not revoke the app grant when the authentication server refuses", async () => {
-    const { handlers, mint, deps } = await world();
+    const { handlers, mint, deps, store } = await world();
     const owner = await mint(TENANT_A.userId);
-    await deps.store!.recordConsent(
+    await store.recordConsent(
       { path: "ui-session", userId: TENANT_A.userId, clientId: null },
       {
         oauthClientId: API_CLIENT,
@@ -718,11 +728,13 @@ describe("authenticateMaterial", () => {
       sessionClaims(TENANT_A.userId),
     );
     const verify = (token: string) =>
-      verifyAccessToken(token, {
-        jwks: [keys.jwk],
+      verifySupabaseAccessToken({
+        token,
+        supabaseUrl,
+        publishableKey,
         issuer: ISSUER,
         audiences: acceptedAudiences(DEV_ORIGIN),
-        now: NOW,
+        jwks: { keys: [keys.jwk] },
       });
     const authServer = {
       async getUser(token: string) {

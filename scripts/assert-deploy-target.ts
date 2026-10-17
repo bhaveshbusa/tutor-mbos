@@ -63,11 +63,6 @@ export function developmentSetupGaps(
       `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY is absent. Set it at ${DEVELOPMENT_RUNTIME_LOCATION}.`,
     );
   }
-  if (absent("TUTOR_MBOS_APP_DATABASE_URL")) {
-    gaps.push(
-      `TUTOR_MBOS_APP_DATABASE_URL is absent. Set it at ${DEVELOPMENT_RUNTIME_LOCATION}. The username must be app_runtime. It is not the migration URL.`,
-    );
-  }
   return gaps;
 }
 

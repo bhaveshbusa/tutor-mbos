@@ -186,7 +186,7 @@ describe("CI workflow", () => {
     expect(Object.values(ci.jobs).every((job) => !job.environment)).toBe(true);
   });
 
-  it("covers lint, typecheck, tests, hygiene, build and audit", () => {
+  it("covers lint, typecheck, tests, browser, hygiene, build and audit", () => {
     const runs = Object.values(ci.jobs)
       .flatMap((job) => job.steps ?? [])
       .map((step) => step.run ?? "");
@@ -195,6 +195,7 @@ describe("CI workflow", () => {
       "pnpm lint",
       "pnpm typecheck",
       "pnpm test",
+      "pnpm test:browser",
       "pnpm hygiene",
       "pnpm build",
       "pnpm hygiene --artifact .next",
@@ -384,24 +385,18 @@ describe("development migration recovery", () => {
     expect(Object.keys(applied.on)).toEqual(["workflow_call"]);
     expect(call.secrets).toEqual({
       SUPABASE_MIGRATION_DATABASE_URL: { required: true },
-      APP_RUNTIME_PASSWORD: { required: true },
     });
     const runs = (migrate.steps ?? []).map((step) => step.run ?? "").join("\n");
     expect(runs).toContain(
       "SUPABASE_MIGRATION_DATABASE_URL is absent. Expected secret scope: GitHub environment development",
     );
-    expect(runs).toContain(
-      "APP_RUNTIME_PASSWORD is absent. Expected secret scope: GitHub environment development",
-    );
     expect(runs).toContain("SUPABASE_MIGRATION_DATABASE_URL is present.");
-    expect(runs).toContain("APP_RUNTIME_PASSWORD is present.");
+    expect(runs).not.toContain("APP_RUNTIME_PASSWORD");
     expect(runs).not.toContain("||");
-    expect(runs).not.toMatch(
-      /echo\s+["']\$\{?(SUPABASE_MIGRATION_DATABASE_URL|APP_RUNTIME_PASSWORD)/,
-    );
+    expect(runs).not.toMatch(/echo\s+["']\$\{?SUPABASE_MIGRATION_DATABASE_URL/);
     expect(runs).not.toMatch(/\b(printenv|env|sha256sum|wc)\b/);
     expect(runs.indexOf("is absent")).toBeLessThan(
-      runs.indexOf("pnpm migrate:development"),
+      runs.indexOf("pnpm exec supabase db push"),
     );
     expect(runs).not.toContain("vercel");
   });
@@ -410,7 +405,6 @@ describe("development migration recovery", () => {
     const forwarded = {
       SUPABASE_MIGRATION_DATABASE_URL:
         "${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}",
-      APP_RUNTIME_PASSWORD: "${{ secrets.APP_RUNTIME_PASSWORD }}",
     };
     for (const file of ["deploy-development.yml", "migrate-development.yml"]) {
       const caller = load(file).jobs.migrate!;
@@ -486,7 +480,6 @@ describe("all workflows", () => {
             expect(job.secrets, `${file} job ${name}`).toEqual({
               SUPABASE_MIGRATION_DATABASE_URL:
                 "${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}",
-              APP_RUNTIME_PASSWORD: "${{ secrets.APP_RUNTIME_PASSWORD }}",
             });
             continue;
           }

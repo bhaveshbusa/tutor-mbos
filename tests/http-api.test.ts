@@ -24,7 +24,7 @@ describe("GET /api/v1/health", () => {
       status: "ok",
       commit: COMMIT,
       authentication: "enforced",
-      accessContract: "2026-10-15",
+      accessContract: "2026-10-17",
       environment: "development",
       supabaseProjectRef: "idvzjqrkgnihvxoswuxu",
       syntheticDataOnly: true,

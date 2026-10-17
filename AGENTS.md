@@ -18,7 +18,7 @@ Use the installed Linear and GitHub integrations and GitHub Actions. Do not add 
 
 Every pull request answers five questions: the current product need; the standard feature or package considered; the smallest change and what was deferred or removed; the observable behavior covered by tests; the operating burden, including secrets, services, configuration and recovery. Custom cryptography, protocol engines, migration engines or orchestration state machines require a documented platform gap before coding.
 
-TOS-3 is superseded. Do not resume its cloud session, auth or schema work, hosted acceptance, historical cleanup, or pull request 20. The replacement foundation starts only after this delivery milestone, on its own branch.
+TOS-3 is superseded. Do not resume its cloud session, auth or schema work, hosted acceptance, historical cleanup, or pull request 20. The standard foundation is Supabase Auth, the official MCP SDK, and Supabase CLI migrations, recorded in `docs/foundation-transition.md`.
 
 Include automated tests that would catch a meaningful product or security regression. A policy or template change does not add a checker that freezes the template text.
 

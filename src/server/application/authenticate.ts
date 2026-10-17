@@ -1,5 +1,5 @@
 import type { VerifiedActor } from "@/server/domain/access-decision";
-import type { VerifyResult } from "./access-token";
+import type { VerifyResult } from "./verified-token";
 
 export interface AuthServer {
   getUser(

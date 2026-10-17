@@ -1,4 +1,8 @@
-import { isAllowedBrowserNext, recoveryRedirect } from "@/server/config/access";
+import {
+  browserRequestAllowed,
+  isAllowedBrowserNext,
+  recoveryRedirect,
+} from "@/server/config/access";
 import { problemResponse } from "./problem";
 
 export interface BrowserAuth {
@@ -26,7 +30,7 @@ export async function handleLogin(
   auth: BrowserAuth,
   siteOrigin: string,
 ): Promise<Response> {
-  if (request.headers.get("origin") !== siteOrigin) {
+  if (!browserRequestAllowed(request, siteOrigin)) {
     return problemResponse(
       403,
       "Forbidden",
@@ -59,7 +63,7 @@ export async function handleRecovery(
   auth: BrowserAuth,
   siteOrigin: string,
 ): Promise<Response> {
-  if (request.headers.get("origin") !== siteOrigin) {
+  if (!browserRequestAllowed(request, siteOrigin)) {
     return problemResponse(
       403,
       "Forbidden",
@@ -115,7 +119,7 @@ export async function handlePasswordUpdate(
   auth: BrowserAuth,
   siteOrigin: string,
 ): Promise<Response> {
-  if (request.headers.get("origin") !== siteOrigin) {
+  if (!browserRequestAllowed(request, siteOrigin)) {
     return problemResponse(
       403,
       "Forbidden",

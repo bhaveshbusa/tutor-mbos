@@ -88,9 +88,9 @@ describe("access decision", () => {
   });
 
   it("records the client profiles and revocation latency in the contract", () => {
-    expect(ACCESS_CONTRACT_VERSION).toBe("2026-10-15");
+    expect(ACCESS_CONTRACT_VERSION).toBe("2026-10-17");
     expect(REVOCATION_LATENCY).toBe("next-request");
-    expect(CLIENT_PROFILES.chatgpt.registration).toBe("dynamic");
+    expect(CLIENT_PROFILES["dynamic-client"].registration).toBe("dynamic");
     expect(CLIENT_PROFILES["generic-mcp"].registration).toBe(
       "pre-registered-or-dynamic",
     );

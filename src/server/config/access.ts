@@ -9,28 +9,15 @@ export const SITE_ORIGINS: Record<DeploymentEnvironment, string> = {
   production: "https://tutor-mbos-lets-play-game.vercel.app",
 };
 
-const PRIVILEGED_DB_USERS = new Set([
-  "postgres",
-  "supabase_admin",
-  "service_role",
-  "authenticator",
-  "supabase_auth_admin",
-  "supabase_storage_admin",
-]);
-
 export type DatabaseUrlIssue =
   | "invalid"
   | "privileged_user"
   | "binding_mismatch"
-  | "not_app_runtime"
+  | "app_runtime"
   | "transaction_pooler";
 
 export function authIssuer(supabaseUrl: string): string {
   return `${supabaseUrl}/auth/v1`;
-}
-
-export function jwksUrl(supabaseUrl: string): string {
-  return `${supabaseUrl}/auth/v1/.well-known/jwks.json`;
 }
 
 export function resourceUrl(siteOrigin: string): string {
@@ -70,6 +57,59 @@ export function allowedBrowserNextPaths(): readonly string[] {
     "/oauth/consent",
     "/auth/update-password",
   ];
+}
+
+function loopbackHost(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1";
+}
+
+function requestHost(request: Request): string {
+  return (
+    (request.headers.get("host") ?? new URL(request.url).host).split(":")[0] ??
+    ""
+  );
+}
+
+/**
+ * Cookie mutations accept the deployment site. A loopback browser may use
+ * `localhost` or `127.0.0.1` interchangeably: Next dev rewrites `request.url`
+ * to `localhost`. `Referrer-Policy: no-referrer` makes Chromium send
+ * `Origin: null` on the form POST; that opaque origin is accepted only with
+ * the browser's `Sec-Fetch-Site: same-origin` and a loopback or site host.
+ * A hosted cross-site request still requires the site origin.
+ */
+export function browserRequestAllowed(
+  request: Request,
+  siteOrigin: string,
+): boolean {
+  const origin = request.headers.get("origin");
+  if (!origin) return false;
+  if (origin === siteOrigin) return true;
+  let requestUrl: URL;
+  let site: URL;
+  try {
+    requestUrl = new URL(request.url);
+    site = new URL(siteOrigin);
+  } catch {
+    return false;
+  }
+  if (origin !== "null") {
+    let originUrl: URL;
+    try {
+      originUrl = new URL(origin);
+    } catch {
+      return false;
+    }
+    return (
+      loopbackHost(originUrl.hostname) &&
+      loopbackHost(requestUrl.hostname) &&
+      originUrl.protocol === requestUrl.protocol &&
+      originUrl.port === requestUrl.port
+    );
+  }
+  if (request.headers.get("sec-fetch-site") !== "same-origin") return false;
+  const host = requestHost(request);
+  return loopbackHost(host) || host === site.hostname;
 }
 
 export function isAllowedBrowserNext(value: string): boolean {
@@ -128,36 +168,9 @@ function mentionsProject(
 }
 
 /**
- * Runtime business connections must be the non-superuser app_runtime role
- * for this environment. Privileged migration URLs are rejected here.
- */
-export function inspectAppDatabaseUrl(
-  value: string,
-  environment: DeploymentEnvironment,
-): { ok: true } | { ok: false; code: DatabaseUrlIssue } {
-  const parsed = parseDatabaseUrl(value);
-  if (!parsed) return { ok: false, code: "invalid" };
-  const ownRef = projectRefOf(environment);
-  const otherRef = projectRefOf(
-    environment === "development" ? "production" : "development",
-  );
-  if (mentionsProject(parsed, otherRef) || !mentionsProject(parsed, ownRef)) {
-    return { ok: false, code: "binding_mismatch" };
-  }
-  const bareUser = parsed.username.split(".")[0] ?? "";
-  if (
-    PRIVILEGED_DB_USERS.has(bareUser) ||
-    PRIVILEGED_DB_USERS.has(parsed.username)
-  ) {
-    return { ok: false, code: "privileged_user" };
-  }
-  if (bareUser !== "app_runtime") return { ok: false, code: "not_app_runtime" };
-  return { ok: true };
-}
-
-/**
- * Migration workflow only. Development project, DDL-capable login, never the
- * request role and never the production project.
+ * Migration workflow only. Development project, DDL-capable login, never a
+ * request role and never the production project. Business requests do not use
+ * a database password.
  */
 export function inspectMigrationDatabaseUrl(
   value: string,

@@ -4,6 +4,8 @@ import {
   loadRuntimeConfig,
   type EnvSource,
 } from "@/server/config/environments";
+import { browserRequestAllowed } from "@/server/config/access";
+import type { AccessStore } from "@/server/application/access-store";
 import type { AccessDeps } from "./access";
 import { problemResponse } from "./problem";
 
@@ -144,7 +146,7 @@ export async function handleConsentDecision(
   deps: AccessDeps,
   gateway: ConsentGateway,
 ): Promise<Response> {
-  if (request.headers.get("origin") !== deps.siteOrigin) {
+  if (!browserRequestAllowed(request, deps.siteOrigin)) {
     return problemResponse(
       403,
       "Forbidden",
@@ -194,7 +196,8 @@ export async function handleConsentDecision(
   const details = await gateway.details(authorizationId, session);
   if ("error" in details)
     return problemResponse(400, "Bad request", "invalid_authorization");
-  if (!deps.store) {
+  const store = deps.storeFor(session);
+  if (!store) {
     return problemResponse(
       503,
       "Store unavailable",
@@ -207,7 +210,7 @@ export async function handleConsentDecision(
     clientId: null,
   };
   if (!("clientId" in details)) {
-    return reconnectResponse(deps.store, actor, details.redirectUrl);
+    return reconnectResponse(store, actor, details.redirectUrl);
   }
   const requested = form
     .getAll("permissions")
@@ -217,7 +220,7 @@ export async function handleConsentDecision(
   if (decision === "approve" && !redirectOriginPath(details.redirectUri)) {
     return problemResponse(400, "Bad request", "invalid_redirect");
   }
-  const recorded = await recordClientConsent(deps.store, actor, {
+  const recorded = await recordClientConsent(store, actor, {
     oauthClientId: details.clientId,
     permissions,
     scopes: details.scopes,
@@ -241,7 +244,7 @@ export async function handleConsentDecision(
   const outcome = await gateway.decide(authorizationId, session, decision);
   if ("error" in outcome) {
     if (decision === "approve") {
-      await deps.store.revokeGrant(actor, details.clientId);
+      await store.revokeGrant(actor, details.clientId);
     }
     return problemResponse(
       502,
@@ -277,9 +280,10 @@ export async function resolveConsentEntry(
   const details = await gateway.details(authorizationId, session);
   if ("error" in details || "clientId" in details)
     return Response.json({ view: "form" });
-  if (!deps.store) return Response.json({ view: "repeat" });
+  const store = deps.storeFor(session);
+  if (!store) return Response.json({ view: "repeat" });
   return reconnectResponse(
-    deps.store,
+    store,
     { path: "ui-session", userId: user.userId, clientId: null },
     details.redirectUrl,
     { repeatStatus: 200 },
@@ -287,7 +291,7 @@ export async function resolveConsentEntry(
 }
 
 async function reconnectResponse(
-  store: NonNullable<AccessDeps["store"]>,
+  store: AccessStore,
   actor: { path: "ui-session"; userId: string; clientId: null },
   redirectUrl: string,
   options: { repeatStatus: 200 | 409 } = { repeatStatus: 409 },

@@ -1,3 +1,3 @@
 # MCP adapter
 
-MCP JSON-RPC over POST. Unauthenticated calls return 401 with protected-resource metadata, or 503 when Auth is not configured. Tools call the shared application layer and do not grant access from OIDC scopes.
+The official MCP TypeScript SDK serves streamable HTTP at `/api/mcp`. Every request is authenticated before a tool runs. Tools call the shared application layer. Dynamic registration is not authorization, and a client name is not a verified identity.

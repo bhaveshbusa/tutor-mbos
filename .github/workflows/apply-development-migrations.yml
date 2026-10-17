@@ -2,14 +2,12 @@ name: Apply development migrations
 
 # Called by the development delivery sequence and by the manual recovery
 # workflow. It is not triggered by pull requests and has no production target.
-# Callers must pass the development environment secrets by name. A reusable
-# workflow otherwise receives an empty string for an environment secret.
+# The caller passes the development migration URL by name. A reusable workflow
+# otherwise receives an empty string for an environment secret.
 on:
   workflow_call:
     secrets:
       SUPABASE_MIGRATION_DATABASE_URL:
-        required: true
-      APP_RUNTIME_PASSWORD:
         required: true
 
 permissions:
@@ -34,30 +32,18 @@ jobs:
       - name: Require migration credentials
         env:
           SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
-          APP_RUNTIME_PASSWORD: ${{ secrets.APP_RUNTIME_PASSWORD }}
         run: |
-          status=0
           if [ -z "$SUPABASE_MIGRATION_DATABASE_URL" ]; then
             echo "::error::SUPABASE_MIGRATION_DATABASE_URL is absent. Expected secret scope: GitHub environment development (Settings → Environments → development → Secrets)."
-            status=1
-          else
-            echo "SUPABASE_MIGRATION_DATABASE_URL is present. Expected secret scope: GitHub environment development."
-          fi
-          if [ -z "$APP_RUNTIME_PASSWORD" ]; then
-            echo "::error::APP_RUNTIME_PASSWORD is absent. Expected secret scope: GitHub environment development (Settings → Environments → development → Secrets)."
-            status=1
-          else
-            echo "APP_RUNTIME_PASSWORD is present. Expected secret scope: GitHub environment development."
-          fi
-          if [ "$status" -ne 0 ]; then
-            echo "::error::Development migrations stop before SQL until each absent secret above is present."
+            echo "::error::Development migrations stop before SQL until that secret is present."
             exit 1
           fi
-      # Prints each schema ledger version, name, and sha256, then app_runtime
-      # flags, membership options, and privilege checks. It does not print
-      # passwords, verifiers, or connection values.
-      - name: Apply versioned migrations and privilege checks
+          echo "SUPABASE_MIGRATION_DATABASE_URL is present. Expected secret scope: GitHub environment development."
+      - name: Reject a production or request-role URL before connecting
         env:
           SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
-          APP_RUNTIME_PASSWORD: ${{ secrets.APP_RUNTIME_PASSWORD }}
-        run: pnpm migrate:development
+        run: node scripts/migration-url.ts
+      - name: Apply pending migrations with the Supabase CLI
+        env:
+          SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
+        run: pnpm exec supabase db push --db-url "$SUPABASE_MIGRATION_DATABASE_URL" --yes --skip-vault
