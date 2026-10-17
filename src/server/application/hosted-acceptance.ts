@@ -398,8 +398,12 @@ export interface DirectProbe {
   deleted: boolean;
   aborted: boolean;
   abortReason: "visibility" | "count" | "confirm" | null;
-  /** Set when the post-delete read throws after the delete transaction returns. */
-  deleteCommitted?: boolean;
+  /**
+   * True only when the delete transaction returned, so the client received
+   * the commit acknowledgment. Omitted when that acknowledgment is missing.
+   * Omission does not prove the transaction rolled back.
+   */
+  deleteCommitted?: true;
   confirmSqlstate?: string | null;
 }
 
@@ -538,18 +542,18 @@ export async function probeDirectTenantAccess(
       abortReason: "visibility",
     };
   }
-  let removed = false;
+  let commitAcknowledged = false;
   try {
     await asRequest(db, input.userId, async (tx) => {
       await deleteOwnedRows(tx, input, clientIds);
     });
-    removed = true;
+    commitAcknowledged = true;
   } catch {
-    removed = false;
+    commitAcknowledged = false;
   }
   const confirmed = await confirmedVisible(db, input.userId);
   const deleted =
-    removed &&
+    commitAcknowledged &&
     !confirmed.failed &&
     confirmed.ids !== null &&
     !confirmed.ids.includes(input.ownBusinessId) &&
@@ -562,7 +566,10 @@ export async function probeDirectTenantAccess(
     aborted: !deleted,
     abortReason: deleted ? null : confirmed.failed ? "confirm" : "count",
     ...(confirmed.failed
-      ? { deleteCommitted: removed, confirmSqlstate: confirmed.sqlstate }
+      ? {
+          ...(commitAcknowledged ? { deleteCommitted: true as const } : {}),
+          confirmSqlstate: confirmed.sqlstate,
+        }
       : {}),
   };
 }
@@ -628,18 +635,18 @@ export async function probeDirectTenants(
       });
       continue;
     }
-    let removed = false;
+    let commitAcknowledged = false;
     try {
       await asRequest(db, view.input.userId, async (tx) => {
         await deleteOwnedRows(tx, view.input, view.clientIds);
       });
-      removed = true;
+      commitAcknowledged = true;
     } catch {
-      removed = false;
+      commitAcknowledged = false;
     }
     const confirmed = await confirmedVisible(db, view.input.userId);
     const deleted =
-      removed &&
+      commitAcknowledged &&
       !confirmed.failed &&
       confirmed.ids !== null &&
       !confirmed.ids.includes(view.input.ownBusinessId) &&
@@ -653,7 +660,10 @@ export async function probeDirectTenants(
       aborted: !deleted,
       abortReason: deleted ? null : confirmed.failed ? "confirm" : "count",
       ...(confirmed.failed
-        ? { deleteCommitted: removed, confirmSqlstate: confirmed.sqlstate }
+        ? {
+            ...(commitAcknowledged ? { deleteCommitted: true as const } : {}),
+            confirmSqlstate: confirmed.sqlstate,
+          }
         : {}),
     });
   }
@@ -789,7 +799,7 @@ export function classifyDirectProbes(
       acceptanceCase(
         "direct.orphan_rows",
         "gap",
-        "Auth user deletion does not cascade into app.businesses, app.business_creation_keys, or app.oauth_consents. Scoped cleanup aborted, so those rows may remain for one or both synthetic owners. This workflow will not send unqualified SQL or an elevated business request. The reviewed follow-up for run 38954838195 reads each manifest owner's business under that owner's claims and prints the phase and SQLSTATE. It does not delete until that read is reviewed, and it does not delete by name or prefix.",
+        "Auth user deletion does not cascade into app.businesses, app.business_creation_keys, or app.oauth_consents. Scoped cleanup aborted, so those rows may remain for one or both synthetic owners. This workflow will not send unqualified SQL or an elevated business request. The reviewed cleanup for run 38954838195 deletes only the two business ids recorded by read 39019907233, and only after each manifest owner still sees exactly that business. It does not delete by name or prefix.",
       ),
     );
   }

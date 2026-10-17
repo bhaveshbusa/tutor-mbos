@@ -1,11 +1,12 @@
-name: Read run 38954838195 app rows
+name: Clean run 38954838195 app rows
 
-# Manual development read for one acceptance run. Run 38992665029 failed
-# before a report, so deletion is uncertain. This dispatch does not delete.
-# It does not sign up, read mail, call Auth admin, migrate,
-# deploy, or run hosted acceptance. Dispatch waits on development-delivery.
-# The only credential is the development app_runtime URL. Owner and client
-# ids are in the reviewed script, not in this workflow.
+# Manual development cleanup for one acceptance run. Read 39019907233
+# showed both pinned businesses still present. This dispatch deletes only
+# those businesses after the reviewed ids match. It does not sign up, read
+# mail, call Auth admin, migrate, deploy, or run hosted acceptance.
+# Preparing this workflow does not dispatch it. Dispatch waits on
+# development-delivery. The only credential is the development app_runtime
+# URL. Owner, client, and business ids are in the reviewed script.
 on:
   workflow_dispatch:
 
@@ -19,7 +20,7 @@ concurrency:
 
 jobs:
   cleanup-app-rows:
-    name: Read run 38954838195 app rows
+    name: Clean run 38954838195 app rows
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -30,7 +31,7 @@ jobs:
       - name: Require main
         if: github.ref != 'refs/heads/main'
         run: |
-          echo "::error::Historical app-row read runs from main only."
+          echo "::error::Historical app-row cleanup runs from main only."
           exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -48,7 +49,7 @@ jobs:
             exit 1
           fi
           echo "TUTOR_MBOS_APP_DATABASE_URL is present."
-      - name: Read run 38954838195 app rows
+      - name: Clean run 38954838195 app rows
         env:
           TUTOR_MBOS_APP_DATABASE_URL: ${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}
         run: pnpm accept:development:cleanup-run-38954838195

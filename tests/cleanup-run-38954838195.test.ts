@@ -29,6 +29,26 @@ async function asRuntime(connection: {
   await connection.exec("set session authorization app_runtime");
 }
 
+async function insertOwnedBusiness(
+  connection: {
+    query: (text: string, params: readonly unknown[]) => Promise<unknown>;
+  },
+  ownerUserId: string,
+  businessId: string,
+  displayName: string,
+): Promise<void> {
+  await connection.query(
+    `insert into app.businesses (id, owner_user_id, display_name)
+     values ($1::uuid, $2::uuid, $3)`,
+    [businessId, ownerUserId, displayName],
+  );
+  await connection.query(
+    `insert into app.business_creation_keys (owner_user_id, idempotency_key, business_id)
+     values ($1::uuid, $2, $3::uuid)`,
+    [ownerUserId, `pinned-${ownerUserId.slice(0, 8)}`, businessId],
+  );
+}
+
 async function addCreationKeys(
   connection: {
     query: (text: string, params: readonly unknown[]) => Promise<unknown>;
@@ -46,6 +66,106 @@ async function addCreationKeys(
   }
 }
 
+function databaseFailure(message: string, code: string): Error {
+  const failure = new Error(message);
+  failure.name = "error";
+  return Object.assign(failure, { code });
+}
+
+function pinnedCleanupConnection(failBusinessDelete: boolean): {
+  connection: SqlConnection;
+  calls: string[];
+  selects: () => number;
+  businessDeletes: () => number;
+} {
+  const [userA, userB] = CLEANUP_RUN_38954838195.users;
+  const businessFor = (userId: string) => {
+    if (userId === userA.id) return userA.businessId;
+    if (userId === userB.id) return userB.businessId;
+    throw new Error("unexpected owner");
+  };
+  let userId = "";
+  let selects = 0;
+  let businessDeletes = 0;
+  const calls: string[] = [];
+  const connection = {
+    async query(text: string) {
+      calls.push(text);
+      throw databaseFailure("secret detail runtime", "42501");
+    },
+    async exec() {
+      return undefined;
+    },
+    async transaction(
+      fn: (tx: {
+        query: (
+          text: string,
+          params?: readonly unknown[],
+        ) => Promise<{
+          rows: {
+            id?: string;
+            business_id?: string;
+            oauth_client_id?: string;
+          }[];
+        }>;
+        exec: () => Promise<void>;
+      }) => Promise<unknown>,
+    ) {
+      return fn({
+        async query(text: string, params?: readonly unknown[]) {
+          calls.push(text);
+          if (text.includes("request.jwt.claim.sub")) {
+            userId = String(params?.[0] ?? "");
+            return { rows: [] };
+          }
+          if (text.includes("set_config")) return { rows: [] };
+          if (text.includes("select id::text")) {
+            selects += 1;
+            if (selects === 5) {
+              throw databaseFailure("secret detail from confirm", "42501");
+            }
+            return { rows: [{ id: businessFor(userId) }] };
+          }
+          if (text.includes("delete from app.business_creation_keys")) {
+            return { rows: [{ business_id: businessFor(userId) }] };
+          }
+          if (text.includes("delete from app.oauth_consents")) {
+            return {
+              rows: CLEANUP_RUN_38954838195.clientIds.map(
+                (oauth_client_id) => ({ oauth_client_id }),
+              ),
+            };
+          }
+          if (text.includes("update app.client_grants")) {
+            return {
+              rows: CLEANUP_RUN_38954838195.clientIds.map(
+                (oauth_client_id) => ({ oauth_client_id }),
+              ),
+            };
+          }
+          if (text.includes("delete from app.businesses")) {
+            if (failBusinessDelete) {
+              throw databaseFailure("secret detail from delete", "40001");
+            }
+            businessDeletes += 1;
+            return { rows: [{ id: businessFor(userId) }] };
+          }
+          throw new Error(`unexpected ${text}`);
+        },
+        async exec() {
+          return undefined;
+        },
+      });
+    },
+  };
+  return {
+    connection: connection as unknown as SqlConnection,
+    calls,
+    selects: () => selects,
+    businessDeletes: () => businessDeletes,
+  };
+}
+
 describe("run 38954838195 app-row cleanup", () => {
   it("pins the manifest printed by cleanup job 117156025989", () => {
     expect(CLEANUP_RUN_38954838195).toEqual({
@@ -54,9 +174,19 @@ describe("run 38954838195 app-row cleanup", () => {
       commit: "cb889c4ab3108d004ff6a434ef6982bc0a1fc98d",
       projectRef: "idvzjqrkgnihvxoswuxu",
       manifestSource: "actions job 117156025989 ACCEPTANCE_MANIFEST",
+      readSource: "actions run 39019907233 job 117359487839",
+      readCommit: "8fa09df59effb0cf03b1d9c7022ac28caa06bf62",
       users: [
-        { label: "tenant-a", id: "bfb76b40-67f2-4be2-b002-9a4b7a0d7108" },
-        { label: "tenant-b", id: "30328585-f1fa-4d1a-b80b-2dcd0dd2132a" },
+        {
+          label: "tenant-a",
+          id: "bfb76b40-67f2-4be2-b002-9a4b7a0d7108",
+          businessId: "9087ef87-7934-4e26-a514-fd057cefe3e0",
+        },
+        {
+          label: "tenant-b",
+          id: "30328585-f1fa-4d1a-b80b-2dcd0dd2132a",
+          businessId: "e5ae56e0-6ccd-45dd-801d-930c4f780379",
+        },
       ],
       clientIds: [
         "01306e08-f3b8-438e-801b-ff261a831aaf",
@@ -65,13 +195,14 @@ describe("run 38954838195 app-row cleanup", () => {
       ],
     });
     const script = readFileSync("scripts/cleanup-run-38954838195.ts", "utf8");
-    expect(script).toContain("diagnoseRun38954838195");
-    expect(script).toContain("formatDiagnoseReport");
+    expect(script).toContain("cleanupRun38954838195");
+    expect(script).toContain("formatHistoricalAppRowReport");
     expect(script).toContain("databaseSqlState");
+    expect(script).toContain('outcome === "removed"');
+    expect(script).not.toContain("diagnoseRun38954838195");
     expect(script).not.toContain("ACCEPTANCE_MANIFEST");
     expect(script).not.toContain("SUPABASE_DEVELOPMENT_AUTH_ADMIN_KEY");
     expect(script).not.toContain("probeDirectTenants");
-    expect(script).not.toContain("cleanupRun38954838195");
     expect(script).not.toContain("delete from");
     expect(script).not.toContain(".message");
     expect(script).not.toContain("error.name");
@@ -103,28 +234,32 @@ describe("run 38954838195 app-row cleanup", () => {
       clientId: null,
     });
     const [userA, userB] = CLEANUP_RUN_38954838195.users;
-    const createdA = await store.createBusiness(actor(userA.id), {
-      displayName: "Synthetic A",
-      idempotencyKey: "tos3-a",
-    });
-    const createdB = await store.createBusiness(actor(userB.id), {
-      displayName: "Synthetic B",
-      idempotencyKey: "tos3-b",
-    });
+    await insertOwnedBusiness(
+      connection,
+      userA.id,
+      userA.businessId,
+      "Synthetic A",
+    );
+    await insertOwnedBusiness(
+      connection,
+      userB.id,
+      userB.businessId,
+      "Synthetic B",
+    );
     const createdC = await store.createBusiness(actor(userC), {
       displayName: "Synthetic C",
       idempotencyKey: "tos3-c",
     });
-    await addCreationKeys(connection, userA.id, createdA.business.id, 2);
-    await addCreationKeys(connection, userB.id, createdB.business.id, 3);
+    await addCreationKeys(connection, userA.id, userA.businessId, 2);
+    await addCreationKeys(connection, userB.id, userB.businessId, 3);
     await asRuntime(connection);
     const report = await cleanupRun38954838195(connection);
     expect(report.outcome).toBe("removed");
     expect(report.owners.map((owner) => owner.visible)).toEqual([1, 1]);
     expect(report.probes.every((probe) => probe.deleted)).toBe(true);
     const text = formatHistoricalAppRowReport(report);
-    expect(text).toContain(`business=${createdA.business.id}`);
-    expect(text).toContain(`business=${createdB.business.id}`);
+    expect(text).toContain(`business=${userA.businessId}`);
+    expect(text).toContain(`business=${userB.businessId}`);
     expect(text).not.toContain("Synthetic");
     await connection.exec("reset session authorization");
     expect(await store.readBusiness(actor(userA.id))).toBeNull();
@@ -173,15 +308,19 @@ describe("run 38954838195 app-row cleanup", () => {
       clientId: null,
     });
     const [userA, userB] = CLEANUP_RUN_38954838195.users;
-    const createdA = await store.createBusiness(actor(userA.id), {
-      displayName: "Synthetic A",
-      idempotencyKey: "tos3-a",
-    });
-    const createdB = await store.createBusiness(actor(userB.id), {
-      displayName: "Synthetic B",
-      idempotencyKey: "tos3-b",
-    });
-    await addCreationKeys(connection, userA.id, createdA.business.id, 4);
+    await insertOwnedBusiness(
+      connection,
+      userA.id,
+      userA.businessId,
+      "Synthetic A",
+    );
+    await insertOwnedBusiness(
+      connection,
+      userB.id,
+      userB.businessId,
+      "Synthetic B",
+    );
+    await addCreationKeys(connection, userA.id, userA.businessId, 4);
     await asRuntime(connection);
     const report = await cleanupRun38954838195(connection);
     expect(report.outcome).toBe("aborted_count");
@@ -189,10 +328,47 @@ describe("run 38954838195 app-row cleanup", () => {
     expect(report.probes[1]?.deleted).toBe(false);
     await connection.exec("reset session authorization");
     expect((await store.readBusiness(actor(userA.id)))?.id).toBe(
-      createdA.business.id,
+      userA.businessId,
     );
     expect((await store.readBusiness(actor(userB.id)))?.id).toBe(
-      createdB.business.id,
+      userB.businessId,
+    );
+    await db.close();
+  });
+
+  it("reports partial completion when the second owner aborts after the first delete", async () => {
+    const { db, connection, store } = await migratedDatabase();
+    const actor = (userId: string) => ({
+      path: "ui-session" as const,
+      userId,
+      clientId: null,
+    });
+    const [userA, userB] = CLEANUP_RUN_38954838195.users;
+    await insertOwnedBusiness(
+      connection,
+      userA.id,
+      userA.businessId,
+      "Synthetic A",
+    );
+    await insertOwnedBusiness(
+      connection,
+      userB.id,
+      userB.businessId,
+      "Synthetic B",
+    );
+    await addCreationKeys(connection, userB.id, userB.businessId, 4);
+    await asRuntime(connection);
+    const report = await cleanupRun38954838195(connection);
+    expect(report.outcome).toBe("partial");
+    expect(report.probes[0]?.deleted).toBe(true);
+    expect(report.probes[1]?.deleted).toBe(false);
+    const text = formatHistoricalAppRowReport(report);
+    expect(text).toContain("outcome=partial");
+    expect(text).not.toContain("Synthetic");
+    await connection.exec("reset session authorization");
+    expect(await store.readBusiness(actor(userA.id))).toBeNull();
+    expect((await store.readBusiness(actor(userB.id)))?.id).toBe(
+      userB.businessId,
     );
     await db.close();
   });
@@ -224,7 +400,7 @@ describe("run 38954838195 app-row cleanup", () => {
     expect(text).not.toContain("SUPABASE_DEVELOPMENT_ACCESS_TOKEN");
     expect(text).not.toContain("VERCEL_TOKEN");
     expect(text).not.toContain("accept:development\n");
-    expect(text).toContain("does not delete");
+    expect(text).toContain("does not dispatch");
     expect(text).toContain("pnpm accept:development:cleanup-run-38954838195");
     const cleanup = job?.steps?.find((step) =>
       step.run?.includes("cleanup-run-38954838195"),
@@ -375,93 +551,40 @@ describe("run 38954838195 app-row cleanup", () => {
     expect(formatDiagnoseReport(report)).not.toContain("secret detail");
   });
 
-  it("stops the second owner when confirmation throws after the delete commits", async () => {
+  it("aborts before any delete when the visible business is not the pinned id", async () => {
+    const { db, connection, store } = await migratedDatabase();
+    const actor = (userId: string) => ({
+      path: "ui-session" as const,
+      userId,
+      clientId: null,
+    });
     const [userA, userB] = CLEANUP_RUN_38954838195.users;
-    const businessA = "11111111-1111-4111-8111-111111111111";
-    const businessB = "22222222-2222-4222-8222-222222222222";
-    const businessFor = (userId: string) => {
-      if (userId === userA.id) return businessA;
-      if (userId === userB.id) return businessB;
-      throw new Error("unexpected owner");
-    };
-    let userId = "";
-    let selects = 0;
-    let businessDeletes = 0;
-    const calls: string[] = [];
-    const connection = {
-      async query(text: string) {
-        calls.push(text);
-        const failure = new Error("secret detail runtime");
-        failure.name = "error";
-        throw Object.assign(failure, { code: "42501" });
-      },
-      async exec() {
-        return undefined;
-      },
-      async transaction(
-        fn: (tx: {
-          query: (
-            text: string,
-            params?: readonly unknown[],
-          ) => Promise<{
-            rows: {
-              id?: string;
-              business_id?: string;
-              oauth_client_id?: string;
-            }[];
-          }>;
-          exec: () => Promise<void>;
-        }) => Promise<unknown>,
-      ) {
-        return fn({
-          async query(text: string, params?: readonly unknown[]) {
-            calls.push(text);
-            if (text.includes("request.jwt.claim.sub")) {
-              userId = String(params?.[0] ?? "");
-              return { rows: [] };
-            }
-            if (text.includes("set_config")) return { rows: [] };
-            if (text.includes("select id::text")) {
-              selects += 1;
-              if (selects === 5) {
-                const failure = new Error("secret detail from confirm");
-                failure.name = "error";
-                throw Object.assign(failure, { code: "42501" });
-              }
-              return { rows: [{ id: businessFor(userId) }] };
-            }
-            if (text.includes("delete from app.business_creation_keys")) {
-              return { rows: [{ business_id: businessFor(userId) }] };
-            }
-            if (text.includes("delete from app.oauth_consents")) {
-              return {
-                rows: CLEANUP_RUN_38954838195.clientIds.map(
-                  (oauth_client_id) => ({ oauth_client_id }),
-                ),
-              };
-            }
-            if (text.includes("update app.client_grants")) {
-              return {
-                rows: CLEANUP_RUN_38954838195.clientIds.map(
-                  (oauth_client_id) => ({ oauth_client_id }),
-                ),
-              };
-            }
-            if (text.includes("delete from app.businesses")) {
-              businessDeletes += 1;
-              return { rows: [{ id: businessFor(userId) }] };
-            }
-            throw new Error(`unexpected ${text}`);
-          },
-          async exec() {
-            return undefined;
-          },
-        });
-      },
-    };
-    const report = await cleanupRun38954838195(
-      connection as unknown as SqlConnection,
+    const createdA = await store.createBusiness(actor(userA.id), {
+      displayName: "Synthetic A",
+      idempotencyKey: "tos3-a",
+    });
+    const createdB = await store.createBusiness(actor(userB.id), {
+      displayName: "Synthetic B",
+      idempotencyKey: "tos3-b",
+    });
+    await asRuntime(connection);
+    const report = await cleanupRun38954838195(connection);
+    expect(report.outcome).toBe("aborted_visibility");
+    expect(report.phase).toBe("read");
+    expect(report.probes).toEqual([]);
+    await connection.exec("reset session authorization");
+    expect((await store.readBusiness(actor(userA.id)))?.id).toBe(
+      createdA.business.id,
     );
+    expect((await store.readBusiness(actor(userB.id)))?.id).toBe(
+      createdB.business.id,
+    );
+    await db.close();
+  });
+
+  it("stops the second owner when confirmation throws after the delete commits", async () => {
+    const probe = pinnedCleanupConnection(false);
+    const report = await cleanupRun38954838195(probe.connection);
     expect(report.outcome).toBe("uncertain");
     expect(report.probes[0]).toMatchObject({
       deleted: false,
@@ -474,15 +597,31 @@ describe("run 38954838195 app-row cleanup", () => {
       abortReason: "count",
     });
     expect(report.probes[1]?.deleteCommitted).toBeUndefined();
-    expect(businessDeletes).toBe(1);
-    expect(selects).toBe(5);
+    expect(probe.businessDeletes()).toBe(1);
+    expect(probe.selects()).toBe(5);
     const text = formatHistoricalAppRowReport(report);
     expect(text).toContain("outcome=uncertain");
     expect(text).toContain("delete_committed=true");
     expect(text).toContain("confirm_sqlstate=42501");
     expect(text).not.toContain("secret detail");
-    expect(
-      calls.filter((call) => call.includes("delete from app.businesses")),
-    ).toHaveLength(1);
+    expect(text).not.toContain("delete_committed=false");
+  });
+
+  it("does not treat a missing commit acknowledgment as proof of rollback", async () => {
+    const probe = pinnedCleanupConnection(true);
+    const report = await cleanupRun38954838195(probe.connection);
+    expect(report.outcome).toBe("uncertain");
+    expect(report.probes[0]).toMatchObject({
+      deleted: false,
+      abortReason: "confirm",
+      confirmSqlstate: "42501",
+    });
+    expect(report.probes[0]?.deleteCommitted).toBeUndefined();
+    expect(report.probes[1]?.deleted).toBe(false);
+    expect(probe.businessDeletes()).toBe(0);
+    const text = formatHistoricalAppRowReport(report);
+    expect(text).toContain("delete_committed=unknown");
+    expect(text).not.toContain("delete_committed=false");
+    expect(text).not.toContain("secret detail");
   });
 });

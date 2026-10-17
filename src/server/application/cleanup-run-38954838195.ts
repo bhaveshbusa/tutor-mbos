@@ -1,8 +1,9 @@
 /**
  * Development-only cleanup for acceptance run 38954838195.
- * The ids are the accept-job manifest printed in cleanup job 117156025989.
- * That manifest has no business id. This module does not open connections,
- * read credentials, or accept a caller-supplied owner or client id.
+ * Owner and client ids are the accept-job manifest from cleanup job
+ * 117156025989. Business ids are the read from run 39019907233. This
+ * module does not open connections, read credentials, or accept a
+ * caller-supplied owner, client, or business id.
  */
 import {
   databaseSqlState,
@@ -18,9 +19,19 @@ export const CLEANUP_RUN_38954838195 = {
   commit: "cb889c4ab3108d004ff6a434ef6982bc0a1fc98d",
   projectRef: "idvzjqrkgnihvxoswuxu",
   manifestSource: "actions job 117156025989 ACCEPTANCE_MANIFEST",
+  readSource: "actions run 39019907233 job 117359487839",
+  readCommit: "8fa09df59effb0cf03b1d9c7022ac28caa06bf62",
   users: [
-    { label: "tenant-a", id: "bfb76b40-67f2-4be2-b002-9a4b7a0d7108" },
-    { label: "tenant-b", id: "30328585-f1fa-4d1a-b80b-2dcd0dd2132a" },
+    {
+      label: "tenant-a",
+      id: "bfb76b40-67f2-4be2-b002-9a4b7a0d7108",
+      businessId: "9087ef87-7934-4e26-a514-fd057cefe3e0",
+    },
+    {
+      label: "tenant-b",
+      id: "30328585-f1fa-4d1a-b80b-2dcd0dd2132a",
+      businessId: "e5ae56e0-6ccd-45dd-801d-930c4f780379",
+    },
   ],
   clientIds: [
     "01306e08-f3b8-438e-801b-ff261a831aaf",
@@ -65,10 +76,10 @@ export function cleanupRunGuard(
     env.TUTOR_MBOS_ACCEPTANCE !== "development" ||
     env.GITHUB_ACTIONS !== "true"
   ) {
-    return "Historical app-row read runs only from the protected development workflow.";
+    return "Historical app-row cleanup runs only from the protected development workflow.";
   }
   if (env.GITHUB_REF && env.GITHUB_REF !== "refs/heads/main") {
-    return "Historical app-row read runs from main only.";
+    return "Historical app-row cleanup runs from main only.";
   }
   return null;
 }
@@ -145,17 +156,16 @@ export function formatDiagnoseReport(report: DiagnoseReport): string {
 }
 
 /**
- * Reads both manifest owners before any delete. Each must see exactly one
- * business, and the two ids must differ. `businesses_one_owner` makes a
- * second business for the same owner impossible. `auth.uid()` is the JWT
- * `sub` claim, so the already-deleted Auth users do not block the read and
- * do not cascade into app rows. An uncertain read returns before
- * `probeDirectTenants`. That probe still re-reads both owners, rolls a bad
- * row count back, and does not start the second owner after the first aborts.
- * A confirmation read that throws after the delete transaction returns is
- * `uncertain`: the caller cannot treat that owner as cleanly removed.
- * The protected command does not call this function while run 38992665029
- * has no visibility report.
+ * Reads both manifest owners before any delete. Each must see exactly the
+ * business id recorded by read 39019907233. Any other id, count, or
+ * uncertainty returns before `probeDirectTenants`. `businesses_one_owner`
+ * makes a second business for the same owner impossible. `auth.uid()` is
+ * the JWT `sub` claim, so the already-deleted Auth users do not block the
+ * read and do not cascade into app rows. The probe re-reads both owners,
+ * rolls a bad row count back, and does not start the second owner after
+ * the first aborts. A missing commit acknowledgment or a confirmation read
+ * that throws is `uncertain`. `delete_committed=true` means the client
+ * received the commit. `delete_committed=unknown` does not prove a rollback.
  */
 export async function cleanupRun38954838195(
   db: SqlConnection,
@@ -170,13 +180,15 @@ export async function cleanupRun38954838195(
     });
   }
   const [first, second] = owners;
+  const [userA, userB] = CLEANUP_RUN_38954838195.users;
   const ready =
-    first?.visible === 1 &&
-    second?.visible === 1 &&
-    first.businessId !== null &&
-    second.businessId !== null &&
-    first.businessId !== second.businessId;
-  if (!ready || !first?.businessId || !second?.businessId) {
+    first?.label === userA.label &&
+    second?.label === userB.label &&
+    first.visible === 1 &&
+    second.visible === 1 &&
+    first.businessId === userA.businessId &&
+    second.businessId === userB.businessId;
+  if (!ready) {
     return {
       runId: CLEANUP_RUN_38954838195.runId,
       phase: "read",
@@ -185,19 +197,17 @@ export async function cleanupRun38954838195(
       outcome: "aborted_visibility",
     };
   }
-  const userA = CLEANUP_RUN_38954838195.users[0];
-  const userB = CLEANUP_RUN_38954838195.users[1];
   const probes = await probeDirectTenants(db, [
     {
       userId: userA.id,
-      ownBusinessId: first.businessId,
-      otherBusinessId: second.businessId,
+      ownBusinessId: userA.businessId,
+      otherBusinessId: userB.businessId,
       clientIds: CLEANUP_RUN_38954838195.clientIds,
     },
     {
       userId: userB.id,
-      ownBusinessId: second.businessId,
-      otherBusinessId: first.businessId,
+      ownBusinessId: userB.businessId,
+      otherBusinessId: userA.businessId,
       clientIds: CLEANUP_RUN_38954838195.clientIds,
     },
   ]);
@@ -226,7 +236,7 @@ export function formatHistoricalAppRowReport(
   report: HistoricalAppRowReport,
 ): string {
   const lines = [
-    `historical_app_rows run=${report.runId} outcome=${report.outcome}`,
+    `historical_app_rows run=${report.runId} phase=${report.phase} outcome=${report.outcome}`,
   ];
   for (const owner of report.owners) {
     lines.push(
@@ -239,7 +249,7 @@ export function formatHistoricalAppRowReport(
     const label = report.owners[index]?.label ?? "unknown";
     const confirm =
       probe.abortReason === "confirm"
-        ? ` delete_committed=${probe.deleteCommitted === true} confirm_sqlstate=${probe.confirmSqlstate ?? "absent"}`
+        ? ` delete_committed=${probe.deleteCommitted === true ? "true" : "unknown"} confirm_sqlstate=${probe.confirmSqlstate ?? "absent"}`
         : "";
     lines.push(
       `probe=${label} deleted=${probe.deleted} abort=${probe.abortReason ?? "none"} other_visible=${probe.otherVisible}${confirm}`,
