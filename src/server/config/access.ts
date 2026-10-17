@@ -189,9 +189,14 @@ export function appRuntimeDatabaseUrl(input: {
   }
   const url = new URL("postgresql://localhost/postgres");
   url.username = `app_runtime.${projectRefOf(input.environment)}`;
-  url.password = input.password;
+  // The WHATWG password setter leaves "%" unchanged. pg-connection-string
+  // then decodes percent sequences, so a raw "%" must be encoded first.
+  url.password = encodeURIComponent(input.password);
   url.hostname = input.host;
   url.port = input.port;
+  // The pooler requires TLS. pg 8.23 treats sslmode=require as verify-full
+  // and warns. verify-full is that same certificate check, without the warning.
+  url.searchParams.set("sslmode", "verify-full");
   const inspected = inspectAppDatabaseUrl(url.href, input.environment);
   if (!inspected.ok) return inspected;
   return { ok: true, url: url.href, source: "password" };

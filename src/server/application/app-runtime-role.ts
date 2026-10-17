@@ -1,6 +1,6 @@
 import { hashSql } from "./migration-runner";
 import { scramSha256Verifier } from "./scram-password";
-import type { Sql } from "./sql";
+import type { Sql, SqlConnection } from "./sql";
 
 /**
  * Provisions the request login used by the running app.
@@ -578,26 +578,29 @@ async function assignAppRuntimePassword(
 }
 
 /**
- * Ordinary provisioning. A missing role is created and receives the
- * password. An existing role is aligned and granted, and its password is
- * not changed.
+ * Ordinary provisioning. A missing role is created, checked, and given its
+ * password in one transaction. A failure rolls that role back. An existing
+ * role is aligned and granted, and its password is not read or changed.
+ * password_action=unchanged does not mean the stored password matches.
  */
 export async function provisionAppRuntime(
-  db: Sql,
+  db: SqlConnection,
   password: string,
 ): Promise<RuntimePrivilegeEvidence> {
-  const prepared = await prepareAppRuntime(db, true);
-  if (prepared.created) {
-    await assignAppRuntimePassword(db, password, prepared.role);
-  }
-  return {
-    role: prepared.role,
-    effectiveMembers: prepared.effectiveMembers,
-    requestRole: prepared.requestRole,
-    requestMembers: prepared.requestMembers,
-    ownedOrAcl: prepared.ownedOrAcl,
-    passwordAction: prepared.created ? "created" : "unchanged",
-  };
+  return db.transaction(async (tx) => {
+    const prepared = await prepareAppRuntime(tx, true);
+    if (prepared.created) {
+      await assignAppRuntimePassword(tx, password, prepared.role);
+    }
+    return {
+      role: prepared.role,
+      effectiveMembers: prepared.effectiveMembers,
+      requestRole: prepared.requestRole,
+      requestMembers: prepared.requestMembers,
+      ownedOrAcl: prepared.ownedOrAcl,
+      passwordAction: prepared.created ? "created" : "unchanged",
+    };
+  });
 }
 
 /**

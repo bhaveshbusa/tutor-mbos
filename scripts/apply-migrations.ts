@@ -120,7 +120,11 @@ async function main(): Promise<void> {
       assertLedgerMatches(ledger, manifest.migrations);
       const evidence = await provisionAppRuntime(db, appPassword);
       console.log(formatRuntimePrivilegeEvidence(evidence));
-      console.log("app_runtime is ready for user-scoped requests.");
+      console.log(
+        evidence.passwordAction === "created"
+          ? "app_runtime is ready for user-scoped requests."
+          : "app_runtime privileges are ready. The existing password was not changed.",
+      );
     } catch (error) {
       runtimeFailure = safeRuntimeFailure(error, appPassword);
     }

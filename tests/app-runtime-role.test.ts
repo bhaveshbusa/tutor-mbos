@@ -81,17 +81,24 @@ const unchanged: RuntimePrivilegeEvidence = {
   passwordAction: "unchanged",
 };
 
-function recording(connection: Sql): { sql: Sql; statements: string[] } {
+function recording(connection: SqlConnection): {
+  sql: SqlConnection;
+  statements: string[];
+} {
   const statements: string[] = [];
-  const sql: Sql = {
+  const wrap = (inner: Sql): Sql => ({
     async query(text, params) {
       statements.push(text);
-      return connection.query(text, params);
+      return inner.query(text, params);
     },
     async exec(text) {
       statements.push(text);
-      await connection.exec(text);
+      await inner.exec(text);
     },
+  });
+  const sql: SqlConnection = {
+    ...wrap(connection),
+    transaction: (fn) => connection.transaction(async (tx) => fn(wrap(tx))),
   };
   return { sql, statements };
 }
@@ -460,6 +467,45 @@ describe("app runtime role provisioning", () => {
     );
   });
 
+  it("rolls a new role back when the password phase fails, then retries", async () => {
+    const connection = await migrated();
+    await useMigrationLogin(connection);
+    let denied = false;
+    const failing: SqlConnection = {
+      query: (text, params) => connection.query(text, params),
+      exec: (text) => connection.exec(text),
+      transaction: (fn) =>
+        connection.transaction(async (tx) =>
+          fn({
+            query: (text, params) => tx.query(text, params),
+            exec: async (text) => {
+              if (text.startsWith("alter role app_runtime password ")) {
+                denied = true;
+                const error = new Error("password denied");
+                Object.assign(error, { code: "42501" });
+                throw error;
+              }
+              await tx.exec(text);
+            },
+          }),
+        ),
+    };
+    await expect(provisionAppRuntime(failing, password)).rejects.toThrow(
+      /phase=password/,
+    );
+    expect(denied).toBe(true);
+    const present = async () => {
+      const result = await connection.query<{ present: boolean }>(
+        "select exists(select 1 from pg_roles where rolname = 'app_runtime') as present",
+      );
+      return result.rows[0]?.present;
+    };
+    expect(await present()).toBe(false);
+    const retried = await provisionAppRuntime(connection, password);
+    expect(retried.passwordAction).toBe("created");
+    expect(await present()).toBe(true);
+  });
+
   it("rejects an existing bypassrls role before it can serve requests", async () => {
     const connection = await migrated();
     await connection.exec(
@@ -790,6 +836,9 @@ describe("app runtime role provisioning", () => {
     expect(ledgerCheck).toBeGreaterThan(0);
     expect(provision).toBeGreaterThan(ledgerCheck);
     expect(readyLog).toBeGreaterThan(provision);
+    expect(script).toContain(
+      "app_runtime privileges are ready. The existing password was not changed.",
+    );
     expect(script).not.toContain("nosuperuser");
     expect(script).not.toContain("nobypassrls");
     const source = readFileSync(

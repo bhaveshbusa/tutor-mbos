@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import { describe, expect, it } from "vitest";
 import {
   appRuntimeDatabaseUrl,
@@ -6,6 +7,19 @@ import {
   resolveAppDatabaseUrl,
 } from "@/server/config/access";
 import { ENVIRONMENT_BINDINGS } from "@/server/config/environments";
+
+const require = createRequire(import.meta.url);
+const ConnectionParameters = require("pg/lib/connection-parameters.js") as new (
+  value: string,
+) => { password?: string; user?: string; ssl?: unknown };
+
+function parsedConnection(value: string): {
+  password?: string;
+  user?: string;
+  ssl?: unknown;
+} {
+  return new ConnectionParameters(value);
+}
 
 const devRef = ENVIRONMENT_BINDINGS.development.supabaseProjectRef;
 const prodRef = ENVIRONMENT_BINDINGS.production.supabaseProjectRef;
@@ -85,11 +99,31 @@ describe("database connection guards", () => {
     });
     expect(built.ok).toBe(true);
     if (!built.ok) return;
-    const parsed = new URL(built.url);
-    expect(decodeURIComponent(parsed.password)).toBe(secret);
-    expect(parsed.username).toBe(`app_runtime.${devRef}`);
+    const parsed = parsedConnection(built.url);
+    expect(parsed.password).toBe(secret);
+    expect(parsed.user).toBe(`app_runtime.${devRef}`);
+    expect(parsed.ssl).toEqual({});
+    expect(built.url).toContain("sslmode=verify-full");
     expect(built.url).not.toContain(secret);
     expect(JSON.stringify(built)).not.toContain(secret);
+    for (const roundTrip of [
+      "p%41ss",
+      "ab%2Fcd",
+      "%25%",
+      "100%",
+      "x+y&z!$'()*,;=~",
+    ]) {
+      const encoded = appRuntimeDatabaseUrl({
+        environment: "development",
+        password: roundTrip,
+        host: "aws-0-eu-west-2.pooler.supabase.com",
+        port: "6543",
+      });
+      expect(encoded.ok, roundTrip).toBe(true);
+      if (!encoded.ok) continue;
+      expect(parsedConnection(encoded.url).password, roundTrip).toBe(roundTrip);
+      expect(encoded.url).toContain("sslmode=verify-full");
+    }
     const legacy = `postgresql://app_runtime.${devRef}:<decoy>@aws-0-eu-west-2.pooler.supabase.com:6543/postgres`;
     const preferred = resolveAppDatabaseUrl(
       {
