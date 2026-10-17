@@ -406,8 +406,12 @@ describe("run 38954838195 app-row cleanup", () => {
       step.run?.includes("cleanup-run-38954838195"),
     );
     expect(cleanup?.env).toEqual({
-      TUTOR_MBOS_APP_DATABASE_URL: "${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}",
+      APP_RUNTIME_PASSWORD: "${{ secrets.APP_RUNTIME_PASSWORD }}",
+      TUTOR_MBOS_APP_DATABASE_HOST: "${{ vars.TUTOR_MBOS_APP_DATABASE_HOST }}",
+      TUTOR_MBOS_APP_DATABASE_PORT: "${{ vars.TUTOR_MBOS_APP_DATABASE_PORT }}",
     });
+    expect(text).not.toContain("TUTOR_MBOS_APP_DATABASE_URL");
+    expect(text).not.toContain("SUPABASE_MIGRATION_DATABASE_URL");
   });
 
   it("keeps only an allowlisted SQLSTATE", () => {

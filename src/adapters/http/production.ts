@@ -2,7 +2,7 @@ import { createServerClient, parseCookieHeader } from "@supabase/ssr";
 import {
   acceptedAudiences,
   authIssuer,
-  inspectAppDatabaseUrl,
+  resolveAppDatabaseUrl,
   jwksUrl,
   protectedResourceMetadataUrl,
   siteOriginFor,
@@ -59,9 +59,9 @@ export function authConfigured(env: EnvSource): boolean {
   const runtime = loadRuntimeConfig(env);
   const key = env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
   if (!runtime.ok || !key || looksLikeSecret(key)) return false;
-  const databaseUrl = env.TUTOR_MBOS_APP_DATABASE_URL;
-  if (!databaseUrl) return true;
-  return inspectAppDatabaseUrl(databaseUrl, runtime.config.environment).ok;
+  const database = resolveAppDatabaseUrl(env, runtime.config.environment);
+  if (!database.ok && database.code === "absent") return true;
+  return database.ok;
 }
 
 const SESSION_REFRESH_MARGIN_MS = 90_000;
@@ -129,17 +129,15 @@ export async function withAccess(
       "Supabase Auth is not configured for this deployment.",
     );
   }
-  const databaseUrl = env.TUTOR_MBOS_APP_DATABASE_URL;
-  if (
-    databaseUrl &&
-    !inspectAppDatabaseUrl(databaseUrl, runtime.config.environment).ok
-  ) {
+  const database = resolveAppDatabaseUrl(env, runtime.config.environment);
+  if (!database.ok && database.code !== "absent") {
     return problemResponse(
       503,
       "Store unavailable",
       "The business database connection is not the app runtime role for this environment.",
     );
   }
+  const databaseUrl = database.ok ? database.url : undefined;
   const siteOrigin = siteOriginFor(runtime.config.environment);
   const connection = databaseUrl ? pgConnection(databaseUrl) : null;
   const refreshedCookies: string[] = [];

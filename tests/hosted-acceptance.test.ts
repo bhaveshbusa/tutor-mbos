@@ -972,9 +972,10 @@ describe("hosted acceptance harness", () => {
       "scripts/assert-business-acceptance-secrets.mjs",
       "utf8",
     );
-    expect(businessSecrets).toContain("TUTOR_MBOS_APP_DATABASE_URL");
+    expect(businessSecrets).toContain("APP_RUNTIME_PASSWORD");
+    expect(businessSecrets).not.toContain("TUTOR_MBOS_APP_DATABASE_URL");
     expect(businessSecrets).toContain(
-      "Expected secret scope: GitHub environment development (Settings → Environments → development → Secrets). Purpose: development app_runtime connection for direct tenant reads and scoped business-row cleanup. Not the migration URL.",
+      "Expected secret scope: GitHub environment development (Settings → Environments → development → Secrets). Purpose: the only app_runtime password. The business job encodes it into the connection URL. Not the migration URL.",
     );
     expect(businessSecrets).toContain("VERCEL_AUTOMATION_BYPASS_SECRET");
     expect(businessSecrets).toContain("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY");
@@ -1162,7 +1163,9 @@ describe("hosted acceptance harness", () => {
         "${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}",
       NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:
         "${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}",
-      TUTOR_MBOS_APP_DATABASE_URL: "${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}",
+      APP_RUNTIME_PASSWORD: "${{ secrets.APP_RUNTIME_PASSWORD }}",
+      TUTOR_MBOS_APP_DATABASE_HOST: "${{ vars.TUTOR_MBOS_APP_DATABASE_HOST }}",
+      TUTOR_MBOS_APP_DATABASE_PORT: "${{ vars.TUTOR_MBOS_APP_DATABASE_PORT }}",
     });
     expect(preflight.steps.indexOf(presence!)).toBeLessThan(identityAt);
     const health = preflight.steps.find(
@@ -1208,7 +1211,9 @@ describe("hosted acceptance harness", () => {
     const inheritedNames = [
       "VERCEL_AUTOMATION_BYPASS_SECRET",
       "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
-      "TUTOR_MBOS_APP_DATABASE_URL",
+      "APP_RUNTIME_PASSWORD",
+      "TUTOR_MBOS_APP_DATABASE_HOST",
+      "TUTOR_MBOS_APP_DATABASE_PORT",
       "VERCEL_TOKEN",
     ];
     for (const name of inheritedNames) {
@@ -1234,7 +1239,9 @@ describe("hosted acceptance harness", () => {
     const businessSecretNames = [
       "VERCEL_AUTOMATION_BYPASS_SECRET",
       "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
-      "TUTOR_MBOS_APP_DATABASE_URL",
+      "APP_RUNTIME_PASSWORD",
+      "TUTOR_MBOS_APP_DATABASE_HOST",
+      "TUTOR_MBOS_APP_DATABASE_PORT",
     ];
     for (const step of preflight.steps) {
       if (step === presence || step === health) continue;
@@ -1321,7 +1328,9 @@ describe("hosted acceptance harness", () => {
       ACCEPTANCE_PHASE: "finish",
       VERCEL_AUTOMATION_BYPASS_SECRET:
         "${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}",
-      TUTOR_MBOS_APP_DATABASE_URL: "${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}",
+      APP_RUNTIME_PASSWORD: "${{ secrets.APP_RUNTIME_PASSWORD }}",
+      TUTOR_MBOS_APP_DATABASE_HOST: "${{ vars.TUTOR_MBOS_APP_DATABASE_HOST }}",
+      TUTOR_MBOS_APP_DATABASE_PORT: "${{ vars.TUTOR_MBOS_APP_DATABASE_PORT }}",
       NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:
         "${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}",
     });
@@ -1376,7 +1385,10 @@ describe("hosted acceptance harness", () => {
       for (const name of [
         "VERCEL_AUTOMATION_BYPASS_SECRET",
         "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
-        "TUTOR_MBOS_APP_DATABASE_URL",
+        "APP_RUNTIME_PASSWORD",
+        "TUTOR_MBOS_APP_DATABASE_HOST",
+        "TUTOR_MBOS_APP_DATABASE_PORT",
+        "SUPABASE_MIGRATION_DATABASE_URL",
         "VERCEL_TOKEN",
         "RESEND_DEVELOPMENT_RECEIVING_API_KEY",
       ]) {
@@ -1428,6 +1440,10 @@ describe("hosted acceptance harness", () => {
     );
     expect(JSON.stringify(cleanup)).not.toContain(
       "TUTOR_MBOS_APP_DATABASE_URL",
+    );
+    expect(JSON.stringify(cleanup)).not.toContain("APP_RUNTIME_PASSWORD");
+    expect(JSON.stringify(accept)).not.toContain(
+      "SUPABASE_MIGRATION_DATABASE_URL",
     );
     expect(JSON.stringify(cleanup)).not.toContain(
       "SUPABASE_DEVELOPMENT_ACCESS_TOKEN",
@@ -1502,7 +1518,9 @@ describe("hosted acceptance harness", () => {
       });
     const bypass = "synthetic-bypass-value";
     const publishable = "synthetic-publishable-value";
-    const database = "synthetic-database-value";
+    const runtimePassword = "synthetic-runtime-password";
+    const host = "db.example.test";
+    const port = "6543";
     const absent = run({});
     expect(absent.status).toBe(1);
     const absentText = `${absent.stdout}${absent.stderr}`;
@@ -1510,14 +1528,19 @@ describe("hosted acceptance harness", () => {
     expect(absentText).toContain(
       "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY is absent.",
     );
-    expect(absentText).toContain("TUTOR_MBOS_APP_DATABASE_URL is absent.");
+    expect(absentText).toContain("APP_RUNTIME_PASSWORD is absent.");
+    expect(absentText).toContain("TUTOR_MBOS_APP_DATABASE_HOST is absent.");
+    expect(absentText).toContain("TUTOR_MBOS_APP_DATABASE_PORT is absent.");
+    expect(absentText).not.toContain("TUTOR_MBOS_APP_DATABASE_URL");
     expect(absentText).toContain(
       "stops before the admin capability check until each absent business secret above is present",
     );
     const one = run({
       VERCEL_AUTOMATION_BYPASS_SECRET: bypass,
       NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: publishable,
-      TUTOR_MBOS_APP_DATABASE_URL: "",
+      APP_RUNTIME_PASSWORD: "",
+      TUTOR_MBOS_APP_DATABASE_HOST: host,
+      TUTOR_MBOS_APP_DATABASE_PORT: port,
     });
     expect(one.status).toBe(1);
     const oneText = `${one.stdout}${one.stderr}`;
@@ -1527,14 +1550,17 @@ describe("hosted acceptance harness", () => {
     expect(oneText).toContain(
       "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY is present. Expected secret scope: GitHub environment development.",
     );
-    expect(oneText).toContain("TUTOR_MBOS_APP_DATABASE_URL is absent.");
+    expect(oneText).toContain("APP_RUNTIME_PASSWORD is absent.");
     expect(oneText).not.toContain("VERCEL_AUTOMATION_BYPASS_SECRET is absent.");
     expect(oneText).not.toContain(bypass);
     expect(oneText).not.toContain(publishable);
+    expect(oneText).not.toContain(runtimePassword);
     const ready = run({
       VERCEL_AUTOMATION_BYPASS_SECRET: bypass,
       NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: publishable,
-      TUTOR_MBOS_APP_DATABASE_URL: database,
+      APP_RUNTIME_PASSWORD: runtimePassword,
+      TUTOR_MBOS_APP_DATABASE_HOST: host,
+      TUTOR_MBOS_APP_DATABASE_PORT: port,
     });
     expect(ready.status).toBe(0);
     const readyText = `${ready.stdout}${ready.stderr}`;
@@ -1542,16 +1568,21 @@ describe("hosted acceptance harness", () => {
     expect(readyText).toContain(
       "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY is present.",
     );
-    expect(readyText).toContain("TUTOR_MBOS_APP_DATABASE_URL is present.");
+    expect(readyText).toContain("APP_RUNTIME_PASSWORD is present.");
+    expect(readyText).toContain("TUTOR_MBOS_APP_DATABASE_HOST is present.");
+    expect(readyText).toContain("TUTOR_MBOS_APP_DATABASE_PORT is present.");
     expect(readyText).not.toContain(bypass);
     expect(readyText).not.toContain(publishable);
-    expect(readyText).not.toContain(database);
+    expect(readyText).not.toContain(runtimePassword);
+    expect(readyText).not.toContain(host);
     expect(ready.stderr).toBe("");
     const whitespace = " \n\t ";
     const untrimmed = run({
       VERCEL_AUTOMATION_BYPASS_SECRET: whitespace,
       NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: whitespace,
-      TUTOR_MBOS_APP_DATABASE_URL: whitespace,
+      APP_RUNTIME_PASSWORD: whitespace,
+      TUTOR_MBOS_APP_DATABASE_HOST: whitespace,
+      TUTOR_MBOS_APP_DATABASE_PORT: whitespace,
     });
     expect(untrimmed.status).toBe(0);
     const untrimmedText = `${untrimmed.stdout}${untrimmed.stderr}`;
@@ -1561,7 +1592,7 @@ describe("hosted acceptance harness", () => {
     expect(untrimmedText).toContain(
       "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY is present.",
     );
-    expect(untrimmedText).toContain("TUTOR_MBOS_APP_DATABASE_URL is present.");
+    expect(untrimmedText).toContain("APP_RUNTIME_PASSWORD is present.");
     expect(untrimmedText).not.toContain("is absent");
   });
 
@@ -2026,6 +2057,23 @@ describe("acceptance classifiers", () => {
     expect(material.publishableKey).toBe(publishableKey);
     expect(material.appDatabaseUrl).toBeNull();
     expect(material.managementToken).toBeNull();
+    const secret = "p@ss word";
+    const constructed = resolveAcceptanceMaterial(
+      {
+        [PUBLISHABLE_KEY_NAME]: publishableKey,
+        APP_RUNTIME_PASSWORD: secret,
+        TUTOR_MBOS_APP_DATABASE_HOST: "aws-0-eu-west-2.pooler.supabase.com",
+        TUTOR_MBOS_APP_DATABASE_PORT: "6543",
+        [APP_DATABASE_URL_SECRET]: `postgresql://app_runtime.${ENVIRONMENT_BINDINGS.development.supabaseProjectRef}:<decoy>@aws-0-eu-west-2.pooler.supabase.com:6543/postgres`,
+      },
+      {},
+    );
+    expect(constructed.appDatabaseUrl).toBeTruthy();
+    expect(constructed.appDatabaseUrl).not.toContain("decoy");
+    expect(constructed.appDatabaseUrl).not.toContain(secret);
+    expect(
+      decodeURIComponent(new URL(constructed.appDatabaseUrl ?? "").password),
+    ).toBe(secret);
   });
 });
 

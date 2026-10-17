@@ -5,8 +5,9 @@ name: Clean run 38954838195 app rows
 # those businesses after the reviewed ids match. It does not sign up, read
 # mail, call Auth admin, migrate, deploy, or run hosted acceptance.
 # Preparing this workflow does not dispatch it. Dispatch waits on
-# development-delivery. The only credential is the development app_runtime
-# URL. Owner, client, and business ids are in the reviewed script.
+# development-delivery. The only credential is APP_RUNTIME_PASSWORD. The
+# job builds the connection from that password and the non-secret host and
+# port. Owner, client, and business ids are in the reviewed script.
 on:
   workflow_dispatch:
 
@@ -40,16 +41,24 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           pnpm-cache: "false"
-      - name: Require app runtime URL
+      - name: Require app runtime password
         env:
-          TUTOR_MBOS_APP_DATABASE_URL: ${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}
+          APP_RUNTIME_PASSWORD: ${{ secrets.APP_RUNTIME_PASSWORD }}
+          TUTOR_MBOS_APP_DATABASE_HOST: ${{ vars.TUTOR_MBOS_APP_DATABASE_HOST }}
+          TUTOR_MBOS_APP_DATABASE_PORT: ${{ vars.TUTOR_MBOS_APP_DATABASE_PORT }}
         run: |
-          if [ -z "$TUTOR_MBOS_APP_DATABASE_URL" ]; then
-            echo "::error::TUTOR_MBOS_APP_DATABASE_URL is absent. Expected secret scope: GitHub environment development"
+          if [ -z "$APP_RUNTIME_PASSWORD" ]; then
+            echo "::error::APP_RUNTIME_PASSWORD is absent. Expected secret scope: GitHub environment development"
             exit 1
           fi
-          echo "TUTOR_MBOS_APP_DATABASE_URL is present."
+          if [ -z "$TUTOR_MBOS_APP_DATABASE_HOST" ] || [ -z "$TUTOR_MBOS_APP_DATABASE_PORT" ]; then
+            echo "::error::TUTOR_MBOS_APP_DATABASE_HOST or TUTOR_MBOS_APP_DATABASE_PORT is absent. Expected variable scope: GitHub environment development"
+            exit 1
+          fi
+          echo "APP_RUNTIME_PASSWORD is present."
       - name: Clean run 38954838195 app rows
         env:
-          TUTOR_MBOS_APP_DATABASE_URL: ${{ secrets.TUTOR_MBOS_APP_DATABASE_URL }}
+          APP_RUNTIME_PASSWORD: ${{ secrets.APP_RUNTIME_PASSWORD }}
+          TUTOR_MBOS_APP_DATABASE_HOST: ${{ vars.TUTOR_MBOS_APP_DATABASE_HOST }}
+          TUTOR_MBOS_APP_DATABASE_PORT: ${{ vars.TUTOR_MBOS_APP_DATABASE_PORT }}
         run: pnpm accept:development:cleanup-run-38954838195

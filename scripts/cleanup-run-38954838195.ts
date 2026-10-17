@@ -3,8 +3,9 @@
  * pinned businesses still present. This process deletes only when each
  * manifest owner still sees exactly that business. The ids are compiled
  * into the reviewed module. This process does not read a manifest, an
- * admin key, or a caller-supplied id. It receives only the development
- * app_runtime URL.
+ * admin key, or a caller-supplied id. It builds the development
+ * app_runtime URL from APP_RUNTIME_PASSWORD and the non-secret host and
+ * port. A stored URL is not accepted.
  */
 import { pathToFileURL } from "node:url";
 import {
@@ -15,11 +16,8 @@ import {
   type HistoricalAppRowReport,
 } from "@/server/application/cleanup-run-38954838195";
 import { pgConnection } from "@/server/application/pg-connection";
-import {
-  APP_DATABASE_URL_SECRET,
-  databaseSqlState,
-} from "@/server/application/hosted-acceptance";
-import { inspectAppDatabaseUrl } from "@/server/config/access";
+import { databaseSqlState } from "@/server/application/hosted-acceptance";
+import { resolveAppDatabaseUrl } from "@/server/config/access";
 
 function mask(value: string | null | undefined): void {
   if (value && process.env.GITHUB_ACTIONS === "true") {
@@ -33,13 +31,15 @@ async function main(): Promise<number> {
     console.error(`::error::${guard}`);
     return 2;
   }
-  const databaseUrl = process.env[APP_DATABASE_URL_SECRET] ?? "";
-  mask(databaseUrl);
-  const inspected = inspectAppDatabaseUrl(databaseUrl, "development");
-  if (!inspected.ok) {
-    console.error(`::error::app_database_url=${inspected.code}`);
+  const inspected = resolveAppDatabaseUrl(process.env, "development");
+  if (!inspected.ok || inspected.source !== "password") {
+    console.error(
+      `::error::app_database_url=${inspected.ok ? "url" : inspected.code}`,
+    );
     return 1;
   }
+  const databaseUrl = inspected.url;
+  mask(databaseUrl);
   const connection = pgConnection(databaseUrl);
   let report: HistoricalAppRowReport | null = null;
   let failed: unknown = null;
