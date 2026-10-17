@@ -1,12 +1,13 @@
 # Tutor MBOS: proposed initial-release plan
 
-Status: approved by the user on 14 October 2026. Supabase projects tutor-mbos and tutor-mbos-dev created by user report; configuration verification pending.
+Status: product plan approved by the user on 14 October 2026. Delivery follows the 17 October 2026 direction reset: https://linear.app/lets-play-match/document/project-direction-reset-standard-tooling-and-unattended-delivery-e6794b5a055f
+Supabase projects tutor-mbos and tutor-mbos-dev were created by the user.
 Repository: https://github.com/bhaveshbusa/tutor-mbos
 Delivery: https://linear.app/lets-play-match/project/tutor-mbos-initial-release-9973c3f2fd65
 
 ## Product and authority
 
-Build a fresh configurable, multi-tenant tutoring system. ChatGPT and the tutor admin UI are primary clients; documented APIs and standard MCP support other compatible clients. Each business has one owner/user, with no staff roles or invitation hierarchy. Teaching staff may be reference records without login accounts. Initial assumption: one business per account; a separate demo account owns a separate demo business.
+Build a fresh configurable, multi-tenant tutoring system. The admin UI, the documented API and standard MCP are the product clients. Users may connect compatible AI clients. ChatGPT is an example, not a privileged client or a separate architecture. Do not add a brand allowlist, and do not claim that every named assistant supports MCP or OAuth. Each business has one owner/user, with no staff roles or invitation hierarchy. Teaching staff may be reference records without login accounts. Initial assumption: one business per account; a separate demo account owns a separate demo business.
 
 This plan supersedes the predecessor project's single-business, MCP-only and workbook-first assumptions for this new repository. The old workbook is neither the specification nor an acceptance gate. Do not copy private records, extracts, secrets or Git history. No migration or Excel reconciliation is required. Existing systems/data are preserved pending a separately scoped retirement decision; stopping development does not delete production.
 
@@ -58,13 +59,13 @@ Prevent cross-tenant leaks through joins, aggregate counts, charts, caches, save
 
 Proposed stack: TypeScript, Next.js admin UI and HTTP adapters on Vercel, Supabase Auth/Postgres, a shared application/domain/query layer, and an MCP adapter. Use a modular monolith initially. Long-running exports/imports use durable cloud jobs when synchronous limits are exceeded.
 
-Supabase owns identity and OAuth authorization/token issuance. The app supplies login/consent UX, resource discovery, permission enforcement and business onboarding. UI sessions and delegated OAuth access tokens have separate documented validation paths. Use authorization-code flow with PKCE for delegated clients; no homemade authorization server or shared master API token.
+Supabase owns identity and OAuth authorization/token issuance. The app supplies login and consent, resource discovery, permission enforcement and business onboarding. UI sessions and delegated OAuth access tokens have separate documented validation paths. Use authorization-code flow with PKCE for delegated clients. Use Supabase-managed Auth, supported SDK verification, the official MCP SDK and Supabase migration tooling. Do not add a custom JWT or cryptographic stack, a migration engine, or an acceptance orchestrator unless a current platform gap is recorded first. No shared master API token.
 
 Validate signature, issuer, expiry, intended resource/audience and client/session binding as appropriate to each access path. Verify immutable authenticated owner identity against server-controlled tenant ownership. Never authorize from a request-supplied tenant ID or editable user metadata. Client grants (for example reporting-only access) do not introduce business staff roles. Enforce grants at every reachable access surface, including database paths; Supabase OIDC identity scopes alone do not provide business permissions.
 
 Tenant-scoped RLS and integrity constraints protect all business records and relationships. Business requests use user-scoped database access; privileged deployment credentials never serve routine user requests. Restrict raw Data API access so it cannot bypass application rules or client grants. Report/view/function/storage paths require the same isolation. Explicitly test direct database/API bypass attempts.
 
-Include secure session storage, CSRF protection for browser mutations, strict redirects, client consent/revocation, refresh/reconnection, account recovery, rate limits, input validation, redacted diagnostics and audit trails. Document revocation latency and test it. Authentication must be proved with the admin UI, a standards-based API client, ChatGPT and at least one other MCP client. Client-specific discovery/registration differences must be tested, not assumed.
+Include secure session storage, CSRF protection for browser mutations, strict redirects, client consent and revocation, refresh and reconnection, account recovery, rate limits, input validation, redacted diagnostics and audit trails. Document revocation latency and test it. Prove sign-in, recovery and business creation on the admin UI, API and MCP with shared behavior. Record one supported real MCP client connection. Further named-client compatibility is not a foundation gate. A simulated client is not that connection. Confirm a client's actual capabilities before relying on them.
 
 ## MCP onboarding and discoverability
 
@@ -96,24 +97,22 @@ Paid resources and plan selection are not provisioned by this document. The clou
 
 ## Cloud-only delivery and ownership
 
-No application development, dependency installation, builds, test runs or database execution on the user's machine. Planning reads of the predecessor and remote repository/project administration are allowed. All source editing is in Cursor/Devin cloud workspaces; tests run there and in GitHub-hosted CI.
+No application development, dependency installation, builds, test runs or database execution on the user's machine. Planning reads of the predecessor and remote repository administration are allowed. Source editing happens in a cloud agent workspace. Tests run there and in GitHub-hosted CI.
 
-Linear is the delivery source of truth. Each issue has scope, exclusions, acceptance tests, dependencies, one accountable implementation owner and linked PR/evidence. Cursor and Devin are interchangeable; one owns a shared migration/auth/API contract at a time. The other implements a separate surface against that contract or reviews it. Owner changes are recorded before work, not concurrent edits to the same contract. Codex coordinates planning, review and release through cloud tools.
+Linear is the delivery source of truth. Each issue has scope, exclusions, acceptance tests, dependencies, one implementation owner, one independent reviewer, and linked pull request evidence. The owner is the platform that has shown it can receive the issue, follow CI and review, and finish delivery. Codex coordinates the transition until that ownership transfer is recorded. Only one component dispatches each review. The implementation owner posts the pull request URL, exact HEAD, scope and CI evidence, and does not open a second dispatch. An hourly fallback must not dispatch the same work.
 
-Codex is the sole review dispatcher. The implementation owner posts review readiness with the full repository pull request URL, the exact HEAD, the scope, and CI evidence. That post does not mention the reviewer, delegate a review issue, add a review-trigger label, or retrigger a review from a status or comment. Codex prepares the review issue while it is undelegated, checks the pull request and SHA ledger, then delegates once. A delegation and a mention are two triggers; use one. Follow-ups stay in the retained session thread, without a mention, a second delegation, or a new issue. A new commit does not start a second review while one is active: finish or stop the active review and record the supersession first. CI, status, and stopped-session notices that do not change the verdict stay silent.
+CI gates: formatting, lint, typecheck, build, domain tests, database and RLS isolation tests, API and MCP contract tests, browser end-to-end tests where the change has a browser flow, policy-calculation fixtures, concurrency and idempotency tests, fresh and populated migration tests when migrations change, and secret and dependency scans. Lock dependencies and runner versions. Security-critical skips block readiness. Public and fork pull request workflows run without deployment secrets.
 
-CI gates: formatting/lint/typecheck/build, domain tests, database/RLS isolation tests, API/MCP contract tests, browser end-to-end tests, policy-calculation fixtures, concurrency/idempotency tests, fresh and populated migration tests, secret/dependency scans and report-total checks. Lock dependencies and runner/tool versions. Security-critical skips block readiness. Public/fork PR workflows run without deployment secrets; avoid executing untrusted code in privileged workflows.
-
-Every PR includes automated tests relevant to its behavior. Agent review and required CI gate integration. Promote the tested commit and migration set through development/staging, run hosted smoke tests, then prepare the same candidate for the user's final sign-off. Production release is automated after that sign-off; migrations are serialized, backward compatibility checked, backups verified and recovery/forward-fix instructions recorded. Final sign-off testing is entirely the user's choice; no Excel exercise is imposed.
+Every pull request answers the five questions in `.github/pull_request_template.md` and includes tests that cover its behavior. Required CI and independent review gate integration to `main`. A push to `main` is the ordinary development deployment. Production release stays separately gated on the user's sign-off for that candidate and migration set. The user chooses sign-off testing.
 
 ## Delivery increments and acceptance
 
 1. Plan approval and cloud foundation: public repository, rules, agent workspace setup, CI and deployment environments.
-2. Secure walking skeleton: real UI/API/MCP authentication, two isolated tenants, onboarding, discovery, token lifecycle and denial cases. Must pass before financial implementation is enabled.
+2. Standard secure foundation, after unattended delivery is demonstrated: Supabase Auth, the official MCP SDK, two isolated tenants, onboarding, discovery, token lifecycle and denial cases. This replaces the superseded custom foundation. It must pass before financial implementation is enabled.
 3. Configurable operations: business settings, students/payers, teaching, enrolments, sessions/attendance and assessments with reports delivered alongside each area.
 4. Financial operations: complete fee and receipt/correction workflows, configurable policy calculations and shared financial reports.
 5. Query/discovery completeness: report builder, saved queries/exports, MCP onboarding/help and cross-client parity.
-6. Release qualification: cloud security/regression/performance/restore checks, usable demo account, automatic evidence pack and optional user-chosen sign-off scenarios.
+6. Release qualification: cloud security, regression, performance and restore checks, a usable demo account, and links to the pull request, checks and deployment. The user chooses any final sign-off scenarios.
 
 Reporting is part of each increment's definition of done, not a post-launch phase. The user has approved the plan; implementation can proceed through the cloud-only workflow. No dates or estimates are promised until agents assess the approved contracts.
 
