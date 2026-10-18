@@ -135,7 +135,7 @@ describe("browser authentication", () => {
       auth,
       DEV_ORIGIN,
     );
-    expect(opaque.status).toBe(303);
+    expect(opaque.status).toBe(403);
     const crossSite = await handleLogin(
       new Request("http://localhost:3100/api/auth/login", {
         method: "POST",

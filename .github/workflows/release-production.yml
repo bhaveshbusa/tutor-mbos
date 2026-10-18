@@ -96,6 +96,29 @@ jobs:
           ref: ${{ needs.candidate.outputs.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup
+      - name: Require the production migration URL
+        env:
+          SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
+        run: |
+          if [ -z "$SUPABASE_MIGRATION_DATABASE_URL" ]; then
+            echo "::error::SUPABASE_MIGRATION_DATABASE_URL is absent. Expected secret scope: GitHub environment production (Settings → Environments → production → Secrets)."
+            echo "::error::Production promotion stops before SQL and before deploy until that secret is present."
+            exit 1
+          fi
+      - name: Reject a development or request-role URL before connecting
+        env:
+          SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
+          MIGRATION_TARGET: production
+        run: node scripts/migration-url.ts
+      - name: Compare the recorded ledger with the reviewed files
+        env:
+          SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
+          MIGRATION_TARGET: production
+        run: node scripts/migration-url.ts --ledger
+      - name: Apply the signed-off migration set before deploy
+        env:
+          SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
+        run: pnpm exec supabase db push --db-url "$SUPABASE_MIGRATION_DATABASE_URL" --yes --skip-vault
       - name: Require deployment credentials
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}

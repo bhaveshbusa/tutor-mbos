@@ -63,53 +63,33 @@ function loopbackHost(hostname: string): boolean {
   return hostname === "localhost" || hostname === "127.0.0.1";
 }
 
-function requestHost(request: Request): string {
-  return (
-    (request.headers.get("host") ?? new URL(request.url).host).split(":")[0] ??
-    ""
-  );
-}
-
 /**
- * Cookie mutations accept the deployment site. A loopback browser may use
- * `localhost` or `127.0.0.1` interchangeably: Next dev rewrites `request.url`
- * to `localhost`. `Referrer-Policy: no-referrer` makes Chromium send
- * `Origin: null` on the form POST; that opaque origin is accepted only with
- * the browser's `Sec-Fetch-Site: same-origin` and a loopback or site host.
- * A hosted cross-site request still requires the site origin.
+ * Cookie mutations accept the deployment site origin. A loopback browser may
+ * use `localhost` or `127.0.0.1` on the same port and protocol, because Next
+ * dev rewrites `request.url` to `localhost`. An opaque `Origin: null` is
+ * refused, including on the hosted site.
  */
 export function browserRequestAllowed(
   request: Request,
   siteOrigin: string,
 ): boolean {
   const origin = request.headers.get("origin");
-  if (!origin) return false;
+  if (!origin || origin === "null") return false;
   if (origin === siteOrigin) return true;
+  let originUrl: URL;
   let requestUrl: URL;
-  let site: URL;
   try {
+    originUrl = new URL(origin);
     requestUrl = new URL(request.url);
-    site = new URL(siteOrigin);
   } catch {
     return false;
   }
-  if (origin !== "null") {
-    let originUrl: URL;
-    try {
-      originUrl = new URL(origin);
-    } catch {
-      return false;
-    }
-    return (
-      loopbackHost(originUrl.hostname) &&
-      loopbackHost(requestUrl.hostname) &&
-      originUrl.protocol === requestUrl.protocol &&
-      originUrl.port === requestUrl.port
-    );
-  }
-  if (request.headers.get("sec-fetch-site") !== "same-origin") return false;
-  const host = requestHost(request);
-  return loopbackHost(host) || host === site.hostname;
+  return (
+    loopbackHost(originUrl.hostname) &&
+    loopbackHost(requestUrl.hostname) &&
+    originUrl.protocol === requestUrl.protocol &&
+    originUrl.port === requestUrl.port
+  );
 }
 
 export function isAllowedBrowserNext(value: string): boolean {
@@ -174,12 +154,15 @@ function mentionsProject(
  */
 export function inspectMigrationDatabaseUrl(
   value: string,
+  target: DeploymentEnvironment = "development",
 ): { ok: true } | { ok: false; code: DatabaseUrlIssue | "app_runtime" } {
   const parsed = parseDatabaseUrl(value);
   if (!parsed) return { ok: false, code: "invalid" };
-  const devRef = projectRefOf("development");
-  const prodRef = projectRefOf("production");
-  if (mentionsProject(parsed, prodRef) || !mentionsProject(parsed, devRef)) {
+  const expected = projectRefOf(target);
+  const other = projectRefOf(
+    target === "development" ? "production" : "development",
+  );
+  if (mentionsProject(parsed, other) || !mentionsProject(parsed, expected)) {
     return { ok: false, code: "binding_mismatch" };
   }
   const bareUser = parsed.username.split(".")[0] ?? "";

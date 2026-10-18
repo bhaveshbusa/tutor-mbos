@@ -127,7 +127,7 @@ describe("tenant isolation", () => {
           [TENANT_B.userId],
         );
       }),
-    ).rejects.toThrow(/row-level security/);
+    ).rejects.toThrow(/permission denied/);
     const unauthenticated = await connection.transaction(async (tx) => {
       await tx.exec("set local role authenticated");
       return tx.query("select id from app.businesses");

@@ -396,6 +396,9 @@ describe("development migration recovery", () => {
     expect(runs).not.toMatch(/echo\s+["']\$\{?SUPABASE_MIGRATION_DATABASE_URL/);
     expect(runs).not.toMatch(/\b(printenv|env|sha256sum|wc)\b/);
     expect(runs.indexOf("is absent")).toBeLessThan(
+      runs.indexOf("node scripts/migration-url.ts --ledger"),
+    );
+    expect(runs.indexOf("node scripts/migration-url.ts --ledger")).toBeLessThan(
       runs.indexOf("pnpm exec supabase db push"),
     );
     expect(runs).not.toContain("vercel");
@@ -439,7 +442,14 @@ describe("production release", () => {
     const runs = (release.steps ?? []).map((s) => s.run ?? "").join("\n");
     expect(runs).toContain('"$PRODUCTION_RELEASES_ENABLED" != "true"');
     expect(runs.indexOf("PRODUCTION_RELEASES_ENABLED")).toBeLessThan(
-      runs.indexOf("vercel@"),
+      runs.indexOf("pnpm exec supabase db push"),
+    );
+    const releaseText = raw(`${WORKFLOW_DIR}/release-production.yml`);
+    expect(releaseText.indexOf("MIGRATION_TARGET: production")).toBeLessThan(
+      releaseText.indexOf("pnpm exec supabase db push"),
+    );
+    expect(releaseText.indexOf("pnpm exec supabase db push")).toBeLessThan(
+      releaseText.indexOf("vercel@"),
     );
   });
 

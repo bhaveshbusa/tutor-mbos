@@ -43,6 +43,10 @@ jobs:
         env:
           SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
         run: node scripts/migration-url.ts
+      - name: Compare the recorded ledger with the reviewed files
+        env:
+          SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
+        run: node scripts/migration-url.ts --ledger
       - name: Apply pending migrations with the Supabase CLI
         env:
           SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}

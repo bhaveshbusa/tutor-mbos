@@ -1,19 +1,27 @@
 -- Forward transition to ordinary user-scoped access.
 -- Earlier files stay as applied. This file does not drop roles, tables, or rows.
 -- app_request remains for any existing session. app_runtime, if present, is not
--- altered and is no longer provisioned. Requests use the authenticated role
--- through security-invoker functions in public, which PostgREST already exposes.
+-- altered and is no longer provisioned. Reads use security-invoker functions.
+-- Writes are security definer, so the API role has no direct table writes.
 -- Row level security from the earlier files still applies, including delegated grants.
 
 grant usage on schema app to authenticated;
-grant select, insert, update, delete on all tables in schema app to authenticated;
+grant select on all tables in schema app to authenticated;
 grant select on app.setup_report to authenticated;
+revoke insert, update, delete, truncate on all tables in schema app from authenticated;
 grant execute on function app.auth_uid() to authenticated;
 grant execute on function app.auth_jwt() to authenticated;
 grant execute on function app.permissions_allowed(text[]) to authenticated;
 grant execute on function app.create_business(text, text) to authenticated;
 grant execute on function app.record_client_consent(text, text[], text[], text, text, text) to authenticated;
 grant execute on function app.revoke_client_grant(text) to authenticated;
+
+-- Writes go through the reviewed functions. Direct table writes by the API
+-- role would skip consent validation. The functions keep their auth.uid()
+-- checks and run as the migration owner.
+alter function app.create_business(text, text) security definer;
+alter function app.record_client_consent(text, text[], text[], text, text, text) security definer;
+alter function app.revoke_client_grant(text) security definer;
 
 revoke all on schema app from anon;
 revoke all on all tables in schema app from anon;
@@ -153,6 +161,11 @@ begin
   end if;
   if not has_schema_privilege('authenticated', 'app', 'USAGE') then
     raise exception 'authenticated_missing_app_usage';
+  end if;
+  if has_table_privilege('authenticated', 'app.client_grants', 'INSERT')
+    or has_table_privilege('authenticated', 'app.client_grants', 'UPDATE')
+    or has_table_privilege('authenticated', 'app.businesses', 'INSERT') then
+    raise exception 'authenticated_can_write_app_tables';
   end if;
   if not exists (
     select 1
