@@ -3,7 +3,7 @@
  * Versioned here so adapters cannot drift from the rules they enforce.
  * Human-readable copy: docs/contracts/access-v1.md.
  */
-export const ACCESS_CONTRACT_VERSION = "2026-10-15";
+export const ACCESS_CONTRACT_VERSION = "2026-10-17";
 
 /** Business permissions. These are not OAuth/OIDC scopes. */
 export const BUSINESS_PERMISSIONS = [
@@ -26,9 +26,6 @@ export const UI_SESSION_PERMISSIONS: readonly BusinessPermission[] = [
   "reports.read",
 ];
 
-/** Clock skew accepted when checking access-token expiry. */
-export const ACCESS_TOKEN_CLOCK_SKEW_SECONDS = 5;
-
 /**
  * Grant and session revocation is read on every request. There is no
  * permission cache, so a revoked grant or Auth session fails on the next call.
@@ -48,7 +45,7 @@ export const CLIENT_PROFILES = {
     pkce: "S256",
     transport: "bearer",
   },
-  chatgpt: {
+  "dynamic-client": {
     accessPath: "delegated-oauth",
     registration: "dynamic",
     pkce: "S256",
@@ -66,27 +63,10 @@ export const CLIENT_PROFILES = {
 
 export type ClientProfileName = keyof typeof CLIENT_PROFILES;
 
-export const ACCEPTED_TOKEN_ALGORITHMS = ["ES256", "RS256"] as const;
-
 export function isBusinessPermission(
   value: string,
 ): value is BusinessPermission {
   return (BUSINESS_PERMISSIONS as readonly string[]).includes(value);
-}
-
-/** MCP protocol versions this server can negotiate. */
-export const MCP_PROTOCOL_VERSIONS = ["2025-03-26", "2025-06-18"] as const;
-
-export const MCP_PROTOCOL_VERSION = "2025-06-18";
-
-export function negotiateMcpProtocol(requested: unknown): string {
-  if (
-    typeof requested === "string" &&
-    (MCP_PROTOCOL_VERSIONS as readonly string[]).includes(requested)
-  ) {
-    return requested;
-  }
-  return MCP_PROTOCOL_VERSION;
 }
 
 /** Drops anything outside the catalogue, including claims a client invented. */

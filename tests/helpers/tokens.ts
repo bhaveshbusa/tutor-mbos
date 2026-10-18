@@ -3,7 +3,17 @@ import {
   ENVIRONMENT_BINDINGS,
   supabaseUrlFor,
 } from "@/server/config/environments";
-import type { JsonWebKey } from "@/server/application/access-token";
+
+export interface TestJwk {
+  kid?: string;
+  kty: string;
+  crv?: string;
+  x?: string;
+  y?: string;
+  alg?: string;
+  key_ops?: string[];
+  [key: string]: unknown;
+}
 
 export const NOW = new Date("2026-10-15T12:00:00Z");
 export const DEV_ORIGIN = "https://tutor-mbos-dev-lets-play-game.vercel.app";
@@ -31,18 +41,17 @@ function base64url(value: Uint8Array | string): string {
 
 export async function signingKey(): Promise<{
   privateKey: CryptoKey;
-  jwk: JsonWebKey;
+  jwk: TestJwk;
 }> {
   const pair = await crypto.subtle.generateKey(
     { name: "ECDSA", namedCurve: "P-256" },
     true,
     ["sign", "verify"],
   );
-  const jwk = (await crypto.subtle.exportKey(
-    "jwk",
-    pair.publicKey,
-  )) as JsonWebKey;
+  const jwk = (await crypto.subtle.exportKey("jwk", pair.publicKey)) as TestJwk;
   jwk.kid = "test-key";
+  jwk.alg = "ES256";
+  jwk.key_ops = ["verify"];
   return { privateKey: pair.privateKey, jwk };
 }
 
@@ -69,12 +78,15 @@ export function sessionClaims(
   userId: string,
   extra: Record<string, unknown> = {},
 ) {
+  const issuedAt = Math.floor(Date.now() / 1000) - 30;
   return {
     sub: userId,
     role: "authenticated",
     aud: "authenticated",
     iss: ISSUER,
-    exp: Math.floor(NOW.getTime() / 1000) + 3600,
+    iat: issuedAt,
+    exp: issuedAt + 3600,
+    aal: "aal1",
     session_id: `session-${userId.slice(-4)}`,
     user_metadata: {
       tenant_id: TENANT_B.userId,

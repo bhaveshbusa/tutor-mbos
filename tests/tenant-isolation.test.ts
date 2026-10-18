@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   createFirstBusiness,
@@ -103,7 +102,7 @@ describe("tenant isolation", () => {
       await tx.query("select set_config('request.jwt.claim.sub', $1, true)", [
         TENANT_A.userId,
       ]);
-      await tx.exec("set local role app_request");
+      await tx.exec("set local role authenticated");
       return tx.query(
         "select count(*)::int as n from app.businesses where owner_user_id = $1 or id = $2",
         [TENANT_B.userId, createdB.business.id],
@@ -122,19 +121,18 @@ describe("tenant isolation", () => {
         await tx.query("select set_config('request.jwt.claim.sub', $1, true)", [
           TENANT_A.userId,
         ]);
-        await tx.exec("set local role app_request");
+        await tx.exec("set local role authenticated");
         await tx.query(
           "insert into app.businesses (owner_user_id, display_name) values ($1, 'stolen')",
           [TENANT_B.userId],
         );
       }),
-    ).rejects.toThrow(/row-level security/);
-    await expect(
-      connection.transaction(async (tx) => {
-        await tx.exec("set local role authenticated");
-        await tx.query("select * from app.businesses");
-      }),
     ).rejects.toThrow(/permission denied/);
+    const unauthenticated = await connection.transaction(async (tx) => {
+      await tx.exec("set local role authenticated");
+      return tx.query("select id from app.businesses");
+    });
+    expect(unauthenticated.rows).toEqual([]);
 
     await expect(
       store.createBusiness(delegated(TENANT_B.userId, GENERIC_MCP_CLIENT), {
@@ -158,7 +156,7 @@ describe("tenant isolation", () => {
       await tx.query("select set_config('request.jwt.claim.sub', $1, true)", [
         TENANT_A.userId,
       ]);
-      await tx.exec("set local role app_request");
+      await tx.exec("set local role authenticated");
       return tx.query("select id from app.businesses");
     });
     expect(serviceClaim.rows).toEqual([]);
@@ -174,11 +172,46 @@ describe("tenant isolation", () => {
       "select count(*)::int as n from app.businesses",
     );
     expect(privileged.rows).toEqual([{ n: 2 }]);
-    const source = readFileSync(
-      "src/server/application/access-store.ts",
-      "utf8",
+    await expect(
+      connection.transaction(async (tx) => {
+        await tx.exec("set local role anon");
+        await tx.query("select public.create_business('nope', 'nope')");
+      }),
+    ).rejects.toThrow(/permission denied/);
+  });
+
+  it("does not let one delegated client read another client's grant", async () => {
+    const { store } = await seed();
+    await store.recordConsent(ui(TENANT_A.userId), {
+      oauthClientId: CHATGPT_CLIENT,
+      permissions: ["business.read"],
+      scopes: ["openid"],
+      authorizationId: "authz-a-redirect",
+      decision: "approved",
+      redirectUri: "https://client-a.example/callback",
+    });
+    await store.recordConsent(ui(TENANT_A.userId), {
+      oauthClientId: API_CLIENT,
+      permissions: ["reports.read"],
+      scopes: ["openid"],
+      authorizationId: "authz-api-redirect",
+      decision: "approved",
+      redirectUri: "https://client-b.example/callback",
+    });
+    const other = await store.readGrant(
+      delegated(TENANT_A.userId, CHATGPT_CLIENT),
+      API_CLIENT,
     );
-    expect(source).toContain("set local role app_request");
+    expect(other).toBeNull();
+    expect(
+      await store.listLiveGrantRedirects(
+        delegated(TENANT_A.userId, CHATGPT_CLIENT),
+      ),
+    ).toEqual(["https://client-a.example/callback"]);
+    expect(await store.listLiveGrantRedirects(ui(TENANT_A.userId))).toEqual([
+      "https://client-a.example/callback",
+      "https://client-b.example/callback",
+    ]);
   });
 
   it("rejects a store that returns another owner's business", async () => {

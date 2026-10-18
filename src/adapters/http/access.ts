@@ -3,7 +3,7 @@ import {
   type AuthServer,
   type AuthSuccess,
 } from "@/server/application/authenticate";
-import type { VerifyResult } from "@/server/application/access-token";
+import type { VerifyResult } from "@/server/application/verified-token";
 import {
   createFirstBusiness,
   readBusiness,
@@ -12,6 +12,7 @@ import {
   type AccessContext,
 } from "@/server/application/business-access";
 import type { AccessStore } from "@/server/application/access-store";
+import { browserRequestAllowed } from "@/server/config/access";
 import { ACCESS_CONTRACT_VERSION } from "@/server/domain/access-contract";
 import { permissionsFor } from "@/server/domain/access-decision";
 import { API_VERSION, jsonResponse, problemResponse } from "./problem";
@@ -22,7 +23,8 @@ export interface AccessDeps {
   now: () => Date;
   verify: (token: string) => Promise<VerifyResult>;
   authServer: AuthServer;
-  store: AccessStore | null;
+  /** Opens a user-scoped store for the access token that was just verified. */
+  storeFor: (accessToken: string) => AccessStore | null;
   /** First-party session token from the Supabase auth cookie. Not a request claim. */
   sessionToken: (request: Request) => Promise<string | null> | string | null;
   /** Deletes the Supabase OAuth grant before the app grant is revoked. */
@@ -89,12 +91,13 @@ async function authorize(
   deps: AccessDeps,
   body: unknown,
 ): Promise<
-  | { ok: true; auth: AuthSuccess; context: AccessContext }
+  | { ok: true; auth: AuthSuccess; context: AccessContext; store: AccessStore }
   | { ok: false; response: Response }
 > {
-  const session = await deps.sessionToken(request);
+  const bearerToken = bearer(request);
+  const session = bearerToken ? null : await deps.sessionToken(request);
   const auth = await authenticateMaterial({
-    bearerToken: bearer(request),
+    bearerToken,
     sessionToken: session,
     verify: deps.verify,
     authServer: deps.authServer,
@@ -114,7 +117,9 @@ async function authorize(
           );
     return { ok: false, response: challenge(deps, response) };
   }
-  if (!deps.store) {
+  const accessToken = bearerToken ?? session;
+  const store = accessToken ? deps.storeFor(accessToken) : null;
+  if (!store) {
     return {
       ok: false,
       response: problemResponse(
@@ -126,7 +131,7 @@ async function authorize(
   }
   if (
     auth.presented === "cookie" &&
-    request.headers.get("origin") !== deps.siteOrigin
+    !browserRequestAllowed(request, deps.siteOrigin)
   ) {
     return {
       ok: false,
@@ -140,7 +145,7 @@ async function authorize(
   let grant = null;
   if (auth.actor.clientId !== null) {
     try {
-      grant = await deps.store.readGrant(auth.actor, auth.actor.clientId);
+      grant = await store.readGrant(auth.actor, auth.actor.clientId);
     } catch {
       return {
         ok: false,
@@ -160,6 +165,7 @@ async function authorize(
       grant,
       requestedTenantId: requestedTenantId(request, body),
     },
+    store,
   };
 }
 
@@ -197,7 +203,7 @@ export function createAccessHandlers(deps: AccessDeps) {
     async getBusiness(request: Request): Promise<Response> {
       const decision = await authorize(request, deps, {});
       if (!decision.ok) return decision.response;
-      const result = await readBusiness(deps.store!, decision.context);
+      const result = await readBusiness(decision.store, decision.context);
       if (!result.ok) return failure(result);
       return jsonResponse(200, {
         apiVersion: API_VERSION,
@@ -223,10 +229,14 @@ export function createAccessHandlers(deps: AccessDeps) {
       const formKey =
         typeof record.idempotencyKey === "string" ? record.idempotencyKey : "";
       const idempotencyKey = headerKey || formKey || "browser-onboarding";
-      const result = await createFirstBusiness(deps.store!, decision.context, {
-        displayName,
-        idempotencyKey,
-      });
+      const result = await createFirstBusiness(
+        decision.store,
+        decision.context,
+        {
+          displayName,
+          idempotencyKey,
+        },
+      );
       if (!result.ok) return failure(result);
       return jsonResponse(result.created ? 201 : 200, {
         apiVersion: API_VERSION,
@@ -240,7 +250,7 @@ export function createAccessHandlers(deps: AccessDeps) {
     async setupReport(request: Request): Promise<Response> {
       const decision = await authorize(request, deps, {});
       if (!decision.ok) return decision.response;
-      const result = await readSetupReport(deps.store!, decision.context);
+      const result = await readSetupReport(decision.store, decision.context);
       if (!result.ok) return failure(result);
       return jsonResponse(200, { apiVersion: API_VERSION, ...result.report });
     },
@@ -255,7 +265,7 @@ export function createAccessHandlers(deps: AccessDeps) {
       const clientId =
         typeof record.clientId === "string" ? record.clientId : "";
       const result = await revokeClient(
-        deps.store!,
+        decision.store,
         decision.context,
         clientId,
         deps.revokeAuthGrant

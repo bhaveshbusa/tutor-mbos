@@ -1,3 +1,3 @@
 # Application layer
 
-Use cases shared by the admin UI, HTTP API and MCP adapters. Adapters translate transport input into these calls and map results back; they never reimplement business rules. Framework-free: no `next`, `react` or adapter imports (enforced by ESLint and `tests/architecture.test.ts`). Database access for a request uses the `app_request` role.
+Use cases shared by the admin UI, HTTP API and MCP adapters. Adapters translate transport input into these calls and map results back; they never reimplement business rules. Framework-free: no `next`, `react` or adapter imports (enforced by ESLint and `tests/architecture.test.ts`). A request uses the caller's Supabase access token. Postgres applies row level security as the `authenticated` role.

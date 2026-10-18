@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createMcpHandler } from "@/adapters/mcp/handler";
 import { protectedResourceDocument } from "@/adapters/http/discovery";
 import type { AccessDeps } from "@/adapters/http/access";
-import { verifyAccessToken } from "@/server/application/access-token";
+import { verifySupabaseAccessToken } from "@/server/application/verify-supabase-token";
 import { CLIENT_PROFILES } from "@/server/domain/access-contract";
 import {
   acceptedAudiences,
@@ -30,6 +30,7 @@ import {
 const supabaseUrl = supabaseUrlFor(
   ENVIRONMENT_BINDINGS.development.supabaseProjectRef,
 );
+const publishableKey = `sb_${"publishable"}_ci`;
 
 async function mcp() {
   const keys = await signingKey();
@@ -39,13 +40,15 @@ async function mcp() {
     siteOrigin: DEV_ORIGIN,
     resourceMetadataUrl: protectedResourceMetadataUrl(DEV_ORIGIN),
     now: () => NOW,
-    store,
+    storeFor: () => store,
     verify: (token) =>
-      verifyAccessToken(token, {
-        jwks: [keys.jwk],
+      verifySupabaseAccessToken({
+        token,
+        supabaseUrl,
+        publishableKey,
         issuer: ISSUER,
         audiences: acceptedAudiences(DEV_ORIGIN),
-        now: NOW,
+        jwks: { keys: [keys.jwk] },
       }),
     authServer: {
       async getUser(token) {
@@ -67,12 +70,24 @@ async function mcp() {
 }
 
 function rpc(method: string, token: string | null, params?: unknown) {
-  const headers = new Headers({ "content-type": "application/json" });
+  const headers = new Headers({
+    "content-type": "application/json",
+    accept: "application/json, text/event-stream",
+  });
   if (token) headers.set("authorization", `Bearer ${token}`);
+  const bodyParams =
+    method === "initialize"
+      ? {
+          protocolVersion: "2025-03-26",
+          capabilities: {},
+          clientInfo: { name: "vitest", version: "0" },
+          ...(params && typeof params === "object" ? params : {}),
+        }
+      : params;
   return new Request("https://example.test/api/mcp", {
     method: "POST",
     headers,
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: bodyParams }),
   });
 }
 
@@ -82,10 +97,10 @@ describe("MCP clients", () => {
     expect(document.authorization_servers).toEqual([authIssuer(supabaseUrl)]);
     expect(document.resource).toBe(`${DEV_ORIGIN}/api/mcp`);
     expect(document.scopes_supported).not.toContain("business.onboard");
-    expect(CLIENT_PROFILES.chatgpt.discovery).toBe(
+    expect(CLIENT_PROFILES["dynamic-client"].discovery).toBe(
       CLIENT_PROFILES["generic-mcp"].discovery,
     );
-    expect(CLIENT_PROFILES.chatgpt.registration).not.toBe(
+    expect(CLIENT_PROFILES["dynamic-client"].registration).not.toBe(
       CLIENT_PROFILES["generic-mcp"].registration,
     );
   });
@@ -109,7 +124,7 @@ describe("MCP clients", () => {
     const latest = await handle(
       rpc("initialize", token, { protocolVersion: "1999-01-01" }),
     );
-    expect((await latest.json()).result.protocolVersion).toBe("2025-06-18");
+    expect((await latest.json()).result.protocolVersion).toBe("2025-11-25");
 
     await store.recordConsent(
       { path: "ui-session", userId: TENANT_A.userId, clientId: null },

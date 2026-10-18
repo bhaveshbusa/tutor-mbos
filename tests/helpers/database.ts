@@ -1,12 +1,7 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
-import {
-  applyMigrations,
-  loadMigrationFiles,
-  type MigrationManifest,
-} from "@/server/application/migration-runner";
-import { createPgAccessStore } from "@/server/application/access-store";
 import type { Sql, SqlConnection } from "@/server/application/sql";
+import { createSqlAccessStore } from "./sql-store";
 
 export function pgliteConnection(db: PGlite): SqlConnection {
   const wrap = (target: {
@@ -30,10 +25,52 @@ export function pgliteConnection(db: PGlite): SqlConnection {
   };
 }
 
-export function migrationManifest(): MigrationManifest {
-  return JSON.parse(
-    readFileSync("supabase/migrations/manifest.json", "utf8"),
-  ) as MigrationManifest;
+export function migrationFileNames(): string[] {
+  return readdirSync("supabase/migrations")
+    .filter((name) => name.endsWith(".sql"))
+    .sort();
+}
+
+const LEDGER = `
+create schema if not exists supabase_migrations;
+create table if not exists supabase_migrations.schema_migrations (
+  version text primary key,
+  statements text[],
+  name text
+);
+`;
+
+/**
+ * Applies reviewed SQL files in filename order, one transaction each, and
+ * records the Supabase CLI history shape. This is the test fixture. Hosted
+ * development uses `supabase db push`, which skips versions already recorded.
+ */
+export async function applyMigrationFiles(
+  connection: SqlConnection,
+  names: readonly string[] = migrationFileNames(),
+): Promise<string[]> {
+  await connection.exec(LEDGER);
+  const existing = await connection.query<{ version: string }>(
+    "select version from supabase_migrations.schema_migrations",
+  );
+  const recorded = new Set(existing.rows.map((row) => row.version));
+  const applied: string[] = [];
+  for (const file of names) {
+    const version = file.split("_")[0] ?? "";
+    if (recorded.has(version)) continue;
+    const name = file.slice(version.length + 1).replace(/\.sql$/, "");
+    const sql = readFileSync(`supabase/migrations/${file}`, "utf8");
+    await connection.transaction(async (tx) => {
+      await tx.exec(sql);
+      await tx.query(
+        `insert into supabase_migrations.schema_migrations
+           (version, statements, name) values ($1, $2, $3)`,
+        [version, [sql], name],
+      );
+    });
+    applied.push(version);
+  }
+  return applied;
 }
 
 export async function emptyDatabase(): Promise<{
@@ -48,14 +85,11 @@ export async function emptyDatabase(): Promise<{
 
 export async function migratedDatabase() {
   const { db, connection } = await emptyDatabase();
-  const manifest = migrationManifest();
-  const files = loadMigrationFiles("supabase/migrations", manifest);
-  await applyMigrations(connection, files, manifest.lockKey);
+  const applied = await applyMigrationFiles(connection);
   return {
     db,
     connection,
-    store: createPgAccessStore(connection),
-    manifest,
-    files,
+    store: createSqlAccessStore(connection),
+    applied,
   };
 }

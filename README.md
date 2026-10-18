@@ -11,6 +11,7 @@ A configurable multi-tenant tutoring system for students, batches, fees, assessm
 - [Cloud foundation and delivery](docs/cloud-foundation.md): layout, checks, environment variables, deployment
 - [Access contract](docs/contracts/access-v1.md)
 - [Release and migration policy](docs/release.md)
+- [Foundation transition](docs/foundation-transition.md)
 
 One owner per business. Cloud-only development, automated tests and development deployment. A separate demo account uses the production system as an isolated tenant. Development stays separate from production.
 

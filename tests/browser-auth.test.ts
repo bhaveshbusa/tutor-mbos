@@ -93,6 +93,66 @@ describe("browser authentication", () => {
       DEV_ORIGIN,
     );
     expect(login.status).toBe(403);
+    const loopback = await handleLogin(
+      new Request("http://localhost:3100/api/auth/login", {
+        method: "POST",
+        headers: { origin: "http://127.0.0.1:3100" },
+        body: new URLSearchParams({
+          email: "a@example.test",
+          password: "secret",
+        }),
+      }),
+      auth,
+      DEV_ORIGIN,
+    );
+    expect(loopback.status).toBe(303);
+    const otherPort = await handleLogin(
+      new Request("http://localhost:3100/api/auth/login", {
+        method: "POST",
+        headers: { origin: "http://127.0.0.1:9999" },
+        body: new URLSearchParams({
+          email: "a@example.test",
+          password: "secret",
+        }),
+      }),
+      auth,
+      DEV_ORIGIN,
+    );
+    expect(otherPort.status).toBe(403);
+    const opaque = await handleLogin(
+      new Request("http://localhost:3100/api/auth/login", {
+        method: "POST",
+        headers: {
+          origin: "null",
+          host: "127.0.0.1:3100",
+          "sec-fetch-site": "same-origin",
+        },
+        body: new URLSearchParams({
+          email: "a@example.test",
+          password: "secret",
+        }),
+      }),
+      auth,
+      DEV_ORIGIN,
+    );
+    expect(opaque.status).toBe(403);
+    const crossSite = await handleLogin(
+      new Request("http://localhost:3100/api/auth/login", {
+        method: "POST",
+        headers: {
+          origin: "null",
+          host: "127.0.0.1:3100",
+          "sec-fetch-site": "cross-site",
+        },
+        body: new URLSearchParams({
+          email: "a@example.test",
+          password: "secret",
+        }),
+      }),
+      auth,
+      DEV_ORIGIN,
+    );
+    expect(crossSite.status).toBe(403);
     const callback = await handleCallback(
       new Request(
         "https://example.test/auth/callback?code=abc&next=https://evil.example",

@@ -1,4 +1,4 @@
-# Access contract 2026-10-15
+# Access contract 2026-10-17
 
 Implementation owner: Cursor, for TOS-3. One owner changes this contract. UI, API and MCP call the same application functions and the same database policies.
 
@@ -6,14 +6,14 @@ Executable copy: `src/server/domain/access-contract.ts` and `src/server/domain/a
 
 ## Identity
 
-Supabase Auth issues sessions and OAuth 2.1 access tokens (authorization code with PKCE). This service does not issue tokens and does not hold a JWT secret or service-role key.
+Supabase Auth issues sessions and OAuth 2.1 access tokens (authorization code with PKCE). This service does not issue tokens and does not hold a JWT secret or service-role key. Verification uses `supabase.auth.getClaims()` and then `getUser()`.
 
 | Path | Presentation | Validation |
 | --- | --- | --- |
-| UI session | Supabase auth cookie | Asymmetric signature, issuer, audience, expiry, `role=authenticated`, no `client_id`, then Auth `GET /user` confirms the subject |
-| Delegated OAuth | `Authorization: Bearer` | Same signature checks, `client_id` required, then Auth `GET /user`, then the server grant |
+| UI session | Supabase auth cookie | `getClaims()` checks the signature and expiry. The app then requires issuer, audience, `role=authenticated`, and no `client_id`. `getUser()` confirms the subject |
+| Delegated OAuth | `Authorization: Bearer` | The same checks, with `client_id` required, then the server grant |
 
-A bearer token is never upgraded by a cookie. A token that has `client_id` is never an owner session. Audience must be `authenticated` or this deployment's MCP resource URL, and every audience value must be on that list. Supabase currently issues OAuth access tokens with audience `authenticated`. Accepting that audience on `/api/mcp` is a known deviation from RFC 8707 resource indicators. Delegated MCP calls still require `client_id` and a live grant. A hosted check must record whether issued tokens include the MCP resource audience; once they do, a later contract version requires that audience for MCP. An unknown signing key id refetches JWKS once, then waits 10 seconds before another miss refetch. Accepted algorithms are ES256 and RS256. HS256 and `none` are rejected. Clock skew is 5 seconds.
+A bearer token is never upgraded by a cookie. A token that has `client_id` is never an owner session. Audience must be `authenticated` or this deployment's MCP resource URL, and every audience value must be on that list. Supabase currently issues OAuth access tokens with audience `authenticated`. Accepting that audience on `/api/mcp` is a known deviation from RFC 8707 resource indicators. Delegated MCP calls still require `client_id` and a live grant. A hosted check must record whether issued tokens include the MCP resource audience; once they do, a later contract version requires that audience for MCP.
 
 ## Permissions
 
@@ -23,7 +23,7 @@ The UI session has all three permissions because it is the account owner. There 
 
 ## Tenancy
 
-One business per owner. Creation is idempotent: a later call returns the existing business and does not rename it or attach the account to a business id from the request. Similar names are distinct rows. Row level security, forced even for the table owner, ties every row to `app.auth_uid()`, a security-definer read of `auth.uid()` owned by the migration login. `app_request` is not granted schema `auth`. Delegated reads also require a live grant. The `app` schema is not exposed to the Data API (`supabase/config.toml` publishes only `public`). Hosted project settings must be checked separately, because they do not read `config.toml`. `anon` and the `authenticated` API role have no privileges on `app`. A JWT whose role claim is not `authenticated` sees no rows. Requests use `app_request` only.
+One business per owner. Creation is idempotent: a later call returns the existing business and does not rename it or attach the account to a business id from the request. Similar names are distinct rows. Row level security, forced even for the table owner, ties every row to `app.auth_uid()`, a security-definer read of `auth.uid()` owned by the migration login. Delegated reads also require a live grant. The Data API exposes `public` only (`supabase/config.toml`). The app calls security-invoker functions there, which run as `authenticated` under the existing policies. `anon` has no privilege on `app` or those functions. A JWT whose role claim is not `authenticated` sees no rows. Hosted project settings must keep `app` out of the exposed schemas; if that changes, the same policies still apply.
 
 ## Clients
 
@@ -31,7 +31,7 @@ One business per owner. Creation is idempotent: a later call returns the existin
 | --- | --- | --- |
 | Admin UI | First party | Cookie, origin must be the environment site |
 | HTTP API | Pre-registered public client, PKCE S256 | Bearer |
-| ChatGPT | Dynamic registration at Supabase | Bearer, protected-resource discovery |
+| A dynamically registered client | Dynamic registration at Supabase | Bearer, protected-resource discovery |
 | Another MCP client | Pre-registered or dynamic | Bearer, same discovery document |
 
 Consent is an explicit form. The stored client id comes from Supabase's authorization details, not from the form. Checked permissions are stored; unchecked and unknown values are not. The browser is redirected only to the HTTPS URL Supabase returns.

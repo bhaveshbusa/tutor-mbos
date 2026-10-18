@@ -2,8 +2,6 @@ import { createServerClient, parseCookieHeader } from "@supabase/ssr";
 import {
   acceptedAudiences,
   authIssuer,
-  inspectAppDatabaseUrl,
-  jwksUrl,
   protectedResourceMetadataUrl,
   siteOriginFor,
 } from "@/server/config/access";
@@ -13,55 +11,22 @@ import {
   type EnvSource,
 } from "@/server/config/environments";
 import {
-  verifyAccessTokenRefreshingKeys,
-  type JsonWebKey,
-} from "@/server/application/access-token";
+  confirmedUser,
+  verifySupabaseAccessToken,
+} from "@/server/application/verify-supabase-token";
+import {
+  createSupabaseAccessStore,
+  createUserSupabaseClient,
+} from "@/server/application/supabase-store";
 import { applySetCookies, serializeAuthCookie } from "./auth-cookies";
 import { revokeSupabaseOauthGrant } from "./consent";
-import { createPgAccessStore } from "@/server/application/access-store";
-import { pgConnection } from "@/server/application/pg-connection";
 import type { AccessDeps } from "./access";
 import { problemResponse } from "./problem";
-
-interface CachedJwks {
-  url: string;
-  keys: JsonWebKey[];
-  expiresAt: number;
-}
-
-let jwksCache: CachedJwks | null = null;
-const jwksMissState = { lastMissRefetchAt: 0 };
-
-export function resetJwksCache(): void {
-  jwksCache = null;
-  jwksMissState.lastMissRefetchAt = 0;
-}
-
-async function loadJwks(
-  url: string,
-  fetchImpl: typeof fetch,
-  force = false,
-): Promise<JsonWebKey[]> {
-  const now = Date.now();
-  if (!force && jwksCache && jwksCache.url === url && jwksCache.expiresAt > now)
-    return jwksCache.keys;
-  const response = await fetchImpl(url, {
-    headers: { accept: "application/json" },
-  });
-  if (!response.ok) throw new Error("jwks");
-  const body = (await response.json()) as { keys?: JsonWebKey[] };
-  if (!Array.isArray(body.keys)) throw new Error("jwks");
-  jwksCache = { url, keys: body.keys, expiresAt: now + 10 * 60 * 1000 };
-  return body.keys;
-}
 
 export function authConfigured(env: EnvSource): boolean {
   const runtime = loadRuntimeConfig(env);
   const key = env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
-  if (!runtime.ok || !key || looksLikeSecret(key)) return false;
-  const databaseUrl = env.TUTOR_MBOS_APP_DATABASE_URL;
-  if (!databaseUrl) return true;
-  return inspectAppDatabaseUrl(databaseUrl, runtime.config.environment).ok;
+  return Boolean(runtime.ok && key && !looksLikeSecret(key));
 }
 
 const SESSION_REFRESH_MARGIN_MS = 90_000;
@@ -129,55 +94,39 @@ export async function withAccess(
       "Supabase Auth is not configured for this deployment.",
     );
   }
-  const databaseUrl = env.TUTOR_MBOS_APP_DATABASE_URL;
-  if (
-    databaseUrl &&
-    !inspectAppDatabaseUrl(databaseUrl, runtime.config.environment).ok
-  ) {
-    return problemResponse(
-      503,
-      "Store unavailable",
-      "The business database connection is not the app runtime role for this environment.",
-    );
-  }
   const siteOrigin = siteOriginFor(runtime.config.environment);
-  const connection = databaseUrl ? pgConnection(databaseUrl) : null;
   const refreshedCookies: string[] = [];
   const deps: AccessDeps = {
     siteOrigin,
     resourceMetadataUrl: protectedResourceMetadataUrl(siteOrigin),
     now: () => new Date(),
-    store: connection ? createPgAccessStore(connection) : null,
+    storeFor: (accessToken) =>
+      createSupabaseAccessStore(
+        createUserSupabaseClient({
+          supabaseUrl: runtime.config.supabaseUrl,
+          publishableKey,
+          accessToken,
+          fetchImpl,
+        }),
+      ),
     authServer: {
-      async getUser(accessToken) {
-        try {
-          const response = await fetchImpl(
-            `${runtime.config.supabaseUrl}/auth/v1/user`,
-            {
-              headers: {
-                authorization: `Bearer ${accessToken}`,
-                apikey: publishableKey,
-              },
-            },
-          );
-          if (!response.ok) return null;
-          const body = (await response.json()) as { id?: unknown };
-          return typeof body.id === "string" ? { userId: body.id } : null;
-        } catch {
-          return "unavailable";
-        }
-      },
+      getUser: (accessToken) =>
+        confirmedUser(
+          runtime.config.supabaseUrl,
+          publishableKey,
+          accessToken,
+          fetchImpl,
+        ),
     },
-    async verify(token) {
-      return verifyAccessTokenRefreshingKeys(token, {
+    verify: (token) =>
+      verifySupabaseAccessToken({
+        token,
+        supabaseUrl: runtime.config.supabaseUrl,
+        publishableKey,
         issuer: authIssuer(runtime.config.supabaseUrl),
         audiences: acceptedAudiences(siteOrigin),
-        now: new Date(),
-        state: jwksMissState,
-        loadKeys: (force) =>
-          loadJwks(jwksUrl(runtime.config.supabaseUrl), fetchImpl, force),
-      });
-    },
+        fetchImpl,
+      }),
     revokeAuthGrant: async (sessionToken, clientId) => {
       const result = await revokeSupabaseOauthGrant(
         runtime.config.supabaseUrl,
@@ -202,11 +151,7 @@ export async function withAccess(
       return session.accessToken;
     },
   };
-  try {
-    return applySetCookies(await run(deps), refreshedCookies);
-  } finally {
-    await connection?.close();
-  }
+  return applySetCookies(await run(deps), refreshedCookies);
 }
 
 export async function readUiSession(
