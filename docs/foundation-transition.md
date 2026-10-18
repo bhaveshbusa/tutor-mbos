@@ -28,3 +28,21 @@ Compared with current `main` and the pre-TOS-3 tree `df683429b49d29e570bec9daa70
 `20261017220000_user_scoped_access.sql` grants `authenticated` the privileges the third applied file revoked, and adds the public functions the Data API calls. It does not drop roles, tables, or rows. `anon` still has no access to `app`. If the hosted Data API is later pointed at `app`, the same policies still hide other tenants and revoked grants.
 
 CI proves this on an empty database and on a database that already has a business row. It does not connect to the hosted project.
+
+## Hosted history and what is not proved yet
+
+The last development migration job that ran is [Deploy development run 39021652199](https://github.com/bhaveshbusa/tutor-mbos/actions/runs/39021652199), commit `74737aad42d4b8c71da4221d8df5dfecce6d3917`, on 17 October 2026. Its log says the migrations were already applied and prints the ledger:
+
+- `20261015120000` `tenant_security` `6c2b8d5fd737be6ae8e692544fde72ddc74c22d1392c1751982840a55e269eff`
+- `20261015121000` `restrict_delegated_access` `1dac10609dd055ef2dacad846e6431a7d2ef67125d28761f9a0c484489fa14e7`
+- `20261015122000` `review_access_fixes` `4a038b61668e97332c1983d950f6464ff9b4af06bbb589539fd6e3c171346355`
+
+Those checksums match the files in git. The old runner wrote `supabase_migrations.schema_migrations` (`version`, `statements`, `name`), which is the table `supabase db push` reads. Later development deploys [39054039678](https://github.com/bhaveshbusa/tutor-mbos/actions/runs/39054039678), [39068821624](https://github.com/bhaveshbusa/tutor-mbos/actions/runs/39068821624), [39071971070](https://github.com/bhaveshbusa/tutor-mbos/actions/runs/39071971070), and [39072594740](https://github.com/bhaveshbusa/tutor-mbos/actions/runs/39072594740) skipped the migration job. No manual *Migrate development* run is recorded. The forward file is not in that ledger. This session does not apply it ahead of merge, does not edit the three applied files, and does not reset or delete hosted data.
+
+CI run [39076405972](https://github.com/bhaveshbusa/tutor-mbos/actions/runs/39076405972) and the workspace `pnpm check` prove fail-closed browser forms, PGlite isolation and migration tests, and an official MCP SDK client against a local HTTP server. That client is the SDK, not a ChatGPT, Claude, or other named product connection. Named-product checks stay on TOS-7.
+
+Not proved, and not claimed: a successful development sign-in, recovery, or onboarding; a hosted Data API call under row level security; a delegated permission check on the hosted project; a hosted MCP connection. This workspace has no publishable key, migration URL, or Vercel token. Reading the `development` environment secrets returns 403, and the development alias is behind deployment protection. Those credentials stay in the protected environment. The post-merge development workflow is the path that applies the forward migration and smoke-tests the deployment.
+
+## Consent calls that stay
+
+`@supabase/auth-js` 2.117.3 covers the session, `getClaims`, and `getUser`. It has no method for the OAuth authorization-server resource. Supabase Auth remains that server (`authorization_url_path = /oauth/consent`). The app calls Auth's HTTP API: `GET` and `POST /auth/v1/oauth/authorizations/:id` and `DELETE /auth/v1/user/oauth/grants`. Business permissions are rows in `app.client_grants`, not OAuth scopes, so the consent form writes the grant and then posts Auth's approve or deny. Issuer, audience, role, and `client_id` checks sit on the verified claims. The loopback and `Origin: null` cookie check exists because `Referrer-Policy: no-referrer` makes Chromium send an opaque origin on the form POST. None of this is a second token parser, password hasher, or protocol engine.
