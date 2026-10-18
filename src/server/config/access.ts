@@ -2,7 +2,7 @@ import {
   ENVIRONMENT_BINDINGS,
   supabaseUrlFor,
   type DeploymentEnvironment,
-} from "./environments";
+} from "./environments.ts";
 
 export const SITE_ORIGINS: Record<DeploymentEnvironment, string> = {
   development: "https://tutor-mbos-dev-lets-play-game.vercel.app",

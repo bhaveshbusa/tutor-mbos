@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { inspectMigrationDatabaseUrl } from "@/server/config/access";
 import {
@@ -118,5 +119,26 @@ describe("migration ledger drift", () => {
         },
       ]),
     ).toMatchObject({ ok: false, code: "history_gap" });
+  });
+});
+
+describe("migration script under node", () => {
+  it("loads the same way the migration job runs it", () => {
+    const env = { ...process.env };
+    delete env.SUPABASE_MIGRATION_DATABASE_URL;
+    let stderr = "";
+    try {
+      execFileSync("node", ["scripts/migration-url.ts"], {
+        encoding: "utf8",
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      const failed = error as { status?: number; stderr?: string };
+      expect(failed.status).toBe(1);
+      stderr = failed.stderr ?? "";
+    }
+    expect(stderr).toContain("SUPABASE_MIGRATION_DATABASE_URL is required");
+    expect(stderr).not.toContain("ERR_MODULE_NOT_FOUND");
   });
 });
