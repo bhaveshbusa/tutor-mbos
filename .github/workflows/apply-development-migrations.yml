@@ -50,4 +50,4 @@ jobs:
       - name: Apply pending migrations with the Supabase CLI
         env:
           SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
-        run: pnpm exec supabase db push --db-url "$SUPABASE_MIGRATION_DATABASE_URL" --yes --skip-vault
+        run: node scripts/migration-url.ts --push

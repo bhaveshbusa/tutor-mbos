@@ -172,26 +172,68 @@ function rowsFromQuery(stdout: string): RecordedMigration[] | null {
 const LEDGER_SQL =
   "select version, name, statements from supabase_migrations.schema_migrations order by version";
 
+/**
+ * CLI 2.121.0 accepts a database URL only as `--db-url`. It does not read
+ * `SUPABASE_DB_URL`. The password travels in `PGPASSWORD`, which this CLI
+ * sends to Postgres, and the argument URL has no password.
+ */
+export function migrationCliInvocation(
+  databaseUrl: string,
+  mode: "query" | "push",
+): { args: string[]; env: NodeJS.ProcessEnv } {
+  const parsed = new URL(databaseUrl);
+  const password = decodePassword(parsed.password);
+  parsed.password = "";
+  const argsUrl = parsed.href.replace(/:\/\/([^/?#@]+):@/, "://$1@");
+  if (new URL(argsUrl).password) {
+    throw new Error(
+      "Refusing to pass the migration password on the command line.",
+    );
+  }
+  const args =
+    mode === "query"
+      ? [
+          "exec",
+          "supabase",
+          "db",
+          "query",
+          "--db-url",
+          argsUrl,
+          "--output-format",
+          "json",
+          LEDGER_SQL,
+        ]
+      : [
+          "exec",
+          "supabase",
+          "db",
+          "push",
+          "--db-url",
+          argsUrl,
+          "--yes",
+          "--skip-vault",
+        ];
+  return { args, env: { ...process.env, PGPASSWORD: password } };
+}
+
+function decodePassword(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 export function readRecordedMigrations(
   databaseUrl: string,
 ):
   | { ok: true; rows: RecordedMigration[] }
   | { ok: false; code: "missing" | "unreadable" } {
-  const result = spawnSync(
-    "pnpm",
-    [
-      "exec",
-      "supabase",
-      "db",
-      "query",
-      "--db-url",
-      databaseUrl,
-      "--output-format",
-      "json",
-      LEDGER_SQL,
-    ],
-    { encoding: "utf8" },
-  );
+  const invocation = migrationCliInvocation(databaseUrl, "query");
+  const result = spawnSync("pnpm", invocation.args, {
+    encoding: "utf8",
+    env: invocation.env,
+  });
   const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
   if (result.status !== 0) {
     if (
@@ -230,26 +272,49 @@ function main(): number {
     console.error(`::error::${diagnostic.message}`);
     return 1;
   }
-  if (!process.argv.includes("--ledger")) {
+  if (process.argv.includes("--ledger") && process.argv.includes("--push")) {
+    console.error("::error::Pass only one of --ledger or --push.");
+    return 1;
+  }
+  if (!process.argv.includes("--ledger") && !process.argv.includes("--push")) {
     console.log(`Migration URL accepted for the ${target} project.`);
     return 0;
   }
-  const recorded = readRecordedMigrations(diagnostic.databaseUrl);
+  if (!ledgerMatches(diagnostic.databaseUrl)) return 1;
+  if (!process.argv.includes("--push")) {
+    console.log("Recorded migration history matches the reviewed files.");
+    return 0;
+  }
+  const invocation = migrationCliInvocation(diagnostic.databaseUrl, "push");
+  const applied = spawnSync("pnpm", invocation.args, {
+    env: invocation.env,
+    stdio: "inherit",
+  });
+  if (applied.status !== 0) {
+    console.error(
+      "::error::supabase db push did not apply the pending migrations.",
+    );
+    return 1;
+  }
+  return 0;
+}
+
+function ledgerMatches(databaseUrl: string): boolean {
+  const recorded = readRecordedMigrations(databaseUrl);
   if (!recorded.ok) {
     console.error(
       "::error::The migration ledger could not be read. No migration was applied.",
     );
-    return 1;
+    return false;
   }
   const drift = migrationLedgerDrift(reviewedMigrationFiles(), recorded.rows);
   if (!drift.ok) {
     console.error(
       `::error::Recorded migration history does not match the reviewed files: ${drift.code}. No migration was applied.`,
     );
-    return 1;
+    return false;
   }
-  console.log("Recorded migration history matches the reviewed files.");
-  return 0;
+  return true;
 }
 
 if (

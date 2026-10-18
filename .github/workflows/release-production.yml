@@ -91,11 +91,34 @@ jobs:
             echo "::error::Production releases are disabled. Set PRODUCTION_RELEASES_ENABLED=true on the 'production' environment only after final sign-off."
             exit 1
           fi
+      - name: Require sign-off of this candidate and its migration set
+        env:
+          PRODUCTION_SIGNED_OFF_SHA: ${{ vars.PRODUCTION_SIGNED_OFF_SHA }}
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
+        run: |
+          if [ -z "$PRODUCTION_SIGNED_OFF_SHA" ] || [ "$PRODUCTION_SIGNED_OFF_SHA" != "$CANDIDATE_SHA" ]; then
+            echo "::error::Set PRODUCTION_SIGNED_OFF_SHA on the production environment to this candidate SHA only after signing off that commit and its migration set. Production SQL does not run until it matches."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.candidate.outputs.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup
+      - name: Require deployment credentials
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          if [ -z "$VERCEL_TOKEN" ]; then
+            echo "::error::Secret VERCEL_TOKEN is not set on the GitHub 'production' environment."
+            exit 1
+          fi
+      - name: Pull Vercel project settings and environment
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: pnpm dlx "vercel@${VERCEL_CLI_VERSION}" pull --yes --environment=production
+      - name: Verify deployment target binding
+        run: node scripts/assert-deploy-target.ts "$DEPLOY_ENVIRONMENT"
       - name: Require the production migration URL
         env:
           SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
@@ -118,21 +141,7 @@ jobs:
       - name: Apply the signed-off migration set before deploy
         env:
           SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
-        run: pnpm exec supabase db push --db-url "$SUPABASE_MIGRATION_DATABASE_URL" --yes --skip-vault
-      - name: Require deployment credentials
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-        run: |
-          if [ -z "$VERCEL_TOKEN" ]; then
-            echo "::error::Secret VERCEL_TOKEN is not set on the GitHub 'production' environment."
-            exit 1
-          fi
-      - name: Pull Vercel project settings and environment
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-        run: pnpm dlx "vercel@${VERCEL_CLI_VERSION}" pull --yes --environment=production
-      - name: Verify deployment target binding
-        run: node scripts/assert-deploy-target.ts "$DEPLOY_ENVIRONMENT"
+        run: node scripts/migration-url.ts --push
       - name: Build
         run: |
           export TUTOR_MBOS_BUILD_COMMIT="$(git rev-parse HEAD)"

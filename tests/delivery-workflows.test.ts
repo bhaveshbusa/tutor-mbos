@@ -399,8 +399,9 @@ describe("development migration recovery", () => {
       runs.indexOf("node scripts/migration-url.ts --ledger"),
     );
     expect(runs.indexOf("node scripts/migration-url.ts --ledger")).toBeLessThan(
-      runs.indexOf("pnpm exec supabase db push"),
+      runs.indexOf("node scripts/migration-url.ts --push"),
     );
+    expect(runs).not.toContain("--db-url");
     expect(runs).not.toContain("vercel");
   });
 
@@ -442,15 +443,25 @@ describe("production release", () => {
     const runs = (release.steps ?? []).map((s) => s.run ?? "").join("\n");
     expect(runs).toContain('"$PRODUCTION_RELEASES_ENABLED" != "true"');
     expect(runs.indexOf("PRODUCTION_RELEASES_ENABLED")).toBeLessThan(
-      runs.indexOf("pnpm exec supabase db push"),
+      runs.indexOf("PRODUCTION_SIGNED_OFF_SHA"),
     );
+    expect(runs.indexOf("PRODUCTION_SIGNED_OFF_SHA")).toBeLessThan(
+      runs.indexOf("VERCEL_TOKEN"),
+    );
+    expect(runs.indexOf("VERCEL_TOKEN")).toBeLessThan(
+      runs.indexOf("node scripts/migration-url.ts --push"),
+    );
+    expect(runs).not.toContain("--db-url");
     const releaseText = raw(`${WORKFLOW_DIR}/release-production.yml`);
     expect(releaseText.indexOf("MIGRATION_TARGET: production")).toBeLessThan(
-      releaseText.indexOf("pnpm exec supabase db push"),
+      releaseText.indexOf("node scripts/migration-url.ts --push"),
     );
-    expect(releaseText.indexOf("pnpm exec supabase db push")).toBeLessThan(
-      releaseText.indexOf("vercel@"),
-    );
+    expect(
+      releaseText.indexOf('vercel@"${VERCEL_CLI_VERSION}" pull'),
+    ).toBeLessThan(releaseText.indexOf("node scripts/migration-url.ts --push"));
+    expect(
+      releaseText.indexOf("node scripts/migration-url.ts --push"),
+    ).toBeLessThan(releaseText.indexOf("build --prod"));
   });
 
   it("requires the candidate to have passed the development deployment", () => {

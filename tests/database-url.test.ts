@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { inspectMigrationDatabaseUrl } from "@/server/config/access";
-import { migrationLedgerDrift } from "../scripts/migration-url";
+import {
+  migrationCliInvocation,
+  migrationLedgerDrift,
+} from "../scripts/migration-url";
 import { ENVIRONMENT_BINDINGS } from "@/server/config/environments";
 
 const devRef = ENVIRONMENT_BINDINGS.development.supabaseProjectRef;
@@ -60,6 +63,27 @@ describe("migration connection guards", () => {
         `postgresql://postgres.${devRef}:${password}@aws-0-eu-west-2.pooler.supabase.com:6543/postgres`,
       ),
     ).toMatchObject({ ok: false, code: "transaction_pooler" });
+  });
+});
+
+describe("migration CLI invocation", () => {
+  it("puts the password in PGPASSWORD and leaves it out of the arguments", () => {
+    const password = "p@ss:word";
+    const url = `postgresql://postgres.${devRef}:${encodeURIComponent(password)}@db.${devRef}.supabase.co:5432/postgres`;
+    for (const mode of ["query", "push"] as const) {
+      const invocation = migrationCliInvocation(url, mode);
+      expect(invocation.args.join("\n")).not.toContain(password);
+      expect(invocation.args.join("\n")).not.toContain(
+        encodeURIComponent(password),
+      );
+      expect(
+        new URL(invocation.args[invocation.args.indexOf("--db-url") + 1]!)
+          .password,
+      ).toBe("");
+      expect(invocation.env.PGPASSWORD).toBe(password);
+    }
+    const push = migrationCliInvocation(url, "push");
+    expect(push.args).toContain("--skip-vault");
   });
 });
 

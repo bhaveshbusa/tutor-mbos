@@ -69,6 +69,7 @@ Rules enforced by `src/server/config/environments.ts` and the deployment workflo
 | GitHub → Settings → Environments → `development` → Secrets | `VERCEL_AUTOMATION_BYPASS_SECRET` | Owner. Smoke-test fallback when the Vercel API lookup is unavailable. Copy the project's existing Protection Bypass for Automation value. Do not generate a new secret. |
 | GitHub environment variables (optional) | `SMOKE_ALIAS_URL` | Stable alias (e.g. `https://<project>.vercel.app`) re-checked after promotion |
 | GitHub → Settings → Environments → `production` → Variables | `PRODUCTION_RELEASES_ENABLED=true` | Owner, only after final sign-off |
+| GitHub → Settings → Environments → `production` → Variables | `PRODUCTION_SIGNED_OFF_SHA` equal to the candidate SHA | Owner, with that candidate's migration set. Coding agents must not set it. |
 
 Agent workspaces, pull request workflows and the repository never hold these values.
 
@@ -95,7 +96,7 @@ The Vercel projects and Supabase projects already exist. Do not recreate them.
 1. Reusable CI (all checks above).
 2. Name-only preflight on project `prj_ysIJHdIKYk2MQwvOKermUvIMuGVa`: require `VERCEL_TOKEN`, `vercel pull`, then `scripts/assert-deploy-target.ts development`. The linked team and project must match the development binding, and `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` must be present by name. If the token or the key is absent, the workflow stops before migrations, build, deploy and promotion and names the setup location.
 3. A read-only check compares migration inputs with the last successful *Deploy development* commit. The inputs and the fail-closed cases are in `docs/release.md`. Manual dispatch always runs migrations. The check uses the workflow token and no deployment environment.
-4. Development migrations, only when that check requests them, through `.github/workflows/apply-development-migrations.yml`. The caller passes `SUPABASE_MIGRATION_DATABASE_URL` by name. The job stops before SQL when it is absent. A URL check runs before `supabase db push`. A failed migration does not deploy.
+4. Development migrations, only when that check requests them, through `.github/workflows/apply-development-migrations.yml`. The caller passes `SUPABASE_MIGRATION_DATABASE_URL` by name. The job stops before SQL when it is absent. A URL check and ledger compare run before `node scripts/migration-url.ts --push`. The password stays in `PGPASSWORD`. A failed migration does not deploy.
 5. `vercel pull` again, then the same target check, so the build uses the reviewed project settings.
 6. `vercel build --prod` in CI (no `VERCEL_TOKEN`), then a secret scan of `.vercel/output`.
 7. `vercel deploy --prebuilt --prod --skip-domain` to `tutor-mbos-dev`. This creates the deployment without moving traffic. Development uses that project's main target because the project only ever holds synthetic data.
@@ -136,9 +137,11 @@ Configured, and not yet observed on a live pull request: automation [auto-8e10e6
 3. Reusable CI passes for the candidate.
 4. Approval on the protected `production` GitHub environment.
 5. `PRODUCTION_RELEASES_ENABLED=true` on that environment.
-6. Linked project is `tutor-mbos` (`prj_Ibov9zZm4KOvga3pWUQ83pInPJfQ`) and runtime variables match the production binding.
-7. Artifact secret scan, then `vercel deploy --prebuilt --prod --skip-domain` (no traffic moved).
-8. Smoke test of that deployment expecting `environment: production`, then `vercel promote`, then an optional re-check of `SMOKE_ALIAS_URL`. A failed smoke test leaves the current production deployment serving traffic.
+6. `PRODUCTION_SIGNED_OFF_SHA` on that environment equals `candidate_sha`.
+7. `VERCEL_TOKEN` is present, `vercel pull` succeeds, and the linked project is `tutor-mbos` (`prj_Ibov9zZm4KOvga3pWUQ83pInPJfQ`) before any SQL.
+8. The ledger matches the reviewed files, then those files are applied, then the production build starts.
+9. Artifact secret scan, then `vercel deploy --prebuilt --prod --skip-domain` (no traffic moved).
+10. Smoke test of that deployment expecting `environment: production`, then `vercel promote`, then an optional re-check of `SMOKE_ALIAS_URL`. A failed smoke test leaves the current production deployment serving traffic.
 
 The initial production release waits for final sign-off (see `AGENTS.md`).
 
