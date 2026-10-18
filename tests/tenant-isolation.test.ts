@@ -180,6 +180,40 @@ describe("tenant isolation", () => {
     ).rejects.toThrow(/permission denied/);
   });
 
+  it("does not let one delegated client read another client's grant", async () => {
+    const { store } = await seed();
+    await store.recordConsent(ui(TENANT_A.userId), {
+      oauthClientId: CHATGPT_CLIENT,
+      permissions: ["business.read"],
+      scopes: ["openid"],
+      authorizationId: "authz-a-redirect",
+      decision: "approved",
+      redirectUri: "https://client-a.example/callback",
+    });
+    await store.recordConsent(ui(TENANT_A.userId), {
+      oauthClientId: API_CLIENT,
+      permissions: ["reports.read"],
+      scopes: ["openid"],
+      authorizationId: "authz-api-redirect",
+      decision: "approved",
+      redirectUri: "https://client-b.example/callback",
+    });
+    const other = await store.readGrant(
+      delegated(TENANT_A.userId, CHATGPT_CLIENT),
+      API_CLIENT,
+    );
+    expect(other).toBeNull();
+    expect(
+      await store.listLiveGrantRedirects(
+        delegated(TENANT_A.userId, CHATGPT_CLIENT),
+      ),
+    ).toEqual(["https://client-a.example/callback"]);
+    expect(await store.listLiveGrantRedirects(ui(TENANT_A.userId))).toEqual([
+      "https://client-a.example/callback",
+      "https://client-b.example/callback",
+    ]);
+  });
+
   it("rejects a store that returns another owner's business", async () => {
     const evil: AccessStore = {
       async createBusiness() {

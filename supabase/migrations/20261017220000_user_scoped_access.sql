@@ -23,6 +23,14 @@ alter function app.create_business(text, text) security definer;
 alter function app.record_client_consent(text, text[], text[], text, text, text) security definer;
 alter function app.revoke_client_grant(text) security definer;
 
+create policy grants_client_scope on app.client_grants
+  as restrictive for select
+  to authenticated
+  using (
+    (app.auth_jwt() ->> 'client_id') is null
+    or oauth_client_id = (app.auth_jwt() ->> 'client_id')
+  );
+
 revoke all on schema app from anon;
 revoke all on all tables in schema app from anon;
 revoke all on all functions in schema app from anon;
