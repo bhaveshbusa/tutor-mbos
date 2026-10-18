@@ -141,6 +141,7 @@ jobs:
       - name: Apply the signed-off migration set before deploy
         env:
           SUPABASE_MIGRATION_DATABASE_URL: ${{ secrets.SUPABASE_MIGRATION_DATABASE_URL }}
+          MIGRATION_TARGET: production
         run: node scripts/migration-url.ts --push
       - name: Build
         run: |

@@ -452,6 +452,10 @@ describe("production release", () => {
       runs.indexOf("node scripts/migration-url.ts --push"),
     );
     expect(runs).not.toContain("--db-url");
+    const push = (release.steps ?? []).find((step) =>
+      (step.run ?? "").includes("node scripts/migration-url.ts --push"),
+    );
+    expect(push?.env?.MIGRATION_TARGET).toBe("production");
     const releaseText = raw(`${WORKFLOW_DIR}/release-production.yml`);
     expect(releaseText.indexOf("MIGRATION_TARGET: production")).toBeLessThan(
       releaseText.indexOf("node scripts/migration-url.ts --push"),
