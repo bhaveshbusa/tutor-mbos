@@ -110,7 +110,7 @@ To rerun the whole sequence: GitHub → Actions → *Deploy development* → *Ru
 
 ## What was removed
 
-Hosted acceptance workflows and the custom runtime-role provisioner are gone. See `docs/foundation-transition.md`. Do not add them back.
+Hosted acceptance workflows and the custom runtime-role provisioner are gone. See `docs/foundation-transition.md`. Do not add them back. A manual *Foundation hosted check* workflow may read the existing development receiving key and the deployment's automation bypass. It does not deploy, migrate, or schedule itself.
 
 ## Unattended delivery
 

@@ -20,7 +20,7 @@ Compared with current `main` and the pre-TOS-3 tree `df683429b49d29e570bec9daa70
 ## Remove
 
 - The custom JWT parser, SCRAM password builder, `app_runtime` provisioning, and the migration runner.
-- Hosted acceptance, mail, authorization, and the run-specific cleanup workflow and scripts.
+- Hosted acceptance, mail, authorization, and the run-specific cleanup workflow and scripts. The manual `foundation-hosted-check` workflow is not that harness. It reuses the existing development environment, the existing receiving key, and the official MCP SDK. It does not restore the acceptance orchestrator, cleanup state, or admin key.
 - `TUTOR_MBOS_APP_DATABASE_URL` as a request credential. An existing copy can stay; the app does not read it.
 
 ## Forward database change
