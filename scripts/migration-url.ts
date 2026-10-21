@@ -9,6 +9,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { inspectMigrationDatabaseUrl } from "../src/server/config/access.ts";
 import type { DeploymentEnvironment } from "../src/server/config/environments.ts";
+import { splitAndTrim } from "./sql-split.ts";
 
 export const MIGRATION_URL_REJECTION_CODES = [
   "invalid",
@@ -69,22 +70,68 @@ export interface ReviewedMigrationFile {
   version: string;
   name: string;
   sha256: string;
+  /** Exact file text. Present for files read from disk. */
+  text?: string;
 }
 
 export interface RecordedMigration {
   version: string;
   name: string | null;
   sha256: string;
+  /** Statement list from the ledger, when the query returned one. */
+  statements?: readonly string[];
 }
 
 export type LedgerDriftCode =
   "unknown_version" | "checksum_mismatch" | "name_mismatch" | "history_gap";
 
+export interface LedgerDrift {
+  ok: false;
+  code: LedgerDriftCode;
+  /** Safe diagnostic. Never includes SQL, a URL, or a secret. */
+  detail?: string;
+}
+
+/**
+ * A recorded statement list matches a reviewed file when the statements
+ * concatenate to the file bytes, or when they are the list CLI 2.121.0 stores.
+ * That CLI list is `splitAndTrim`: semicolons and surrounding whitespace are
+ * dropped, and dollar-quoted bodies stay intact. A different statement body
+ * does not match.
+ */
+export function recordedStatementsMatch(
+  fileText: string,
+  statements: readonly string[],
+):
+  | { ok: true }
+  | { ok: false; recorded: number; reviewed: number; index?: number } {
+  if (statements.join("") === fileText) return { ok: true };
+  const expected = splitAndTrim(fileText);
+  if (statements.length !== expected.length) {
+    return {
+      ok: false,
+      recorded: statements.length,
+      reviewed: expected.length,
+    };
+  }
+  for (let index = 0; index < expected.length; index += 1) {
+    if (statements[index] !== expected[index]) {
+      return {
+        ok: false,
+        recorded: statements.length,
+        reviewed: expected.length,
+        index,
+      };
+    }
+  }
+  return { ok: true };
+}
+
 /** Recorded rows must be a checksum-matched prefix of the reviewed files. */
 export function migrationLedgerDrift(
   files: readonly ReviewedMigrationFile[],
   recorded: readonly RecordedMigration[],
-): { ok: true } | { ok: false; code: LedgerDriftCode } {
+): { ok: true } | LedgerDrift {
   const byVersion = new Map(recorded.map((row) => [row.version, row]));
   const expected = new Set(files.map((file) => file.version));
   for (const version of byVersion.keys()) {
@@ -103,8 +150,26 @@ export function migrationLedgerDrift(
     const file = files[index]!;
     const row = byVersion.get(file.version)!;
     if (row.name !== file.name) return { ok: false, code: "name_mismatch" };
+    const statements = row.statements;
+    if (statements && file.text !== undefined) {
+      const match = recordedStatementsMatch(file.text, statements);
+      if (!match.ok) {
+        const at =
+          match.index === undefined ? "" : ` statement_index=${match.index}`;
+        return {
+          ok: false,
+          code: "checksum_mismatch",
+          detail: `version=${file.version} recorded_statements=${match.recorded} reviewed_statements=${match.reviewed}${at}`,
+        };
+      }
+      continue;
+    }
     if (row.sha256 !== file.sha256) {
-      return { ok: false, code: "checksum_mismatch" };
+      return {
+        ok: false,
+        code: "checksum_mismatch",
+        detail: `version=${file.version}`,
+      };
     }
   }
   return { ok: true };
@@ -119,10 +184,9 @@ export function reviewedMigrationFiles(
     .map((filename) => {
       const version = filename.slice(0, 14);
       const name = filename.slice(15, -4);
-      const sha256 = createHash("sha256")
-        .update(readFileSync(`${directory}/${filename}`))
-        .digest("hex");
-      return { version, name, sha256 };
+      const bytes = readFileSync(`${directory}/${filename}`);
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      return { version, name, sha256, text: bytes.toString("utf8") };
     });
 }
 
@@ -138,7 +202,9 @@ function statementsHash(statements: unknown): string | null {
   return createHash("sha256").update(text).digest("hex");
 }
 
-function rowsFromQuery(stdout: string): RecordedMigration[] | null {
+export function parseRecordedMigrations(
+  stdout: string,
+): RecordedMigration[] | null {
   const start = stdout.indexOf("[");
   const end = stdout.lastIndexOf("]");
   if (start < 0 || end < start) return null;
@@ -160,10 +226,16 @@ function rowsFromQuery(stdout: string): RecordedMigration[] | null {
     if (typeof record.version !== "string") return null;
     const sha256 = statementsHash(record.statements);
     if (!sha256) return null;
+    const statements = Array.isArray(record.statements)
+      ? record.statements.every((part) => typeof part === "string")
+        ? record.statements
+        : undefined
+      : undefined;
     rows.push({
       version: record.version,
       name: typeof record.name === "string" ? record.name : null,
       sha256,
+      ...(statements ? { statements } : {}),
     });
   }
   return rows;
@@ -245,7 +317,7 @@ export function readRecordedMigrations(
     }
     return { ok: false, code: "unreadable" };
   }
-  const rows = rowsFromQuery(result.stdout ?? "");
+  const rows = parseRecordedMigrations(result.stdout ?? "");
   if (!rows) return { ok: false, code: "unreadable" };
   return { ok: true, rows };
 }
@@ -309,8 +381,9 @@ function ledgerMatches(databaseUrl: string): boolean {
   }
   const drift = migrationLedgerDrift(reviewedMigrationFiles(), recorded.rows);
   if (!drift.ok) {
+    const detail = drift.detail ? ` ${drift.detail}` : "";
     console.error(
-      `::error::Recorded migration history does not match the reviewed files: ${drift.code}. No migration was applied.`,
+      `::error::Recorded migration history does not match the reviewed files: ${drift.code}${detail}. No migration was applied.`,
     );
     return false;
   }
