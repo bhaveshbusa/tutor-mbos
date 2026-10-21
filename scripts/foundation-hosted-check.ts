@@ -183,7 +183,9 @@ async function signIn(
   await page.getByRole("button", { name: "Sign in" }).click();
   const response = await pending;
   if (response.status() === 303) {
-    await page.waitForURL(/\/onboarding$/, { timeout: 20_000 }).catch(() => undefined);
+    await page
+      .waitForURL(/\/onboarding$/, { timeout: 20_000 })
+      .catch(() => undefined);
   }
   return response.status();
 }
