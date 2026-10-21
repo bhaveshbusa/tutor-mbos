@@ -2,7 +2,10 @@
  * Development-only proof for the current foundation.
  * Runs from the protected GitHub development environment. It creates its
  * own synthetic users, reads their mail through the existing Resend
- * receiving key, and prints case ids only.
+ * receiving key, and prints case ids only. Direct table writes are proved
+ * by the database tests. Auth self-delete may be unsupported, so
+ * cleanup.auth_users records the observed HTTP status and synthetic
+ * accounts can remain.
  */
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -108,26 +111,6 @@ export function trustedSupabaseUrl(
   } catch {
     return null;
   }
-}
-
-/**
- * A missing `app` schema is not proof that INSERT was denied. Privilege
- * denial is a pass. Schema rejection is only a gap.
- */
-export function classifyDirectInsert(status: number): {
-  status: "pass" | "fail" | "gap";
-  detail: string;
-} {
-  if (status === 200 || status === 201) {
-    return { status: "fail", detail: `http_${status}` };
-  }
-  if (status === 401 || status === 403) {
-    return { status: "pass", detail: "privilege_denied" };
-  }
-  if (status === 404 || status === 406) {
-    return { status: "gap", detail: "schema_not_exposed" };
-  }
-  return { status: "fail", detail: `http_${status}` };
 }
 
 function mask(value: string | undefined): void {
@@ -577,24 +560,8 @@ async function main(): Promise<number> {
         isolated ? "pass" : "fail",
         isolated ? "distinct" : `http_${readA.status}`,
       );
-      const write = await jsonFetch(`${SUPABASE}/rest/v1/businesses`, {
-        method: "POST",
-        headers: {
-          ...authHeaders(publishableKey),
-          authorization: `Bearer ${tokenA}`,
-          "content-profile": "app",
-          "accept-profile": "app",
-        },
-        body: JSON.stringify({
-          display_name: "raw",
-          owner_user_id: "00000000-0000-4000-8000-000000000000",
-        }),
-      });
-      const insert = classifyDirectInsert(write.status);
-      record("data_api.direct_insert", insert.status, insert.detail);
     } else {
       record("data_api.tenant_isolation", "fail", "token_or_business_missing");
-      record("data_api.direct_insert", "fail", "token_missing");
     }
 
     const reader = await registerClient(
@@ -869,9 +836,12 @@ async function main(): Promise<number> {
       error instanceof Error ? error.name : "error",
     );
   } finally {
-    let removed = 0;
+    const cleanupStatuses: string[] = [];
     for (const token of [cleanupA, cleanupB]) {
-      if (!token) continue;
+      if (!token) {
+        cleanupStatuses.push("absent");
+        continue;
+      }
       const deleted = await jsonFetch(`${SUPABASE}/auth/v1/user`, {
         method: "DELETE",
         headers: {
@@ -879,12 +849,15 @@ async function main(): Promise<number> {
           authorization: `Bearer ${token}`,
         },
       }).catch(() => ({ status: 0, json: null, location: "" }));
-      if (deleted.status === 200 || deleted.status === 204) removed += 1;
+      cleanupStatuses.push(`http_${deleted.status}`);
     }
+    const removed = cleanupStatuses.filter(
+      (status) => status === "http_200" || status === "http_204",
+    ).length;
     record(
       "cleanup.auth_users",
       removed === 2 ? "pass" : "gap",
-      `deleted_${removed}`,
+      cleanupStatuses.join("_"),
     );
     record("cleanup.oauth_clients", "gap", "left_registered");
     await browser.close().catch(() => undefined);
