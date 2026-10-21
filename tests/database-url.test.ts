@@ -1,10 +1,16 @@
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { inspectMigrationDatabaseUrl } from "@/server/config/access";
 import {
   migrationCliInvocation,
   migrationLedgerDrift,
+  parseRecordedMigrations,
+  recordedStatementsMatch,
+  reviewedMigrationFiles,
+  type RecordedMigration,
 } from "../scripts/migration-url";
+import { splitAndTrim } from "../scripts/sql-split";
 import { ENVIRONMENT_BINDINGS } from "@/server/config/environments";
 
 const devRef = ENVIRONMENT_BINDINGS.development.supabaseProjectRef;
@@ -119,6 +125,71 @@ describe("migration ledger drift", () => {
         },
       ]),
     ).toMatchObject({ ok: false, code: "history_gap" });
+  });
+
+  it("accepts the CLI statement list for the applied forward file and rejects a different body", () => {
+    const files = reviewedMigrationFiles();
+    expect(files.map((file) => file.version)).toEqual([
+      "20261015120000",
+      "20261015121000",
+      "20261015122000",
+      "20261017220000",
+    ]);
+    const recorded: RecordedMigration[] = files.map((file) => {
+      const statements =
+        file.version === "20261017220000"
+          ? splitAndTrim(file.text ?? "")
+          : [file.text ?? ""];
+      return {
+        version: file.version,
+        name: file.name,
+        sha256: createHash("sha256").update(statements.join("")).digest("hex"),
+        statements,
+      };
+    });
+    const forward = recorded[3]!;
+    expect(forward.sha256).not.toBe(files[3]!.sha256);
+    expect(forward.statements?.join("")).not.toBe(files[3]!.text);
+    expect(
+      forward.statements?.some(
+        (statement) =>
+          statement.includes("anon_has_app_usage") &&
+          statement.includes("authenticated_can_write_app_tables"),
+      ),
+    ).toBe(true);
+    expect(migrationLedgerDrift(files, recorded)).toEqual({ ok: true });
+
+    const parsed = parseRecordedMigrations(JSON.stringify(recorded));
+    expect(parsed).not.toBeNull();
+    expect(migrationLedgerDrift(files, parsed!)).toEqual({ ok: true });
+
+    const changed = recorded.map((row, index) =>
+      index === 3
+        ? {
+            ...row,
+            statements: row.statements?.map((statement) =>
+              statement.includes("anon_has_app_usage")
+                ? statement.replace("anon_has_app_usage", "anon_missing")
+                : statement,
+            ),
+          }
+        : row,
+    );
+    expect(migrationLedgerDrift(files, changed)).toMatchObject({
+      ok: false,
+      code: "checksum_mismatch",
+      detail: expect.stringContaining("version=20261017220000"),
+    });
+
+    const spaced = `${files[3]!.text}\n\n`;
+    expect(recordedStatementsMatch(spaced, forward.statements!)).toEqual({
+      ok: true,
+    });
+    expect(
+      recordedStatementsMatch(spaced.replace("grant usage", "revoke usage"), [
+        ...forward.statements!,
+      ]),
+    ).toMatchObject({ ok: false });
   });
 });
 
