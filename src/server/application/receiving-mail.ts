@@ -253,7 +253,9 @@ export async function readReceivedVerifyLink(input: {
   }
   const attempts = input.attempts ?? 1;
   const delayMs = input.delayMs ?? 0;
-  const sleep = input.sleep ?? (async () => undefined);
+  const sleep =
+    input.sleep ??
+    ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   let last: ReceivedVerifyLink = { status: "not_received" };
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     if (attempt > 0) await sleep(delayMs);

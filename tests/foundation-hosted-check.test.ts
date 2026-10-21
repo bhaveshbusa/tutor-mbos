@@ -5,12 +5,14 @@ import { siteOriginFor } from "@/server/config/access";
 import {
   DEVELOPMENT_SITE,
   businessesAreIsolated,
+  classifyDirectInsert,
   grantRows,
   hostedCheckAllowed,
   publishableKeyFromPulled,
   revokedReadDenied,
   syntheticPassword,
   syntheticRecipient,
+  trustedSupabaseUrl,
 } from "../scripts/foundation-hosted-check";
 
 describe("foundation hosted check helpers", () => {
@@ -67,6 +69,31 @@ describe("foundation hosted check helpers", () => {
     expect(grantRows([{ oauth_client_id: "client-a" }])).toEqual(["client-a"]);
     expect(revokedReadDenied(403, { detail: "forbidden" })).toBe(true);
     expect(revokedReadDenied(200, { business: { id: "x" } })).toBe(false);
+  });
+
+  it("does not treat a hidden schema as a denied insert", () => {
+    expect(classifyDirectInsert(201)).toEqual({
+      status: "fail",
+      detail: "http_201",
+    });
+    expect(classifyDirectInsert(403)).toEqual({
+      status: "pass",
+      detail: "privilege_denied",
+    });
+    expect(classifyDirectInsert(406)).toEqual({
+      status: "gap",
+      detail: "schema_not_exposed",
+    });
+  });
+
+  it("rejects an authorization endpoint on another origin", () => {
+    const origin = "https://idvzjqrkgnihvxoswuxu.supabase.co";
+    expect(
+      trustedSupabaseUrl(`${origin}/auth/v1/oauth/authorize`, origin)?.pathname,
+    ).toBe("/auth/v1/oauth/authorize");
+    expect(
+      trustedSupabaseUrl("https://evil.example/authorize", origin),
+    ).toBeNull();
   });
 });
 

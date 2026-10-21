@@ -154,6 +154,38 @@ describe("receiving mail", () => {
     expect(RECEIVING_API_ORIGIN).toBe("https://api.resend.com");
   });
 
+  it("waits before reading the list again", async () => {
+    let lists = 0;
+    const started = Date.now();
+    const fetchImpl = (async (input: URL) => {
+      if (input.pathname === "/emails/receiving") {
+        lists += 1;
+        const data = lists === 1 ? [] : [listed()];
+        return new Response(JSON.stringify({ data, has_more: false }), {
+          status: 200,
+        });
+      }
+      return new Response(
+        JSON.stringify({ ...listed(), html: verifyUrl("signup"), text: "" }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+    const result = await readReceivedVerifyLink({
+      fetchImpl,
+      apiKey: "re_test",
+      recipient,
+      purpose: "confirmation",
+      startedAt,
+      nowMs,
+      supabaseOrigin: supabase,
+      siteOrigin: site,
+      attempts: 2,
+      delayMs: 50,
+    });
+    expect(result.status).toBe("ready");
+    expect(Date.now() - started).toBeGreaterThanOrEqual(45);
+  });
+
   it("does not call Resend when the key is absent", async () => {
     let called = false;
     const result = await readReceivedVerifyLink({

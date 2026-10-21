@@ -96,6 +96,40 @@ export function revokedReadDenied(status: number, body: unknown): boolean {
   return !JSON.stringify(body ?? {}).includes('"id"');
 }
 
+/** A foreign discovery URL must not receive the signed-in browser. */
+export function trustedSupabaseUrl(
+  value: string | undefined,
+  origin: string,
+): URL | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    return url.origin === origin ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A missing `app` schema is not proof that INSERT was denied. Privilege
+ * denial is a pass. Schema rejection is only a gap.
+ */
+export function classifyDirectInsert(status: number): {
+  status: "pass" | "fail" | "gap";
+  detail: string;
+} {
+  if (status === 200 || status === 201) {
+    return { status: "fail", detail: `http_${status}` };
+  }
+  if (status === 401 || status === 403) {
+    return { status: "pass", detail: "privilege_denied" };
+  }
+  if (status === 404 || status === 406) {
+    return { status: "gap", detail: "schema_not_exposed" };
+  }
+  return { status: "fail", detail: `http_${status}` };
+}
+
 function mask(value: string | undefined): void {
   if (value && process.env.GITHUB_ACTIONS === "true") {
     console.log(`::add-mask::${value}`);
@@ -321,11 +355,15 @@ async function authorize(
     authorization_endpoint?: string;
     token_endpoint?: string;
   };
-  if (!record?.authorization_endpoint || !record.token_endpoint) return null;
+  const authorizeUrl = trustedSupabaseUrl(
+    record?.authorization_endpoint,
+    SUPABASE,
+  );
+  const tokenUrl = trustedSupabaseUrl(record?.token_endpoint, SUPABASE);
+  if (!authorizeUrl || !tokenUrl) return null;
   const verifier = randomBytes(32).toString("base64url");
   const challenge = createHash("sha256").update(verifier).digest("base64url");
   mask(verifier);
-  const authorizeUrl = new URL(record.authorization_endpoint);
   authorizeUrl.searchParams.set("response_type", "code");
   authorizeUrl.searchParams.set("client_id", clientId);
   authorizeUrl.searchParams.set("redirect_uri", REDIRECT);
@@ -336,6 +374,7 @@ async function authorize(
   authorizeUrl.searchParams.set("resource", `${SITE}/api/mcp`);
   await page.goto(authorizeUrl.toString(), { waitUntil: "domcontentloaded" });
   await page.waitForURL(/\/oauth\/consent\?/, { timeout: 20_000 });
+  if (new URL(page.url()).origin !== SITE) return null;
   await page
     .locator("input[value='business.read']")
     .setChecked(permissions.includes("business.read"));
@@ -356,7 +395,7 @@ async function authorize(
   const code = new URL(location, SITE).searchParams.get("code");
   if (!code) return null;
   mask(code);
-  const token = await jsonFetch(record.token_endpoint, {
+  const token = await jsonFetch(tokenUrl.toString(), {
     method: "POST",
     headers: {
       "content-type": "application/x-www-form-urlencoded",
@@ -551,14 +590,11 @@ async function main(): Promise<number> {
           owner_user_id: "00000000-0000-4000-8000-000000000000",
         }),
       });
-      record(
-        "data_api.direct_write_denied",
-        write.status !== 200 && write.status !== 201 ? "pass" : "fail",
-        `http_${write.status}`,
-      );
+      const insert = classifyDirectInsert(write.status);
+      record("data_api.direct_insert", insert.status, insert.detail);
     } else {
       record("data_api.tenant_isolation", "fail", "token_or_business_missing");
-      record("data_api.direct_write_denied", "fail", "token_missing");
+      record("data_api.direct_insert", "fail", "token_missing");
     }
 
     const reader = await registerClient(
@@ -680,7 +716,11 @@ async function main(): Promise<number> {
       }
       const revoke = await pageA.request.post(`${SITE}/api/v1/grants/revoke`, {
         data: { clientId: reader },
-        headers: { origin: SITE, accept: "application/json" },
+        headers: {
+          origin: SITE,
+          accept: "application/json",
+          "x-vercel-protection-bypass": bypass.value!,
+        },
       });
       record(
         "app.revoke",
