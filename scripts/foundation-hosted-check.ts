@@ -12,7 +12,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { chromium, type BrowserContext, type Page } from "@playwright/test";
 import { parseDotenv } from "./assert-deploy-target.ts";
 import { resolveProtectionBypass } from "./smoke-health.ts";
@@ -113,33 +113,121 @@ export function trustedSupabaseUrl(
   }
 }
 
+/** Every case a full run reports. Unreached ones are failed, never omitted. */
+export const HOSTED_CASES = [
+  "hosted.health",
+  "mail.confirmation",
+  "browser.login",
+  "browser.onboarding",
+  "browser.onboarding_retry",
+  "data_api.tenant_isolation",
+  "mcp.consent",
+  "data_api.cross_client_grant_hidden",
+  "app.reports_only_business_denied",
+  "mcp.discovery",
+  "mcp.permitted_call",
+  "app.revoke",
+  "app.revoked_read",
+  "data_api.delegated_raw_denied_after_revoke",
+  "mcp.revoked_call",
+  "browser.recovery",
+  "mail.recovery",
+  "browser.password_updated",
+  "browser.old_password_rejected",
+  "browser.new_password_login",
+  "cleanup.auth_users",
+  "cleanup.oauth_clients",
+] as const;
+
+export function unreachedCases(rows: { id: string }[]): string[] {
+  const seen = new Set(rows.map((row) => row.id));
+  return HOSTED_CASES.filter((id) => !seen.has(id));
+}
+
+/** Runs one stage and reports its failure, so later stages still run. */
+export async function continueAfter(
+  work: () => Promise<void>,
+  onFailure: (error: unknown) => void,
+): Promise<void> {
+  try {
+    await work();
+  } catch (error) {
+    onFailure(error);
+  }
+}
+
+function authError(url: URL): boolean {
+  const fragment = new URLSearchParams(url.hash.slice(1));
+  return ["error", "error_code", "error_description"].some(
+    (key) => fragment.has(key) || url.searchParams.has(key),
+  );
+}
+
 /**
- * Where a mailed Supabase verify link lands. Signup through supabase-js uses
- * the implicit flow, so a confirmed address arrives on /auth/callback with a
- * session fragment, not a ?code. Recovery goes through the app's PKCE path.
+ * The Auth verify response for a mailed confirmation link, read without
+ * following it. supabase-js signUp uses the implicit flow, so a good link
+ * redirects to the site callback with a session fragment. The app callback
+ * exchanges PKCE codes only, so the browser is not sent there.
  */
-export function verifyLanding(
-  value: string,
-  purpose: MailPurpose,
+export function confirmationRedirect(
+  status: number,
+  location: string,
   site: string,
-): "verified" | "rejected" | "pending" {
+): string {
+  if (status !== 302 && status !== 303) return `http_${status}`;
+  let url: URL;
+  try {
+    url = new URL(location);
+  } catch {
+    return "bad_location";
+  }
+  if (url.origin !== site || url.pathname !== "/auth/callback") {
+    return "foreign_target";
+  }
+  if (authError(url)) return "auth_error";
+  const fragment = new URLSearchParams(url.hash.slice(1));
+  return fragment.get("access_token") || url.searchParams.get("code")
+    ? "redirected"
+    : "no_session";
+}
+
+/**
+ * A confirmation passes only on the Auth outcome: password sign-in is refused
+ * as unconfirmed before the mailed link and succeeds after it. Sign-in
+ * results are error codes, or null when a session was issued.
+ */
+export function confirmationOutcome(input: {
+  before: string | null;
+  mail: string;
+  redirect: string | null;
+  after: string | null;
+}): string {
+  if (input.before === null) return "unconfirmed_signin_allowed";
+  if (input.before !== "email_not_confirmed") return `before_${input.before}`;
+  if (input.mail !== "ready") return `mail_${input.mail}`;
+  if (input.redirect !== "redirected") {
+    return `redirect_${input.redirect ?? "absent"}`;
+  }
+  if (input.after !== null) return `signin_${input.after}`;
+  return "signin_after_verify";
+}
+
+/** Final document of a followed recovery link, after the app's PKCE exchange. */
+export function recoveryLanding(
+  value: string,
+  status: number,
+  site: string,
+): string {
+  if (status >= 400) return `http_${status}`;
   let url: URL;
   try {
     url = new URL(value);
   } catch {
-    return "pending";
+    return "not_landed";
   }
-  if (url.origin !== site) return "pending";
-  const fragment = new URLSearchParams(url.hash.slice(1));
-  if (fragment.has("error") || url.searchParams.has("error")) return "rejected";
-  if (purpose === "recovery") {
-    return url.pathname === "/auth/update-password" ? "verified" : "pending";
-  }
-  if (/^\/(business|onboarding)$/.test(url.pathname)) return "verified";
-  if (url.pathname === "/auth/callback" && fragment.has("access_token")) {
-    return "verified";
-  }
-  return "pending";
+  if (url.origin !== site) return "foreign_target";
+  if (authError(url)) return "auth_error";
+  return url.pathname === "/auth/update-password" ? "landed" : "not_landed";
 }
 
 /** Stage, error class and Playwright call only. Messages can carry URLs. */
@@ -262,24 +350,40 @@ async function createBusiness(
   return match?.[1] ?? null;
 }
 
-async function followVerify(
-  context: BrowserContext,
-  url: URL,
-  purpose: MailPurpose,
-): Promise<boolean> {
+async function followRecovery(context: BrowserContext, url: URL) {
   const page = await context.newPage();
   try {
-    await page.goto(url.toString(), { waitUntil: "domcontentloaded" });
-    await page.waitForURL(
-      (current) =>
-        verifyLanding(current.toString(), purpose, SITE) !== "pending",
-      { timeout: 20_000 },
-    );
-    return verifyLanding(page.url(), purpose, SITE) === "verified";
-  } catch {
-    return false;
+    const response = await page.goto(url.toString(), {
+      waitUntil: "domcontentloaded",
+    });
+    return recoveryLanding(page.url(), response?.status() ?? 0, SITE);
+  } catch (error) {
+    return failureDetail("recovery_link", error);
   } finally {
     await page.close();
+  }
+}
+
+async function signInCode(
+  auth: SupabaseClient["auth"],
+  email: string,
+  password: string,
+): Promise<string | null> {
+  const { error } = await auth.signInWithPassword({ email, password });
+  if (!error) return null;
+  return error.code ?? `http_${error.status ?? 0}`;
+}
+
+async function verifyRedirect(url: URL): Promise<string> {
+  try {
+    const response = await fetch(url, { redirect: "manual" });
+    return confirmationRedirect(
+      response.status,
+      response.headers.get("location") ?? "",
+      SITE,
+    );
+  } catch (error) {
+    return failureDetail("verify", error);
   }
 }
 
@@ -542,11 +646,12 @@ async function main(): Promise<number> {
     if (signups.some((signup) => signup.error)) {
       record("mail.confirmation", "fail", "signup_rejected");
     } else if (needsMail.some(Boolean)) {
-      const context = await openContext(browser, bypass.value!);
-      let confirmed = true;
+      const outcomes: string[] = [];
       const seen: string[] = [];
       for (const [index, email] of [emailA, emailB].entries()) {
         if (!needsMail[index]) continue;
+        const password = index === 0 ? passwordA : passwordB;
+        const before = await signInCode(supabase.auth, email, password);
         const mail = await readLink(
           receivingKey,
           email,
@@ -555,16 +660,25 @@ async function main(): Promise<number> {
           seen,
         );
         if (mail.messageId) seen.push(mail.messageId);
-        const opened = mail.verifyUrl
-          ? await followVerify(context, mail.verifyUrl, "confirmation")
-          : false;
-        confirmed &&= mail.status === "ready" && opened;
+        const redirect =
+          mail.status === "ready" && mail.verifyUrl
+            ? await verifyRedirect(mail.verifyUrl)
+            : null;
+        const after =
+          redirect === "redirected"
+            ? await signInCode(supabase.auth, email, password)
+            : "not_attempted";
+        outcomes.push(
+          confirmationOutcome({ before, mail: mail.status, redirect, after }),
+        );
       }
-      await context.close();
+      const failure = outcomes.find(
+        (outcome) => outcome !== "signin_after_verify",
+      );
       record(
         "mail.confirmation",
-        confirmed ? "pass" : "fail",
-        confirmed ? "verified" : "not_verified",
+        failure ? "fail" : "pass",
+        failure ?? "signin_after_verify",
       );
     } else {
       record("mail.confirmation", "pass", "autoconfirm");
@@ -626,220 +740,228 @@ async function main(): Promise<number> {
       record("data_api.tenant_isolation", "fail", "token_or_business_missing");
     }
 
-    try {
-      stage = "consent";
-      const reader = await registerClient(
-        publishableKey,
-        `tos29-${runId}-reader`,
-      );
-      const reports = await registerClient(
-        publishableKey,
-        `tos29-${runId}-reports`,
-      );
-      let readerToken: string | null = null;
-      let reportsToken: string | null = null;
-      let consentFailure = !loggedIn
-        ? "no_session"
-        : !reader || !reports
-          ? "client_not_registered"
-          : "";
-      if (loggedIn && reader && reports) {
-        const readerGrant = await authorize(pageA, publishableKey, reader, [
-          "business.read",
-          "reports.read",
-        ]);
-        const reportsGrant = await authorize(pageA, publishableKey, reports, [
-          "reports.read",
-        ]);
-        readerToken = "token" in readerGrant ? readerGrant.token : null;
-        reportsToken = "token" in reportsGrant ? reportsGrant.token : null;
-        consentFailure =
-          "failure" in readerGrant
-            ? `reader_${readerGrant.failure}`
-            : "failure" in reportsGrant
-              ? `reports_${reportsGrant.failure}`
-              : "";
-      }
-      record(
-        "mcp.consent",
-        readerToken && reportsToken ? "pass" : "fail",
-        readerToken && reportsToken ? "issued" : consentFailure,
-      );
-      stage = "client_permissions";
-      if (tokenA && reader && reports && reportsToken) {
-        const own = await rpc(
+    await continueAfter(
+      async () => {
+        stage = "consent";
+        const reader = await registerClient(
           publishableKey,
-          reportsToken,
-          "read_client_grant",
-          {
-            p_oauth_client_id: reports,
-          },
+          `tos29-${runId}-reader`,
         );
-        const other = await rpc(
+        const reports = await registerClient(
           publishableKey,
-          reportsToken,
-          "read_client_grant",
-          { p_oauth_client_id: reader },
+          `tos29-${runId}-reports`,
         );
-        const hidden =
-          grantRows(own.json).length === 1 &&
-          grantRows(other.json).length === 0;
+        let readerToken: string | null = null;
+        let reportsToken: string | null = null;
+        let consentFailure = !loggedIn
+          ? "no_session"
+          : !reader || !reports
+            ? "client_not_registered"
+            : "";
+        if (loggedIn && reader && reports) {
+          const readerGrant = await authorize(pageA, publishableKey, reader, [
+            "business.read",
+            "reports.read",
+          ]);
+          const reportsGrant = await authorize(pageA, publishableKey, reports, [
+            "reports.read",
+          ]);
+          readerToken = "token" in readerGrant ? readerGrant.token : null;
+          reportsToken = "token" in reportsGrant ? reportsGrant.token : null;
+          consentFailure =
+            "failure" in readerGrant
+              ? `reader_${readerGrant.failure}`
+              : "failure" in reportsGrant
+                ? `reports_${reportsGrant.failure}`
+                : "";
+        }
         record(
-          "data_api.cross_client_grant_hidden",
-          hidden ? "pass" : "fail",
-          hidden ? "own_grant_only" : `http_${other.status}`,
+          "mcp.consent",
+          readerToken && reportsToken ? "pass" : "fail",
+          readerToken && reportsToken ? "issued" : consentFailure,
         );
-        const denied = await jsonFetch(`${SITE}/api/v1/business`, {
-          headers: {
-            accept: "application/json",
-            authorization: `Bearer ${reportsToken}`,
-            "x-vercel-protection-bypass": bypass.value!,
-          },
-        });
-        const body = JSON.stringify(denied.json ?? {});
-        record(
-          "app.reports_only_business_denied",
-          denied.status === 403 &&
-            !body.includes(businessA ?? "missing-business")
-            ? "pass"
-            : "fail",
-          `http_${denied.status}`,
-        );
-      } else {
-        record(
-          "data_api.cross_client_grant_hidden",
-          "fail",
-          "grant_setup_missing",
-        );
-        record(
-          "app.reports_only_business_denied",
-          "fail",
-          "grant_setup_missing",
-        );
-      }
-
-      stage = "mcp";
-      if (readerToken) {
-        const discovery = await jsonFetch(
-          `${SITE}/.well-known/oauth-protected-resource`,
-          {
+        stage = "client_permissions";
+        if (tokenA && reader && reports && reportsToken) {
+          const own = await rpc(
+            publishableKey,
+            reportsToken,
+            "read_client_grant",
+            {
+              p_oauth_client_id: reports,
+            },
+          );
+          const other = await rpc(
+            publishableKey,
+            reportsToken,
+            "read_client_grant",
+            { p_oauth_client_id: reader },
+          );
+          const hidden =
+            grantRows(own.json).length === 1 &&
+            grantRows(other.json).length === 0;
+          record(
+            "data_api.cross_client_grant_hidden",
+            hidden ? "pass" : "fail",
+            hidden ? "own_grant_only" : `http_${other.status}`,
+          );
+          const denied = await jsonFetch(`${SITE}/api/v1/business`, {
             headers: {
               accept: "application/json",
+              authorization: `Bearer ${reportsToken}`,
               "x-vercel-protection-bypass": bypass.value!,
             },
-          },
-        );
-        const resource = (discovery.json as { resource?: unknown } | null)
-          ?.resource;
-        record(
-          "mcp.discovery",
-          discovery.status === 200 && resource === `${SITE}/api/mcp`
-            ? "pass"
-            : "fail",
-          discovery.status === 200
-            ? "resource_present"
-            : `http_${discovery.status}`,
-        );
-        const client = new Client({
-          name: "tutor-mbos-foundation-check",
-          version: "0",
-        });
-        const transport = new StreamableHTTPClientTransport(
-          new URL(`${SITE}/api/mcp`),
-          {
-            requestInit: {
+          });
+          const body = JSON.stringify(denied.json ?? {});
+          record(
+            "app.reports_only_business_denied",
+            denied.status === 403 &&
+              !body.includes(businessA ?? "missing-business")
+              ? "pass"
+              : "fail",
+            `http_${denied.status}`,
+          );
+        } else {
+          record(
+            "data_api.cross_client_grant_hidden",
+            "fail",
+            "grant_setup_missing",
+          );
+          record(
+            "app.reports_only_business_denied",
+            "fail",
+            "grant_setup_missing",
+          );
+        }
+
+        stage = "mcp";
+        if (readerToken) {
+          const discovery = await jsonFetch(
+            `${SITE}/.well-known/oauth-protected-resource`,
+            {
               headers: {
-                authorization: `Bearer ${readerToken}`,
+                accept: "application/json",
                 "x-vercel-protection-bypass": bypass.value!,
               },
             },
-          },
-        );
-        let mcpConnected = false;
-        try {
-          await client.connect(transport);
-          mcpConnected = true;
-          const called = await client.callTool({
-            name: "setup_status",
-            arguments: {},
-          });
-          record(
-            "mcp.permitted_call",
-            called.isError ? "fail" : "pass",
-            called.isError ? "tool_error" : "setup_status",
           );
-        } catch {
-          record("mcp.permitted_call", "fail", "client_error");
-        }
-        const revoke = await pageA.request.post(
-          `${SITE}/api/v1/grants/revoke`,
-          {
-            data: { clientId: reader },
-            headers: {
-              origin: SITE,
-              accept: "application/json",
-              "x-vercel-protection-bypass": bypass.value!,
+          const resource = (discovery.json as { resource?: unknown } | null)
+            ?.resource;
+          record(
+            "mcp.discovery",
+            discovery.status === 200 && resource === `${SITE}/api/mcp`
+              ? "pass"
+              : "fail",
+            discovery.status === 200
+              ? "resource_present"
+              : `http_${discovery.status}`,
+          );
+          const client = new Client({
+            name: "tutor-mbos-foundation-check",
+            version: "0",
+          });
+          const transport = new StreamableHTTPClientTransport(
+            new URL(`${SITE}/api/mcp`),
+            {
+              requestInit: {
+                headers: {
+                  authorization: `Bearer ${readerToken}`,
+                  "x-vercel-protection-bypass": bypass.value!,
+                },
+              },
             },
-          },
-        );
-        record(
-          "app.revoke",
-          revoke.status() === 200 ? "pass" : "fail",
-          `http_${revoke.status()}`,
-        );
-        const again = await jsonFetch(`${SITE}/api/v1/business`, {
-          headers: {
-            accept: "application/json",
-            authorization: `Bearer ${readerToken}`,
-            "x-vercel-protection-bypass": bypass.value!,
-          },
-        });
-        record(
-          "app.revoked_read",
-          revokedReadDenied(again.status, again.json) ? "pass" : "fail",
-          `http_${again.status}`,
-        );
-        const raw = await rpc(publishableKey, readerToken, "read_business", {});
-        record(
-          "data_api.delegated_raw_denied_after_revoke",
-          raw.status === 200 && businessIds(raw.json).length === 0
-            ? "pass"
-            : "fail",
-          `http_${raw.status}`,
-        );
-        if (!mcpConnected) {
-          record("mcp.revoked_call", "fail", "client_not_connected");
-        } else {
+          );
+          let mcpConnected = false;
           try {
-            const revokedCall = await client.callTool({
+            await client.connect(transport);
+            mcpConnected = true;
+            const called = await client.callTool({
               name: "setup_status",
               arguments: {},
             });
             record(
-              "mcp.revoked_call",
-              revokedCall.isError ? "pass" : "fail",
-              revokedCall.isError ? "tool_error" : "still_permitted",
+              "mcp.permitted_call",
+              called.isError ? "fail" : "pass",
+              called.isError ? "tool_error" : "setup_status",
             );
           } catch {
-            record("mcp.revoked_call", "pass", "client_rejected");
+            record("mcp.permitted_call", "fail", "client_error");
+          }
+          const revoke = await pageA.request.post(
+            `${SITE}/api/v1/grants/revoke`,
+            {
+              data: { clientId: reader },
+              headers: {
+                origin: SITE,
+                accept: "application/json",
+                "x-vercel-protection-bypass": bypass.value!,
+              },
+            },
+          );
+          record(
+            "app.revoke",
+            revoke.status() === 200 ? "pass" : "fail",
+            `http_${revoke.status()}`,
+          );
+          const again = await jsonFetch(`${SITE}/api/v1/business`, {
+            headers: {
+              accept: "application/json",
+              authorization: `Bearer ${readerToken}`,
+              "x-vercel-protection-bypass": bypass.value!,
+            },
+          });
+          record(
+            "app.revoked_read",
+            revokedReadDenied(again.status, again.json) ? "pass" : "fail",
+            `http_${again.status}`,
+          );
+          const raw = await rpc(
+            publishableKey,
+            readerToken,
+            "read_business",
+            {},
+          );
+          record(
+            "data_api.delegated_raw_denied_after_revoke",
+            raw.status === 200 && businessIds(raw.json).length === 0
+              ? "pass"
+              : "fail",
+            `http_${raw.status}`,
+          );
+          if (!mcpConnected) {
+            record("mcp.revoked_call", "fail", "client_not_connected");
+          } else {
+            try {
+              const revokedCall = await client.callTool({
+                name: "setup_status",
+                arguments: {},
+              });
+              record(
+                "mcp.revoked_call",
+                revokedCall.isError ? "pass" : "fail",
+                revokedCall.isError ? "tool_error" : "still_permitted",
+              );
+            } catch {
+              record("mcp.revoked_call", "pass", "client_rejected");
+            }
+          }
+          await client.close().catch(() => undefined);
+        } else {
+          for (const id of [
+            "mcp.discovery",
+            "mcp.permitted_call",
+            "app.revoke",
+            "app.revoked_read",
+            "data_api.delegated_raw_denied_after_revoke",
+            "mcp.revoked_call",
+          ]) {
+            record(id, "fail", "no_delegated_token");
           }
         }
-        await client.close().catch(() => undefined);
-      } else {
-        for (const id of [
-          "mcp.discovery",
-          "mcp.permitted_call",
-          "app.revoke",
-          "app.revoked_read",
-          "data_api.delegated_raw_denied_after_revoke",
-          "mcp.revoked_call",
-        ]) {
-          record(id, "fail", "no_delegated_token");
-        }
-      }
-    } catch (error) {
-      record("hosted.unhandled", "fail", failureDetail(stage, error));
-    }
+      },
+      (error) => {
+        record("hosted.unhandled", "fail", failureDetail(stage, error));
+      },
+    );
 
     stage = "recovery";
     const recoveryStarted = new Date().toISOString();
@@ -868,14 +990,11 @@ async function main(): Promise<number> {
       [],
     );
     const recoveryContext = await openContext(browser, bypass.value!);
-    const opened = recoveryMail.verifyUrl
-      ? await followVerify(recoveryContext, recoveryMail.verifyUrl, "recovery")
-      : false;
-    record(
-      "mail.recovery",
-      recoveryMail.status === "ready" && opened ? "pass" : "fail",
-      recoveryMail.status,
-    );
+    const landing = recoveryMail.verifyUrl
+      ? await followRecovery(recoveryContext, recoveryMail.verifyUrl)
+      : `mail_${recoveryMail.status}`;
+    const opened = recoveryMail.status === "ready" && landing === "landed";
+    record("mail.recovery", opened ? "pass" : "fail", landing);
     if (opened) {
       const update = await recoveryContext.newPage();
       await update.goto(`${SITE}/auth/update-password`, {
@@ -955,6 +1074,7 @@ async function main(): Promise<number> {
     record("cleanup.oauth_clients", "gap", "left_registered");
     await browser.close().catch(() => undefined);
   }
+  for (const id of unreachedCases(results)) record(id, "fail", "not_reached");
   for (const row of results)
     console.log(`case=${row.id} status=${row.status} detail=${row.detail}`);
   const failed = results.some((row) => row.status === "fail");
