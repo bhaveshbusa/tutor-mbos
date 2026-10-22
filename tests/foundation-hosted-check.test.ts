@@ -5,6 +5,7 @@ import { siteOriginFor } from "@/server/config/access";
 import {
   DEVELOPMENT_SITE,
   businessesAreIsolated,
+  failureDetail,
   grantRows,
   hostedCheckAllowed,
   publishableKeyFromPulled,
@@ -12,6 +13,7 @@ import {
   syntheticPassword,
   syntheticRecipient,
   trustedSupabaseUrl,
+  verifyLanding,
 } from "../scripts/foundation-hosted-check";
 
 describe("foundation hosted check helpers", () => {
@@ -78,6 +80,85 @@ describe("foundation hosted check helpers", () => {
     expect(
       trustedSupabaseUrl("https://evil.example/authorize", origin),
     ).toBeNull();
+  });
+});
+
+describe("foundation hosted check mail landing", () => {
+  const site = DEVELOPMENT_SITE;
+
+  it("accepts the implicit-flow confirmation landing on the callback", () => {
+    expect(
+      verifyLanding(
+        `${site}/auth/callback#access_token=a&refresh_token=r&type=signup`,
+        "confirmation",
+        site,
+      ),
+    ).toBe("verified");
+    expect(verifyLanding(`${site}/onboarding`, "confirmation", site)).toBe(
+      "verified",
+    );
+  });
+
+  it("rejects an error landing and waits on a callback without a session", () => {
+    expect(
+      verifyLanding(
+        `${site}/#error=access_denied&error_code=otp_expired`,
+        "confirmation",
+        site,
+      ),
+    ).toBe("rejected");
+    expect(
+      verifyLanding(
+        `${site}/auth/callback?error=server_error`,
+        "recovery",
+        site,
+      ),
+    ).toBe("rejected");
+    expect(verifyLanding(`${site}/auth/callback`, "confirmation", site)).toBe(
+      "pending",
+    );
+  });
+
+  it("ignores a session fragment on another origin", () => {
+    expect(
+      verifyLanding(
+        "https://evil.example/auth/callback#access_token=a&type=signup",
+        "confirmation",
+        site,
+      ),
+    ).toBe("pending");
+  });
+
+  it("does not count a confirmation landing as recovery", () => {
+    expect(
+      verifyLanding(
+        `${site}/auth/callback#access_token=a&type=signup`,
+        "recovery",
+        site,
+      ),
+    ).toBe("pending");
+    expect(
+      verifyLanding(`${site}/auth/update-password`, "recovery", site),
+    ).toBe("verified");
+  });
+});
+
+describe("foundation hosted check failure details", () => {
+  it("names the stage and Playwright call without the message", () => {
+    const timeout = new Error(
+      "page.waitForURL: Timeout 20000ms exceeded.\n  navigated to https://tutor.example/oauth/consent?authorization_id=secret",
+    );
+    timeout.name = "TimeoutError";
+    const detail = failureDetail("consent_url", timeout);
+    expect(detail).toBe("consent_url_TimeoutError_page.waitForURL");
+    expect(detail).not.toContain("authorization_id");
+  });
+
+  it("falls back to the error class or a generic code", () => {
+    expect(failureDetail("mcp", new TypeError("fetch failed"))).toBe(
+      "mcp_TypeError",
+    );
+    expect(failureDetail("recovery", "boom")).toBe("recovery_error");
   });
 });
 
