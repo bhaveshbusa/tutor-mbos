@@ -12,7 +12,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { chromium, type BrowserContext, type Page } from "@playwright/test";
 import { parseDotenv } from "./assert-deploy-target.ts";
 import { resolveProtectionBypass } from "./smoke-health.ts";
@@ -111,6 +111,130 @@ export function trustedSupabaseUrl(
   } catch {
     return null;
   }
+}
+
+/** Every case a full run reports. Unreached ones are failed, never omitted. */
+export const HOSTED_CASES = [
+  "hosted.health",
+  "mail.confirmation",
+  "browser.login",
+  "browser.onboarding",
+  "browser.onboarding_retry",
+  "data_api.tenant_isolation",
+  "mcp.consent",
+  "data_api.cross_client_grant_hidden",
+  "app.reports_only_business_denied",
+  "mcp.discovery",
+  "mcp.permitted_call",
+  "app.revoke",
+  "app.revoked_read",
+  "data_api.delegated_raw_denied_after_revoke",
+  "mcp.revoked_call",
+  "browser.recovery",
+  "mail.recovery",
+  "browser.password_updated",
+  "browser.old_password_rejected",
+  "browser.new_password_login",
+  "cleanup.auth_users",
+  "cleanup.oauth_clients",
+] as const;
+
+export function unreachedCases(rows: { id: string }[]): string[] {
+  const seen = new Set(rows.map((row) => row.id));
+  return HOSTED_CASES.filter((id) => !seen.has(id));
+}
+
+/** Runs one stage and reports its failure, so later stages still run. */
+export async function continueAfter(
+  work: () => Promise<void>,
+  onFailure: (error: unknown) => void,
+): Promise<void> {
+  try {
+    await work();
+  } catch (error) {
+    onFailure(error);
+  }
+}
+
+function authError(url: URL): boolean {
+  const fragment = new URLSearchParams(url.hash.slice(1));
+  return ["error", "error_code", "error_description"].some(
+    (key) => fragment.has(key) || url.searchParams.has(key),
+  );
+}
+
+/**
+ * The Auth verify response for a mailed confirmation link, read without
+ * following it. supabase-js signUp uses the implicit flow, so a good link
+ * redirects to the site callback with a session fragment. The app callback
+ * exchanges PKCE codes only, so the browser is not sent there.
+ */
+export function confirmationRedirect(
+  status: number,
+  location: string,
+  site: string,
+): string {
+  if (status !== 302 && status !== 303) return `http_${status}`;
+  let url: URL;
+  try {
+    url = new URL(location);
+  } catch {
+    return "bad_location";
+  }
+  if (url.origin !== site || url.pathname !== "/auth/callback") {
+    return "foreign_target";
+  }
+  if (authError(url)) return "auth_error";
+  const fragment = new URLSearchParams(url.hash.slice(1));
+  return fragment.get("access_token") || url.searchParams.get("code")
+    ? "redirected"
+    : "no_session";
+}
+
+/**
+ * A confirmation passes only on the Auth outcome: password sign-in is refused
+ * as unconfirmed before the mailed link and succeeds after it. Sign-in
+ * results are error codes, or null when a session was issued.
+ */
+export function confirmationOutcome(input: {
+  before: string | null;
+  mail: string;
+  redirect: string | null;
+  after: string | null;
+}): string {
+  if (input.before === null) return "unconfirmed_signin_allowed";
+  if (input.before !== "email_not_confirmed") return `before_${input.before}`;
+  if (input.mail !== "ready") return `mail_${input.mail}`;
+  if (input.redirect !== "redirected") {
+    return `redirect_${input.redirect ?? "absent"}`;
+  }
+  if (input.after !== null) return `signin_${input.after}`;
+  return "signin_after_verify";
+}
+
+/** Final document of a followed recovery link, after the app's PKCE exchange. */
+export function recoveryLanding(
+  value: string,
+  status: number,
+  site: string,
+): string {
+  if (status >= 400) return `http_${status}`;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return "not_landed";
+  }
+  if (url.origin !== site) return "foreign_target";
+  if (authError(url)) return "auth_error";
+  return url.pathname === "/auth/update-password" ? "landed" : "not_landed";
+}
+
+/** Stage, error class and Playwright call only. Messages can carry URLs. */
+export function failureDetail(stage: string, error: unknown): string {
+  if (!(error instanceof Error)) return `${stage}_error`;
+  const call = /^([A-Za-z]+\.[A-Za-z]+):/.exec(error.message)?.[1];
+  return call ? `${stage}_${error.name}_${call}` : `${stage}_${error.name}`;
 }
 
 function mask(value: string | undefined): void {
@@ -226,24 +350,40 @@ async function createBusiness(
   return match?.[1] ?? null;
 }
 
-async function followVerify(
-  context: BrowserContext,
-  url: URL,
-  purpose: MailPurpose,
-): Promise<boolean> {
+async function followRecovery(context: BrowserContext, url: URL) {
   const page = await context.newPage();
-  await page.goto(url.toString(), { waitUntil: "domcontentloaded" });
-  const expected =
-    purpose === "confirmation"
-      ? /\/(business|onboarding)$/
-      : /\/auth\/update-password$/;
   try {
-    await page.waitForURL(expected, { timeout: 20_000 });
-    return true;
-  } catch {
-    return false;
+    const response = await page.goto(url.toString(), {
+      waitUntil: "domcontentloaded",
+    });
+    return recoveryLanding(page.url(), response?.status() ?? 0, SITE);
+  } catch (error) {
+    return failureDetail("recovery_link", error);
   } finally {
     await page.close();
+  }
+}
+
+async function signInCode(
+  auth: SupabaseClient["auth"],
+  email: string,
+  password: string,
+): Promise<string | null> {
+  const { error } = await auth.signInWithPassword({ email, password });
+  if (!error) return null;
+  return error.code ?? `http_${error.status ?? 0}`;
+}
+
+async function verifyRedirect(url: URL): Promise<string> {
+  try {
+    const response = await fetch(url, { redirect: "manual" });
+    return confirmationRedirect(
+      response.status,
+      response.headers.get("location") ?? "",
+      SITE,
+    );
+  } catch (error) {
+    return failureDetail("verify", error);
   }
 }
 
@@ -327,78 +467,100 @@ async function authorize(
   key: string,
   clientId: string,
   permissions: string[],
-): Promise<string | null> {
-  const metadata = await jsonFetch(
-    `${SUPABASE}/auth/v1/.well-known/oauth-authorization-server`,
-    {
-      headers: authHeaders(key),
-    },
-  );
-  const record = metadata.json as {
-    authorization_endpoint?: string;
-    token_endpoint?: string;
-  };
-  const authorizeUrl = trustedSupabaseUrl(
-    record?.authorization_endpoint,
-    SUPABASE,
-  );
-  const tokenUrl = trustedSupabaseUrl(record?.token_endpoint, SUPABASE);
-  if (!authorizeUrl || !tokenUrl) return null;
-  const verifier = randomBytes(32).toString("base64url");
-  const challenge = createHash("sha256").update(verifier).digest("base64url");
-  mask(verifier);
-  authorizeUrl.searchParams.set("response_type", "code");
-  authorizeUrl.searchParams.set("client_id", clientId);
-  authorizeUrl.searchParams.set("redirect_uri", REDIRECT);
-  authorizeUrl.searchParams.set("code_challenge", challenge);
-  authorizeUrl.searchParams.set("code_challenge_method", "S256");
-  authorizeUrl.searchParams.set("state", randomBytes(8).toString("hex"));
-  authorizeUrl.searchParams.set("scope", "openid email profile");
-  authorizeUrl.searchParams.set("resource", `${SITE}/api/mcp`);
-  await page.goto(authorizeUrl.toString(), { waitUntil: "domcontentloaded" });
-  await page.waitForURL(/\/oauth\/consent\?/, { timeout: 20_000 });
-  if (new URL(page.url()).origin !== SITE) return null;
-  await page
-    .locator("input[value='business.read']")
-    .setChecked(permissions.includes("business.read"));
-  await page
-    .locator("input[value='reports.read']")
-    .setChecked(permissions.includes("reports.read"));
-  await page
-    .locator("input[value='business.onboard']")
-    .setChecked(permissions.includes("business.onboard"));
-  const pending = page.waitForResponse(
-    (response) =>
-      response.url().includes("/api/oauth/decision") &&
-      response.request().method() === "POST",
-  );
-  await page.getByRole("button", { name: "Approve" }).click();
-  const decided = await pending;
-  const location = decided.headers().location ?? "";
-  const code = new URL(location, SITE).searchParams.get("code");
-  if (!code) return null;
-  mask(code);
-  const token = await jsonFetch(tokenUrl.toString(), {
-    method: "POST",
-    headers: {
-      "content-type": "application/x-www-form-urlencoded",
-      accept: "application/json",
-    },
-    body: new URLSearchParams({
-      grant_type: "authorization_code",
-      code,
-      redirect_uri: REDIRECT,
-      client_id: clientId,
-      code_verifier: verifier,
-    }).toString(),
-  });
-  const access =
-    typeof token.json === "object" && token.json !== null
-      ? (token.json as { access_token?: unknown }).access_token
-      : undefined;
-  if (token.status !== 200 || typeof access !== "string") return null;
-  mask(access);
-  return access;
+): Promise<{ token: string } | { failure: string }> {
+  let step = "metadata";
+  try {
+    const metadata = await jsonFetch(
+      `${SUPABASE}/auth/v1/.well-known/oauth-authorization-server`,
+      {
+        headers: authHeaders(key),
+      },
+    );
+    const record = metadata.json as {
+      authorization_endpoint?: string;
+      token_endpoint?: string;
+    };
+    const authorizeUrl = trustedSupabaseUrl(
+      record?.authorization_endpoint,
+      SUPABASE,
+    );
+    const tokenUrl = trustedSupabaseUrl(record?.token_endpoint, SUPABASE);
+    if (!authorizeUrl || !tokenUrl) return { failure: "metadata_untrusted" };
+    const verifier = randomBytes(32).toString("base64url");
+    const challenge = createHash("sha256").update(verifier).digest("base64url");
+    mask(verifier);
+    authorizeUrl.searchParams.set("response_type", "code");
+    authorizeUrl.searchParams.set("client_id", clientId);
+    authorizeUrl.searchParams.set("redirect_uri", REDIRECT);
+    authorizeUrl.searchParams.set("code_challenge", challenge);
+    authorizeUrl.searchParams.set("code_challenge_method", "S256");
+    authorizeUrl.searchParams.set("state", randomBytes(8).toString("hex"));
+    authorizeUrl.searchParams.set("scope", "openid email profile");
+    authorizeUrl.searchParams.set("resource", `${SITE}/api/mcp`);
+    step = "authorize_navigation";
+    const landed = await page.goto(authorizeUrl.toString(), {
+      waitUntil: "domcontentloaded",
+    });
+    step = "consent_url";
+    await page.waitForURL(/\/oauth\/consent\?/, { timeout: 20_000 });
+    if (new URL(page.url()).origin !== SITE)
+      return { failure: "consent_origin" };
+    const consentStatus = landed?.status() ?? 0;
+    if (consentStatus !== 200)
+      return { failure: `consent_http_${consentStatus}` };
+    step = "permissions";
+    await page
+      .locator("input[value='business.read']")
+      .setChecked(permissions.includes("business.read"));
+    await page
+      .locator("input[value='reports.read']")
+      .setChecked(permissions.includes("reports.read"));
+    await page
+      .locator("input[value='business.onboard']")
+      .setChecked(permissions.includes("business.onboard"));
+    step = "approve";
+    const pending = page.waitForResponse(
+      (response) =>
+        response.url().includes("/api/oauth/decision") &&
+        response.request().method() === "POST",
+    );
+    await page.getByRole("button", { name: "Approve" }).click();
+    step = "decision";
+    const decided = await pending;
+    if (decided.status() !== 303) {
+      return { failure: `decision_http_${decided.status()}` };
+    }
+    const location = decided.headers().location ?? "";
+    const code = new URL(location, SITE).searchParams.get("code");
+    if (!code) return { failure: "decision_no_code" };
+    mask(code);
+    step = "token";
+    const token = await jsonFetch(tokenUrl.toString(), {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        accept: "application/json",
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: REDIRECT,
+        client_id: clientId,
+        code_verifier: verifier,
+      }).toString(),
+    });
+    const access =
+      typeof token.json === "object" && token.json !== null
+        ? (token.json as { access_token?: unknown }).access_token
+        : undefined;
+    if (token.status !== 200 || typeof access !== "string") {
+      return { failure: `token_http_${token.status}` };
+    }
+    mask(access);
+    return { token: access };
+  } catch (error) {
+    return { failure: failureDetail(step, error) };
+  }
 }
 
 async function main(): Promise<number> {
@@ -448,6 +610,7 @@ async function main(): Promise<number> {
     auth: { persistSession: false, autoRefreshToken: false },
   });
   const browser = await chromium.launch({ headless: true });
+  let stage = "health";
   let cleanupA: string | null = null;
   let cleanupB: string | null = null;
   try {
@@ -466,6 +629,7 @@ async function main(): Promise<number> {
       health.status === 200 ? "commit_checked" : `http_${health.status}`,
     );
 
+    stage = "confirmation";
     const started = new Date().toISOString();
     const signups = await Promise.all(
       [emailA, emailB].map((email, index) =>
@@ -482,11 +646,12 @@ async function main(): Promise<number> {
     if (signups.some((signup) => signup.error)) {
       record("mail.confirmation", "fail", "signup_rejected");
     } else if (needsMail.some(Boolean)) {
-      const context = await openContext(browser, bypass.value!);
-      let confirmed = true;
+      const outcomes: string[] = [];
       const seen: string[] = [];
       for (const [index, email] of [emailA, emailB].entries()) {
         if (!needsMail[index]) continue;
+        const password = index === 0 ? passwordA : passwordB;
+        const before = await signInCode(supabase.auth, email, password);
         const mail = await readLink(
           receivingKey,
           email,
@@ -495,21 +660,31 @@ async function main(): Promise<number> {
           seen,
         );
         if (mail.messageId) seen.push(mail.messageId);
-        const opened = mail.verifyUrl
-          ? await followVerify(context, mail.verifyUrl, "confirmation")
-          : false;
-        confirmed &&= mail.status === "ready" && opened;
+        const redirect =
+          mail.status === "ready" && mail.verifyUrl
+            ? await verifyRedirect(mail.verifyUrl)
+            : null;
+        const after =
+          redirect === "redirected"
+            ? await signInCode(supabase.auth, email, password)
+            : "not_attempted";
+        outcomes.push(
+          confirmationOutcome({ before, mail: mail.status, redirect, after }),
+        );
       }
-      await context.close();
+      const failure = outcomes.find(
+        (outcome) => outcome !== "signin_after_verify",
+      );
       record(
         "mail.confirmation",
-        confirmed ? "pass" : "fail",
-        confirmed ? "verified" : "not_verified",
+        failure ? "fail" : "pass",
+        failure ?? "signin_after_verify",
       );
     } else {
       record("mail.confirmation", "pass", "autoconfirm");
     }
 
+    stage = "login_onboarding";
     const contextA = await openContext(browser, bypass.value!);
     const pageA = await contextA.newPage();
     const loginA = await signIn(pageA, emailA, passwordA);
@@ -544,6 +719,7 @@ async function main(): Promise<number> {
     if (loginB === 303) businessB = await createBusiness(pageB, "Fixture B");
     await contextB.close();
 
+    stage = "tenant_isolation";
     const tokenA = await issueToken(publishableKey, emailA, passwordA);
     const tokenB = await issueToken(publishableKey, emailB, passwordB);
     cleanupA = tokenA;
@@ -564,187 +740,230 @@ async function main(): Promise<number> {
       record("data_api.tenant_isolation", "fail", "token_or_business_missing");
     }
 
-    const reader = await registerClient(
-      publishableKey,
-      `tos29-${runId}-reader`,
-    );
-    const reports = await registerClient(
-      publishableKey,
-      `tos29-${runId}-reports`,
-    );
-    let readerToken: string | null = null;
-    let reportsToken: string | null = null;
-    if (loggedIn && reader && reports) {
-      readerToken = await authorize(pageA, publishableKey, reader, [
-        "business.read",
-        "reports.read",
-      ]);
-      reportsToken = await authorize(pageA, publishableKey, reports, [
-        "reports.read",
-      ]);
-    }
-    record(
-      "mcp.consent",
-      readerToken && reportsToken ? "pass" : "fail",
-      readerToken && reportsToken ? "issued" : "not_issued",
-    );
-    if (tokenA && reader && reports && reportsToken) {
-      const own = await rpc(publishableKey, reportsToken, "read_client_grant", {
-        p_oauth_client_id: reports,
-      });
-      const other = await rpc(
-        publishableKey,
-        reportsToken,
-        "read_client_grant",
-        { p_oauth_client_id: reader },
-      );
-      const hidden =
-        grantRows(own.json).length === 1 && grantRows(other.json).length === 0;
-      record(
-        "data_api.cross_client_grant_hidden",
-        hidden ? "pass" : "fail",
-        hidden ? "own_grant_only" : `http_${other.status}`,
-      );
-      const denied = await jsonFetch(`${SITE}/api/v1/business`, {
-        headers: {
-          accept: "application/json",
-          authorization: `Bearer ${reportsToken}`,
-          "x-vercel-protection-bypass": bypass.value!,
-        },
-      });
-      const body = JSON.stringify(denied.json ?? {});
-      record(
-        "app.reports_only_business_denied",
-        denied.status === 403 && !body.includes(businessA ?? "missing-business")
-          ? "pass"
-          : "fail",
-        `http_${denied.status}`,
-      );
-    } else {
-      record(
-        "data_api.cross_client_grant_hidden",
-        "fail",
-        "grant_setup_missing",
-      );
-      record("app.reports_only_business_denied", "fail", "grant_setup_missing");
-    }
-
-    if (readerToken) {
-      const discovery = await jsonFetch(
-        `${SITE}/.well-known/oauth-protected-resource`,
-        {
-          headers: {
-            accept: "application/json",
-            "x-vercel-protection-bypass": bypass.value!,
-          },
-        },
-      );
-      const resource = (discovery.json as { resource?: unknown } | null)
-        ?.resource;
-      record(
-        "mcp.discovery",
-        discovery.status === 200 && resource === `${SITE}/api/mcp`
-          ? "pass"
-          : "fail",
-        discovery.status === 200
-          ? "resource_present"
-          : `http_${discovery.status}`,
-      );
-      const client = new Client({
-        name: "tutor-mbos-foundation-check",
-        version: "0",
-      });
-      const transport = new StreamableHTTPClientTransport(
-        new URL(`${SITE}/api/mcp`),
-        {
-          requestInit: {
+    await continueAfter(
+      async () => {
+        stage = "consent";
+        const reader = await registerClient(
+          publishableKey,
+          `tos29-${runId}-reader`,
+        );
+        const reports = await registerClient(
+          publishableKey,
+          `tos29-${runId}-reports`,
+        );
+        let readerToken: string | null = null;
+        let reportsToken: string | null = null;
+        let consentFailure = !loggedIn
+          ? "no_session"
+          : !reader || !reports
+            ? "client_not_registered"
+            : "";
+        if (loggedIn && reader && reports) {
+          const readerGrant = await authorize(pageA, publishableKey, reader, [
+            "business.read",
+            "reports.read",
+          ]);
+          const reportsGrant = await authorize(pageA, publishableKey, reports, [
+            "reports.read",
+          ]);
+          readerToken = "token" in readerGrant ? readerGrant.token : null;
+          reportsToken = "token" in reportsGrant ? reportsGrant.token : null;
+          consentFailure =
+            "failure" in readerGrant
+              ? `reader_${readerGrant.failure}`
+              : "failure" in reportsGrant
+                ? `reports_${reportsGrant.failure}`
+                : "";
+        }
+        record(
+          "mcp.consent",
+          readerToken && reportsToken ? "pass" : "fail",
+          readerToken && reportsToken ? "issued" : consentFailure,
+        );
+        stage = "client_permissions";
+        if (tokenA && reader && reports && reportsToken) {
+          const own = await rpc(
+            publishableKey,
+            reportsToken,
+            "read_client_grant",
+            {
+              p_oauth_client_id: reports,
+            },
+          );
+          const other = await rpc(
+            publishableKey,
+            reportsToken,
+            "read_client_grant",
+            { p_oauth_client_id: reader },
+          );
+          const hidden =
+            grantRows(own.json).length === 1 &&
+            grantRows(other.json).length === 0;
+          record(
+            "data_api.cross_client_grant_hidden",
+            hidden ? "pass" : "fail",
+            hidden ? "own_grant_only" : `http_${other.status}`,
+          );
+          const denied = await jsonFetch(`${SITE}/api/v1/business`, {
             headers: {
+              accept: "application/json",
+              authorization: `Bearer ${reportsToken}`,
+              "x-vercel-protection-bypass": bypass.value!,
+            },
+          });
+          const body = JSON.stringify(denied.json ?? {});
+          record(
+            "app.reports_only_business_denied",
+            denied.status === 403 &&
+              !body.includes(businessA ?? "missing-business")
+              ? "pass"
+              : "fail",
+            `http_${denied.status}`,
+          );
+        } else {
+          record(
+            "data_api.cross_client_grant_hidden",
+            "fail",
+            "grant_setup_missing",
+          );
+          record(
+            "app.reports_only_business_denied",
+            "fail",
+            "grant_setup_missing",
+          );
+        }
+
+        stage = "mcp";
+        if (readerToken) {
+          const discovery = await jsonFetch(
+            `${SITE}/.well-known/oauth-protected-resource`,
+            {
+              headers: {
+                accept: "application/json",
+                "x-vercel-protection-bypass": bypass.value!,
+              },
+            },
+          );
+          const resource = (discovery.json as { resource?: unknown } | null)
+            ?.resource;
+          record(
+            "mcp.discovery",
+            discovery.status === 200 && resource === `${SITE}/api/mcp`
+              ? "pass"
+              : "fail",
+            discovery.status === 200
+              ? "resource_present"
+              : `http_${discovery.status}`,
+          );
+          const client = new Client({
+            name: "tutor-mbos-foundation-check",
+            version: "0",
+          });
+          const transport = new StreamableHTTPClientTransport(
+            new URL(`${SITE}/api/mcp`),
+            {
+              requestInit: {
+                headers: {
+                  authorization: `Bearer ${readerToken}`,
+                  "x-vercel-protection-bypass": bypass.value!,
+                },
+              },
+            },
+          );
+          let mcpConnected = false;
+          try {
+            await client.connect(transport);
+            mcpConnected = true;
+            const called = await client.callTool({
+              name: "setup_status",
+              arguments: {},
+            });
+            record(
+              "mcp.permitted_call",
+              called.isError ? "fail" : "pass",
+              called.isError ? "tool_error" : "setup_status",
+            );
+          } catch {
+            record("mcp.permitted_call", "fail", "client_error");
+          }
+          const revoke = await pageA.request.post(
+            `${SITE}/api/v1/grants/revoke`,
+            {
+              data: { clientId: reader },
+              headers: {
+                origin: SITE,
+                accept: "application/json",
+                "x-vercel-protection-bypass": bypass.value!,
+              },
+            },
+          );
+          record(
+            "app.revoke",
+            revoke.status() === 200 ? "pass" : "fail",
+            `http_${revoke.status()}`,
+          );
+          const again = await jsonFetch(`${SITE}/api/v1/business`, {
+            headers: {
+              accept: "application/json",
               authorization: `Bearer ${readerToken}`,
               "x-vercel-protection-bypass": bypass.value!,
             },
-          },
-        },
-      );
-      let mcpConnected = false;
-      try {
-        await client.connect(transport);
-        mcpConnected = true;
-        const called = await client.callTool({
-          name: "setup_status",
-          arguments: {},
-        });
-        record(
-          "mcp.permitted_call",
-          called.isError ? "fail" : "pass",
-          called.isError ? "tool_error" : "setup_status",
-        );
-      } catch {
-        record("mcp.permitted_call", "fail", "client_error");
-      }
-      const revoke = await pageA.request.post(`${SITE}/api/v1/grants/revoke`, {
-        data: { clientId: reader },
-        headers: {
-          origin: SITE,
-          accept: "application/json",
-          "x-vercel-protection-bypass": bypass.value!,
-        },
-      });
-      record(
-        "app.revoke",
-        revoke.status() === 200 ? "pass" : "fail",
-        `http_${revoke.status()}`,
-      );
-      const again = await jsonFetch(`${SITE}/api/v1/business`, {
-        headers: {
-          accept: "application/json",
-          authorization: `Bearer ${readerToken}`,
-          "x-vercel-protection-bypass": bypass.value!,
-        },
-      });
-      record(
-        "app.revoked_read",
-        revokedReadDenied(again.status, again.json) ? "pass" : "fail",
-        `http_${again.status}`,
-      );
-      const raw = await rpc(publishableKey, readerToken, "read_business", {});
-      record(
-        "data_api.delegated_raw_denied_after_revoke",
-        raw.status === 200 && businessIds(raw.json).length === 0
-          ? "pass"
-          : "fail",
-        `http_${raw.status}`,
-      );
-      if (!mcpConnected) {
-        record("mcp.revoked_call", "fail", "client_not_connected");
-      } else {
-        try {
-          const revokedCall = await client.callTool({
-            name: "setup_status",
-            arguments: {},
           });
           record(
-            "mcp.revoked_call",
-            revokedCall.isError ? "pass" : "fail",
-            revokedCall.isError ? "tool_error" : "still_permitted",
+            "app.revoked_read",
+            revokedReadDenied(again.status, again.json) ? "pass" : "fail",
+            `http_${again.status}`,
           );
-        } catch {
-          record("mcp.revoked_call", "pass", "client_rejected");
+          const raw = await rpc(
+            publishableKey,
+            readerToken,
+            "read_business",
+            {},
+          );
+          record(
+            "data_api.delegated_raw_denied_after_revoke",
+            raw.status === 200 && businessIds(raw.json).length === 0
+              ? "pass"
+              : "fail",
+            `http_${raw.status}`,
+          );
+          if (!mcpConnected) {
+            record("mcp.revoked_call", "fail", "client_not_connected");
+          } else {
+            try {
+              const revokedCall = await client.callTool({
+                name: "setup_status",
+                arguments: {},
+              });
+              record(
+                "mcp.revoked_call",
+                revokedCall.isError ? "pass" : "fail",
+                revokedCall.isError ? "tool_error" : "still_permitted",
+              );
+            } catch {
+              record("mcp.revoked_call", "pass", "client_rejected");
+            }
+          }
+          await client.close().catch(() => undefined);
+        } else {
+          for (const id of [
+            "mcp.discovery",
+            "mcp.permitted_call",
+            "app.revoke",
+            "app.revoked_read",
+            "data_api.delegated_raw_denied_after_revoke",
+            "mcp.revoked_call",
+          ]) {
+            record(id, "fail", "no_delegated_token");
+          }
         }
-      }
-      await client.close().catch(() => undefined);
-    } else {
-      for (const id of [
-        "mcp.discovery",
-        "mcp.permitted_call",
-        "app.revoke",
-        "app.revoked_read",
-        "data_api.delegated_raw_denied_after_revoke",
-        "mcp.revoked_call",
-      ]) {
-        record(id, "fail", "no_delegated_token");
-      }
-    }
+      },
+      (error) => {
+        record("hosted.unhandled", "fail", failureDetail(stage, error));
+      },
+    );
 
+    stage = "recovery";
     const recoveryStarted = new Date().toISOString();
     const recoveryPage = await contextA.newPage();
     await recoveryPage.goto(`${SITE}/login`, { waitUntil: "domcontentloaded" });
@@ -771,14 +990,11 @@ async function main(): Promise<number> {
       [],
     );
     const recoveryContext = await openContext(browser, bypass.value!);
-    const opened = recoveryMail.verifyUrl
-      ? await followVerify(recoveryContext, recoveryMail.verifyUrl, "recovery")
-      : false;
-    record(
-      "mail.recovery",
-      recoveryMail.status === "ready" && opened ? "pass" : "fail",
-      recoveryMail.status,
-    );
+    const landing = recoveryMail.verifyUrl
+      ? await followRecovery(recoveryContext, recoveryMail.verifyUrl)
+      : `mail_${recoveryMail.status}`;
+    const opened = recoveryMail.status === "ready" && landing === "landed";
+    record("mail.recovery", opened ? "pass" : "fail", landing);
     if (opened) {
       const update = await recoveryContext.newPage();
       await update.goto(`${SITE}/auth/update-password`, {
@@ -830,11 +1046,7 @@ async function main(): Promise<number> {
     await recoveryContext.close();
     await contextA.close();
   } catch (error) {
-    record(
-      "hosted.unhandled",
-      "fail",
-      error instanceof Error ? error.name : "error",
-    );
+    record("hosted.unhandled", "fail", failureDetail(stage, error));
   } finally {
     const cleanupStatuses: string[] = [];
     for (const token of [cleanupA, cleanupB]) {
@@ -862,6 +1074,7 @@ async function main(): Promise<number> {
     record("cleanup.oauth_clients", "gap", "left_registered");
     await browser.close().catch(() => undefined);
   }
+  for (const id of unreachedCases(results)) record(id, "fail", "not_reached");
   for (const row of results)
     console.log(`case=${row.id} status=${row.status} detail=${row.detail}`);
   const failed = results.some((row) => row.status === "fail");
